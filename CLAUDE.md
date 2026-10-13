@@ -1,8 +1,8 @@
 # CLAUDE.md
 
-iprune is a Linux terminal tool that manages `.m3u8` playlists for a local
-music library and syncs tracks and playlists one way, library to device, to an
-iPod Classic through libgpod. It does not play music or edit tags.
+iprune is a Linux tool (GTK4 window and CLI) that manages `.m3u8` playlists
+for a local music library and syncs tracks and playlists one way, library to
+device, to an iPod Classic through libgpod. It does not play music or edit tags.
 
 Read `docs/design.md` (what and why) and `docs/technical.md` (how) before
 changing behaviour. They are the spec. If code and docs disagree, ask which one
@@ -21,7 +21,7 @@ config, scan, SQLite index, `.m3u8` editing, `playlist` commands; `adopt`). Work
 | M3 | planner and `sync --plan-only` | no |
 | M4 | executor for playlists only, backups, checks, verify, restore | yes |
 | M5 | track copy, remove, tag update, stats pull, `doctor` | yes |
-| M6 | terminal UI | yes |
+| M6 | desktop UI (GTK4, iTunes-style grid) | yes |
 | M7 | desktop entry, notifications, packaging | yes |
 
 Do not start work that writes to an iPod before the earlier milestones are done
@@ -34,13 +34,15 @@ and tested.
   `.m3u8` folder.
 - No cover art work of any kind. Leave existing iPod artwork alone.
 - Play statistics come from the iPod only; no iTunes XML import.
+- The interface is a GTK4 desktop window with an iTunes-style grid
+  (sidebar, sortable columns, drag and drop), not a terminal UI.
 
 ## Stack
 
 Rust stable, edition 2024, Cargo workspace. libgpod 0.8.3 (Arch `extra`) via
 FFI with `bindgen` at build time and `glib-sys` for GLib types. `lofty` for
 tags, `rusqlite` (bundled), `walkdir` + `rayon`, `blake3`, `clap` (derive),
-`ratatui` + `crossterm`, `nucleo-matcher`, `serde` + `toml`, `directories`,
+`gtk4-rs` (plain GTK4, no libadwaita), `serde` + `toml`, `directories`,
 `anyhow` in the binary, `thiserror` in libraries, `tracing`. Mount and eject
 through `udisksctl`.
 
@@ -52,7 +54,8 @@ crates/gpod/         safe wrapper; the only crate allowed to contain unsafe
 crates/iprune-core/  config, store, scan, playlist (.m3u8 format), playlists (operations),
                      device (mount detection), ipod (read a database), adopt (pure
                      matching), adoption (run, report, save); later plan, exec, verify, stats
-crates/iprune/       binary: CLI and TUI
+crates/iprune/       binary `iprune`: CLI
+crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6)
 crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c
 ```
 

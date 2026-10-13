@@ -45,7 +45,8 @@ predictable is worse than no sync tool.**
 5. Take over the iPod as it is today without copying 77 GB again.
 6. Bring play counts, skip counts and ratings back from the iPod so they are
    not lost.
-7. Fit Omarchy: keyboard driven, runs in the terminal, follows the theme.
+7. Fit Omarchy: a native Wayland window that follows the GTK theme, usable
+   from the keyboard, with every action also available as a command.
 
 ## 4. Non-goals
 
@@ -112,17 +113,18 @@ library files, so the first sync updates the device instead of refilling it.
    playlist entries that point to missing files.
 3. With the iPod connected, `iprune adopt` matches the 9,669 iPod tracks to
    library files and shows the result: matched, ambiguous, unmatched on either
-   side. The user resolves ambiguous cases in the interface or accepts the
+   side. The user resolves ambiguous cases in the window or accepts the
    defaults. Nothing on the iPod changes at this step.
 4. `iprune sync` shows the first plan. After adoption it should be small: the
    few library tracks missing from the iPod, and any playlist differences.
 
 ### 7.2 Editing playlists
 
-In the interface: pick a playlist, search the library, add tracks, reorder
+In the window: pick a playlist, search the library, add tracks, reorder
 them, remove them, rename or delete the playlist. Each change is written to
 the `.m3u8` file straight away. Changes made to those files by another program
-are picked up on the next scan or when the interface regains focus.
+are picked up on the next scan, or at once while the window is open (it
+watches the playlists folder).
 
 From the command line, for scripts:
 `iprune playlist add "80s" <path>...`, `iprune playlist new`, `rm`, `rename`.
@@ -131,8 +133,8 @@ From the command line, for scripts:
 
 1. Connect the iPod. iprune finds it by looking for a mounted filesystem with
    `iPod_Control/iTunes/iTunesDB`.
-2. `iprune sync` (or `s` in the interface) scans for library changes, reads the
-   iPod, pulls play statistics, and shows the plan:
+2. `iprune sync` (or the Sync button in the window) scans for library
+   changes, reads the iPod, pulls play statistics, and shows the plan:
 
    ```
    iPod "iPod de Julien" (FireWire GUID 000A27...)
@@ -160,36 +162,56 @@ From the command line, for scripts:
 
 ## 8. Interface
 
-A terminal interface built for the keyboard, with three panes:
+A desktop window in the manner of iTunes: a sidebar of sources and a grid of
+tracks. It is built with GTK4, runs natively on Wayland and follows the GTK
+theme Omarchy sets.
 
 ```
-┌ Playlists ─────────┐┌ 80s ─────────────────────────────── 214 tracks ┐
-│ 1984               ││  1  Tears for Fears   Everybody Wants to Rule… │
-│ 2000s              ││  2  a-ha              Take On Me               │
-│ 70s                ││  3  Pet Shop Boys     It's a Sin               │
-│▸80s                ││  …                                             │
-│ 8D                 ││                                                │
-│ +Abel Korneziowski ││                                                │
-│ …                  ││                                                │
-├ Device ────────────┤│                                                │
-│ iPod de Julien     ││                                                │
-│ 9,669 tracks       ││                                                │
-│ 71 GB used / 160 GB││                                                │
-│ last sync 2 d ago  ││                                                │
-└────────────────────┘└────────────────────────────────────────────────┘
- / search   a add   d remove   J/K move   n new   r rename   s sync   q quit
+┌──────────────┬───────────────────────────────────────────────────────────┐
+│ LIBRARY      │ [ Search…                ]                                │
+│  Music       │ #  Name ▲           Time  Artist         Album       Plays│
+│ PLAYLISTS    │ 1  Take On Me       3:46  a-ha           Hunting Hi…    42│
+│  1984        │ 2  It's a Sin       5:00  Pet Shop Boys  Actually       17│
+│ ▸80s         │ 3  Everybody Wants… 4:11  Tears for Fe…  Songs from…    30│
+│  +Max Richter│ …                                                         │
+│ DEVICE       │                                                           │
+│  iPod de J.  │                                                           │
+│  71/160 GB   │            [ Sync ]  [ Eject ]  214 songs, 14.2 h         │
+└──────────────┴───────────────────────────────────────────────────────────┘
 ```
 
-- `/` opens a fuzzy search over the whole library (artist, album, title).
-  Results can be added to the current playlist.
-- The sync plan opens as a full-screen view with expandable sections.
-- Colors use the terminal's 16-color palette, so Omarchy theme changes apply
-  without configuration.
-- The playlist pane shows names exactly as the files are named, so the `+` and
-  `-` prefixes already in use keep working as a sorting convention.
+- **Sidebar.** Library (every indexed track), the playlists named exactly as
+  their files (so the `+` and `-` prefixes keep sorting them), and the
+  connected iPod with its space, track count, unmanaged items and last sync.
+- **Grid.** One row per track. Columns: Name, Time, Artist, Album, Album
+  artist, Composer, Genre, Year, Disc, Track, Plays, Skips, Rating, Last
+  played, Date added, Kind, Size, and in a playlist the position `#`. Columns
+  can be shown, hidden, resized and reordered; clicking a header sorts by it,
+  clicking again reverses. The layout is remembered per view. The grid stays
+  fast with the whole library of about 9,700 tracks.
+- **Search.** A field above the grid filters the current view on title,
+  artist, album, album artist and composer, as you type.
+- **Editing playlists.** Drag rows from any view onto a playlist in the
+  sidebar to append them, or into a playlist's grid to insert them where they
+  are dropped. Dragging inside a playlist sorted by `#` reorders it. Delete
+  removes the selected rows from the playlist (never a file from the library).
+  A context menu offers Add to playlist, Remove from playlist and Show in
+  folder. Playlists are created, renamed and deleted from the sidebar. Each
+  change is written to the `.m3u8` file at once. Sorting a playlist by
+  another column changes only the view, never the file.
+- **Syncing.** The Sync button scans, reads the iPod and opens the plan in a
+  dialog with expandable sections (copy, remove, tag updates, playlists,
+  unmanaged items, statistics pulled) and the space it needs. Apply runs it
+  with a progress bar; Eject unmounts and powers off the iPod.
+- **Adoption review.** On first connection, the proposals appear as a grid,
+  one row per iPod track with its candidates, to accept or reject one by one.
+- **Keyboard.** Ctrl+F search, Delete remove, Ctrl+N new playlist, F2 rename,
+  Ctrl+Up and Ctrl+Down move the selected rows in a playlist, plus the
+  usual GTK navigation.
 
-Every action in the interface is also a command, so syncing can be bound to a
-Hyprland key or run from a script.
+Every action in the window is also a command, so syncing can be bound to a
+Hyprland key or run from a script. The window does not play music or edit
+tags (section 4).
 
 ## 9. Sync rules
 
@@ -263,8 +285,9 @@ playlists whose contents differ.
 
 ## 11. Omarchy integration
 
-- Installed as a single binary, plus a desktop entry that opens it in a
-  terminal so it shows in the Omarchy app launcher.
+- Installed as two binaries, `iprune` (commands) and `iprune-gui` (the
+  window), plus a desktop entry for the window so it shows in the Omarchy app
+  launcher.
 - An optional Hyprland binding in `~/.config/hypr/bindings.conf`.
 - A desktop notification when a sync finishes or fails.
 - No udev rule that syncs automatically. Plugging in the iPod may show a
@@ -278,7 +301,7 @@ In rough order of value:
    the library gains formats the iPod cannot play.
 2. Sync scope by rules (genre, rating, added in the last N months) to fit a
    smaller iPod.
-3. Watching the library folders for changes while the interface is open.
+3. Watching the library folders for changes while the window is open.
 4. A second iPod.
 
 ## 13. Decisions

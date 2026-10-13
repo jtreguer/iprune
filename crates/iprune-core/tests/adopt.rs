@@ -670,6 +670,169 @@ fn playlists_with_other_names_are_unmatched_on_both_sides_sorted() {
     assert_eq!(m.unmatched_library, vec!["beta", "omega"]);
 }
 
+// Prevents a regression of playlists "Dance/Trance" and "2001: a Space Odyssey"
+// staying unmatched because their files hold "_" in place of the character.
+#[test]
+fn file_name_characters_match_an_underscore_in_the_file_name() {
+    for c in ['/', '\\', ':', '*', '?', '"', '<', '>', '|'] {
+        let name = format!("Dance{c}Trance");
+        let m = match_playlists(&[ipl(&name, &[])], &[lpl(4, "Dance_Trance", &[])], &[]);
+        assert_eq!(m.matched.len(), 1, "char {c:?}: {m:?}");
+        assert_eq!(m.matched[0].ipod_name, name, "char {c:?}");
+        assert_eq!(m.matched[0].playlist_id, 4, "char {c:?}");
+        assert_eq!(m.matched[0].library_name, "Dance_Trance", "char {c:?}");
+        assert!(m.unmatched_ipod.is_empty(), "char {c:?}: {m:?}");
+        assert!(m.unmatched_library.is_empty(), "char {c:?}: {m:?}");
+    }
+}
+
+#[test]
+fn file_name_match_also_ignores_case_and_handles_several_characters() {
+    let m = match_playlists(
+        &[
+            ipl("BO - 2001: a Space Odyssey", &[]),
+            ipl("What?/Who*", &[]),
+        ],
+        &[
+            lpl(1, "bo - 2001_ A SPACE odyssey", &[]),
+            lpl(2, "What__Who_", &[]),
+        ],
+        &[],
+    );
+    let got: Vec<(&str, i64)> = m
+        .matched
+        .iter()
+        .map(|x| (x.ipod_name.as_str(), x.playlist_id))
+        .collect();
+    assert_eq!(
+        got,
+        vec![("BO - 2001: a Space Odyssey", 1), ("What?/Who*", 2)]
+    );
+    assert!(m.unmatched_ipod.is_empty() && m.unmatched_library.is_empty());
+}
+
+#[test]
+fn an_exact_file_beats_the_file_safe_one_and_the_other_stays_unmatched() {
+    // Both orders of the library, so position cannot explain the result.
+    for library in [
+        vec![lpl(1, "a:b", &[]), lpl(2, "a_b", &[])],
+        vec![lpl(2, "a_b", &[]), lpl(1, "a:b", &[])],
+    ] {
+        let m = match_playlists(&[ipl("a:b", &[])], &library, &[]);
+        assert_eq!(m.matched.len(), 1, "{m:?}");
+        assert_eq!(m.matched[0].playlist_id, 1);
+        assert_eq!(m.matched[0].library_name, "a:b");
+        assert!(m.unmatched_ipod.is_empty());
+        assert_eq!(m.unmatched_library, vec!["a_b"]);
+    }
+}
+
+#[test]
+fn a_loose_file_beats_the_file_safe_one_and_the_other_stays_unmatched() {
+    for library in [
+        vec![lpl(1, "a:B", &[]), lpl(2, "A_b", &[])],
+        vec![lpl(2, "A_b", &[]), lpl(1, "a:B", &[])],
+    ] {
+        let m = match_playlists(&[ipl("A:b", &[])], &library, &[]);
+        assert_eq!(m.matched.len(), 1, "{m:?}");
+        assert_eq!(m.matched[0].playlist_id, 1);
+        assert_eq!(m.unmatched_library, vec!["A_b"]);
+    }
+}
+
+#[test]
+fn an_earlier_file_safe_candidate_does_not_take_a_file_from_an_exact_name() {
+    // "a:b" comes first and would take "a_b" in a single file-safe pass.
+    let m = match_playlists(
+        &[ipl("a:b", &[]), ipl("a_b", &[])],
+        &[lpl(1, "a_b", &[])],
+        &[],
+    );
+    assert_eq!(m.matched.len(), 1, "{m:?}");
+    assert_eq!(m.matched[0].ipod_name, "a_b");
+    assert_eq!(m.unmatched_ipod, vec!["a:b"]);
+    // And a loose name beats a file-safe one for the same file.
+    let m = match_playlists(
+        &[ipl("a:b", &[]), ipl("A_B", &[])],
+        &[lpl(1, "a_b", &[])],
+        &[],
+    );
+    assert_eq!(m.matched.len(), 1, "{m:?}");
+    assert_eq!(m.matched[0].ipod_name, "A_B");
+    assert_eq!(m.unmatched_ipod, vec!["a:b"]);
+}
+
+#[test]
+fn a_file_is_never_matched_twice_in_the_file_safe_pass() {
+    let m = match_playlists(
+        &[ipl("a:b", &[]), ipl("a/b", &[]), ipl("a*b", &[])],
+        &[lpl(1, "a_b", &[])],
+        &[],
+    );
+    assert_eq!(m.matched.len(), 1, "{m:?}");
+    assert_eq!(m.matched[0].playlist_id, 1);
+    assert_eq!(m.unmatched_ipod.len(), 2, "{m:?}");
+    assert!(!m.unmatched_ipod.contains(&m.matched[0].ipod_name));
+    assert!(m.unmatched_library.is_empty());
+}
+
+#[test]
+fn names_differing_in_another_way_stay_unmatched() {
+    for (ipod_name, file) in [
+        ("Dance/Trance", "Dance-Trance"),
+        ("Dance/Trance", "DanceTrance"),
+        ("Dance/Trance", "Dance__Trance"),
+        ("Dance/Trance", "Dance_ Trance"),
+        ("Dance/Trance", "Dance_Trance2"),
+        ("Dance Trance", "Dance_Trance"),
+        ("Dance.Trance", "Dance_Trance"),
+    ] {
+        let m = match_playlists(&[ipl(ipod_name, &[])], &[lpl(1, file, &[])], &[]);
+        assert!(m.matched.is_empty(), "{ipod_name:?} vs {file:?}: {m:?}");
+        assert_eq!(m.unmatched_ipod, vec![ipod_name]);
+        assert_eq!(m.unmatched_library, vec![file]);
+    }
+}
+
+#[test]
+fn unmatched_lists_stay_sorted_next_to_a_file_safe_match() {
+    let m = match_playlists(
+        &[
+            ipl("zeta", &[]),
+            ipl("Dance/Trance", &[]),
+            ipl("alpha", &[]),
+        ],
+        &[
+            lpl(1, "omega", &[]),
+            lpl(2, "Dance_Trance", &[]),
+            lpl(3, "beta", &[]),
+        ],
+        &[],
+    );
+    assert_eq!(m.matched.len(), 1);
+    assert_eq!(m.matched[0].playlist_id, 2);
+    assert_eq!(m.unmatched_ipod, vec!["alpha", "zeta"]);
+    assert_eq!(m.unmatched_library, vec!["beta", "omega"]);
+}
+
+#[test]
+fn same_contents_is_computed_for_file_safe_matches() {
+    let map = [(1, 10), (2, 20)];
+    let same = match_playlists(
+        &[ipl("A/B", &[1, 2])],
+        &[lpl(1, "A_B", &[Some(10), Some(20)])],
+        &map,
+    );
+    assert!(same.matched[0].same_contents, "{same:?}");
+    let reordered = match_playlists(
+        &[ipl("A/B", &[1, 2])],
+        &[lpl(1, "A_B", &[Some(20), Some(10)])],
+        &map,
+    );
+    assert_eq!(reordered.matched.len(), 1);
+    assert!(!reordered.matched[0].same_contents, "{reordered:?}");
+}
+
 #[test]
 fn same_contents_follows_order_repeats_and_length() {
     let map = [(1, 10), (2, 20)];
@@ -790,13 +953,14 @@ fn resolve_prefers_the_higher_score_within_a_reason() {
 #[test]
 fn tags_only_scores_two_and_needs_an_album_for_a_default() {
     let mut i = ip(1, 100, 5000, "A", "X");
-    let mut l = lib(10, 999, 5000, "A", "X");
+    let mut l = lib(10, 999, 5500, "A", "X");
     let a = adopt(&[i.clone()], &[l.clone()]);
     assert_eq!(
         (proposal(&a, 1).score, proposal(&a, 1).default),
         (2, Some(10))
     );
-    // No album on either side: could be a live version or a remix.
+    // No album on either side and durations 500 ms apart: could be a live
+    // version or a remix.
     i.album = None;
     l.album = None;
     let a = adopt(&[i], &[l]);
@@ -805,6 +969,87 @@ fn tags_only_scores_two_and_needs_an_album_for_a_default() {
         (p.reason, p.default, p.candidates.clone()),
         (Reason::TagsOnly, None, vec![10])
     );
+    let (mapping, left) = resolve(&a, true);
+    assert!(mapping.is_empty());
+    assert_eq!(left.len(), 1);
+}
+
+/// One iPod track and one retagged library file, both without an album, with
+/// the given durations.
+fn no_album_pair(ipod_ms: u32, lib_ms: u32) -> Adoption {
+    let mut i = ip(1, 100, ipod_ms, "A", "X");
+    let mut l = lib(10, 999, lib_ms, "A", "X");
+    i.album = None;
+    l.album = None;
+    adopt(&[i], &[l])
+}
+
+// Prevents the retagged Max Richter and Kurtag files, which have no album and
+// durations equal to the millisecond, from being left without a default.
+#[test]
+fn tags_only_without_album_defaults_when_durations_are_within_10_ms() {
+    for (ipod_ms, lib_ms, default) in [
+        (5000, 5000, Some(10)),
+        (5000, 5010, Some(10)),
+        (5010, 5000, Some(10)),
+        (5000, 5011, None),
+        (5011, 5000, None),
+        (5000, 5500, None),
+    ] {
+        let a = no_album_pair(ipod_ms, lib_ms);
+        let p = proposal(&a, 1);
+        assert_eq!(
+            (p.reason, p.score, p.default, p.candidates.clone()),
+            (Reason::TagsOnly, 2, default, vec![10]),
+            "ipod {ipod_ms} ms, library {lib_ms} ms"
+        );
+    }
+}
+
+#[test]
+fn tags_only_with_an_album_keeps_its_default_at_two_seconds() {
+    let a = adopt(
+        &[ip(1, 100, 5000, "A", "X")],
+        &[lib(10, 999, 7000, "A", "X")],
+    );
+    let p = proposal(&a, 1);
+    assert_eq!((p.reason, p.default), (Reason::TagsOnly, Some(10)));
+}
+
+#[test]
+fn tags_only_without_album_has_no_default_with_several_candidates() {
+    let mut i = ip(1, 100, 5000, "A", "X");
+    i.album = None;
+    let mut l10 = lib(10, 999, 5000, "A", "X");
+    let mut l11 = lib(11, 998, 5000, "A", "X");
+    l10.album = None;
+    l11.album = None;
+    // Both exactly as long: still two candidates, still no default.
+    let a = adopt(&[i.clone()], &[l10.clone(), l11.clone()]);
+    let p = proposal(&a, 1);
+    assert_eq!((p.default, p.candidates.clone()), (None, vec![10, 11]));
+    // Only one is within 10 ms: the second still makes it ambiguous.
+    l11.duration_ms = Some(6500);
+    let a = adopt(&[i], &[l10, l11]);
+    let p = proposal(&a, 1);
+    assert_eq!((p.default, p.candidates.clone()), (None, vec![10, 11]));
+    let (mapping, left) = resolve(&a, true);
+    assert!(mapping.is_empty());
+    assert_eq!(left.len(), 1);
+}
+
+#[test]
+fn resolve_maps_a_no_album_tags_only_match_that_agrees_to_the_millisecond() {
+    let a = no_album_pair(5000, 5000);
+    let (mapping, left) = resolve(&a, true);
+    assert_eq!(mapping, vec![(1, 10)]);
+    assert!(left.is_empty());
+    // Without --accept-proposals nothing is taken.
+    let (mapping, left) = resolve(&a, false);
+    assert!(mapping.is_empty());
+    assert_eq!(left.len(), 1);
+    // 11 ms apart: not taken even with it.
+    let a = no_album_pair(5000, 5011);
     let (mapping, left) = resolve(&a, true);
     assert!(mapping.is_empty());
     assert_eq!(left.len(), 1);

@@ -15,8 +15,7 @@ Status: draft, 2026-10-13. Companion to [design.md](design.md).
 | File walking | `walkdir`, `rayon` for parallel tag reading | |
 | Hashing | `blake3` | |
 | CLI | `clap` (derive) | |
-| Terminal UI | `ratatui` with `crossterm` | |
-| Fuzzy search | `nucleo-matcher` | |
+| Desktop UI | GTK4 through `gtk4-rs` | plain GTK4, not libadwaita, so the GTK theme set by Omarchy applies |
 | Config | `serde`, `toml` | |
 | Paths | `directories` | XDG locations |
 | Errors and logs | `anyhow` in the binary, `thiserror` in libraries, `tracing` | |
@@ -46,8 +45,10 @@ iprune/
         exec.rs             applies a plan through gpod
         verify.rs           snapshot and compare
         stats.rs            play count pull and export
-    iprune/                 binary: CLI and TUI
-      src/{main,cli,tui/*}.rs
+    iprune/                 binary `iprune`: the CLI
+      src/main.rs
+    iprune-gui/             binary `iprune-gui`: the GTK4 window
+      src/{main,view_model,...}.rs
   docs/
   tests/
     fixtures/
@@ -302,8 +303,9 @@ playlist, so the row must outlive the file until the next sync.
   same folder, `fsync`ed, then renamed over the original.
 - External edits are detected by `mtime`. Every edit records the file's mtime
   when it reads it and refuses to replace the file if it changed meanwhile.
-  If a file changed on disk while the interface has unsaved changes for it,
-  the interface reloads it and shows a message instead of overwriting.
+  The window watches the playlists folder and reloads a file changed by
+  another program; an edit made against the old contents is refused and
+  the window shows a message instead of overwriting.
 - Creating and renaming never replace an existing file (no-clobber persist,
   hard link then unlink).
 - Unresolved entries are kept verbatim in the file so iprune never deletes a
@@ -344,7 +346,8 @@ library track.
 6. Second pass for unmatched iPod tracks: same normalized artist, title and
    album, duration within two seconds, any size. These are proposals, covering
    files whose tags were edited after they were copied. A default needs a
-   single candidate and a non-empty album.
+   single candidate and either a non-empty album or durations within 10 ms
+   (a live take or a remix is never that close).
 7. Proposals are resolved strongest first (duplicates on the iPod, duplicate
    library files, weak tags, tags only; then by score), so a weak default
    never takes a file from a better match.
@@ -364,8 +367,8 @@ library track.
    content is the deciding evidence when it is available.
 
 Output is written to `adopt-report.txt` in the data folder, summarised on
-the terminal, and shown in the interface. From the command line, nothing is
-saved while proposals are pending: the user reads the report and runs again
+the terminal, and shown in the window's adoption review. From the command
+line, nothing is saved while proposals are pending: the user reads the report and runs again
 with `--accept-proposals`, which takes every default. Proposals left without
 a usable default keep their iPod track unmanaged. A second adoption of the
 same iPod needs `--force`. Accepted
@@ -374,7 +377,9 @@ from the iPod's current values, so the first sync updates tags only where they
 really differ.
 
 Playlist adoption: iPod playlists are matched to `.m3u8` files by exact name,
-then by NFC-normalized, case-insensitive name. Matches go into
+then by NFC-normalized, case-insensitive name, then with the characters a
+file name cannot hold (`/ \ : * ? " < > |`) replaced by `_`, as exporters
+did: "Dance/Trance" is the file `Dance_Trance.m3u8`. Matches go into
 `device_playlists`.
 
 This step only reads the iPod. It can also run against the backup with
@@ -522,32 +527,59 @@ iprune restore <timestamp>
 iprune doctor [--fix]
 iprune snapshot <mountpoint|iTunesDB>
 iprune eject
-iprune                    (no arguments: opens the TUI)
+iprune                    (no arguments: prints help; the window is iprune-gui)
 ```
 
 Exit codes: 0 success, 1 error, 2 usage, 3 verification failed, 4 user
 declined the plan.
 
-## 14. Terminal UI
+## 14. Desktop UI
 
-- One event loop: crossterm events plus a channel for background jobs (scan,
-  sync). Long jobs run on a worker thread; the libgpod thread is that worker.
-- Views: playlists and tracks (main), search overlay, sync plan, sync
-  progress, adoption review, device info.
-- Colors use `Color::Reset` and the 16 named ANSI colors only, so the terminal
-  theme set by Omarchy controls the look.
-- Key map follows vim where it fits: `j/k` move, `J/K` move the selected track
-  within the playlist, `/` search, `a` add, `d` remove, `n` new playlist,
-  `r` rename, `D` delete playlist, `s` sync, `?` help, `q` quit.
+Crate `iprune-gui`, binary `iprune-gui`, GTK4 (4.12 or later) through
+`gtk4-rs`, without libadwaita. Omarchy switches GTK applications between
+light and dark with the `gtk-theme` (Adwaita or Adwaita-dark) and
+`color-scheme` settings, which plain GTK4 follows. The window needs none of
+libadwaita's widgets.
+
+- **Grid.** `gtk::ColumnView` over a `gio::ListStore` of a `TrackObject`
+  GObject subclass, wrapped in a `gtk::FilterListModel` (search) and a
+  `gtk::SortListModel` fed by the column sorters. List widgets are recycled,
+  so widgets exist only for the visible rows; the ~9,700 track objects are
+  plain data that sorting and filtering go through. Column visibility, width
+  and order are saved per view in `~/.local/state/iprune/ui.toml`.
+- **Sidebar.** `gtk::ListView` with sections for Library, Playlists and
+  Device (section headers need GTK 4.12). Playlists are drop targets for
+  tracks.
+- **Drag and drop.** Rows carry library track ids (`gdk::ContentProvider`
+  with an application-specific type). A drop on a sidebar playlist calls
+  `playlists::add`; a drop inside a playlist grid calls `add` with the drop
+  position, or `move_entry` when the rows come from the same playlist.
+  `ColumnView` has no drop-at-row support of its own: each row widget gets a
+  `gtk::DropTarget`, and the drop position is computed from the row and the
+  pointer's half of it.
+- **Threads.** The GTK main thread owns the widgets and its own SQLite
+  connection for playlist edits, which are small and quick. Scan, plan and
+  sync run on one worker thread that owns the libgpod `Database`; it sends
+  progress and results back through an async channel read by
+  `glib::MainContext::spawn_local`.
+- **Same code as the CLI.** Every edit and sync goes through `iprune-core`
+  (`playlists`, `scan`, `adoption`, `plan`, `exec`); the window holds no
+  logic of its own beyond presentation.
+- **Logic without a display.** Sorting keys, filtering, drop index
+  arithmetic and the plan's presentation live in `view_model.rs` as plain
+  functions with unit tests. Widget code stays thin.
+- **Playlists folder.** A `gio::FileMonitor` reloads files changed by other
+  programs.
 
 ## 15. Omarchy packaging
 
-- `cargo install --path crates/iprune`, or a PKGBUILD later.
-- Desktop entry `~/.local/share/applications/iprune.desktop` with
-  `Terminal=true` so the launcher opens it in the default terminal.
+- `cargo install --path crates/iprune` and `--path crates/iprune-gui`, or a
+  PKGBUILD later.
+- Desktop entry `~/.local/share/applications/iprune.desktop` that starts
+  `iprune-gui`.
 - Notifications through `notify-send` at the end of a sync.
 - Optional binding, for example in `~/.config/hypr/bindings.conf`:
-  `bindd = SUPER SHIFT, I, iPod sync, exec, $terminal -e iprune`.
+  `bindd = SUPER SHIFT, I, iPod, exec, iprune-gui`.
 
 ## 16. Testing
 
@@ -573,7 +605,7 @@ apply to a fake iPod, plan again; the second plan is always empty.
 | M3 | planner and `sync --plan-only` | no |
 | M4 | executor for playlists only, backups, checks, verify, restore | yes |
 | M5 | track copy, remove, tag update, statistics pull, `doctor` | yes |
-| M6 | terminal UI | yes |
+| M6 | desktop UI (GTK4) | yes |
 | M7 | desktop entry, notifications, packaging | yes |
 
 M4 comes before M5 on purpose. Playlist writes are the operation that failed

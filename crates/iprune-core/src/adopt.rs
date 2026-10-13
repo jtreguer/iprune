@@ -12,6 +12,9 @@ use unicode_normalization::UnicodeNormalization;
 const DURATION_MS: u32 = 1000;
 /// Duration tolerance for the tags-only second pass.
 const DURATION_TAGS_ONLY_MS: u32 = 2000;
+/// A tags-only match this close in duration is the same recording even
+/// without an album: a live take or a remix is never within 10 ms.
+const DURATION_SAME_RECORDING_MS: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpodTrack {
@@ -319,6 +322,7 @@ pub fn adopt(ipod: &[IpodTrack], library: &[LibTrack]) -> Adoption {
     }
 
     // Pass 2: unmatched iPod tracks, same artist, title and album, any size.
+    let lib_by_id: HashMap<i64, &LibTrack> = library.iter().map(|l| (l.id, l)).collect();
     let mut by_tags: HashMap<(&str, &str, &str), Vec<&LibTrack>> = HashMap::new();
     for l in library {
         let n = &lib_norm[&l.id];
@@ -351,8 +355,20 @@ pub fn adopt(ipod: &[IpodTrack], library: &[LibTrack]) -> Adoption {
             out.unmatched_ipod.push(dbid);
         } else {
             // Without an album, same artist and title could be another
-            // recording (live, remix): no default.
-            let default = (candidates.len() == 1 && !n.album.is_empty()).then(|| candidates[0]);
+            // recording (live, remix): no default, unless the durations
+            // agree to within a few milliseconds.
+            let same_recording = |id: i64| {
+                !n.album.is_empty()
+                    || close(
+                        it.duration_ms,
+                        lib_by_id[&id].duration_ms,
+                        DURATION_SAME_RECORDING_MS,
+                    )
+            };
+            let default = match candidates[..] {
+                [id] if same_recording(id) => Some(id),
+                _ => None,
+            };
             out.proposals.push(Proposal {
                 dbid,
                 reason: Reason::TagsOnly,
@@ -460,8 +476,17 @@ fn loose(name: &str) -> String {
     name.nfc().collect::<String>().to_lowercase()
 }
 
+/// Characters a file name cannot hold on Linux or Windows. Playlists exported
+/// to files got `_` in their place: "Dance/Trance" became "Dance_Trance".
+const NOT_IN_FILE_NAMES: [char; 9] = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+
+fn file_safe(name: &str) -> String {
+    loose(name).replace(NOT_IN_FILE_NAMES, "_")
+}
+
 /// Matches regular iPod playlists to playlist files by exact name, then by
-/// NFC case-insensitive name. Each file matches at most one iPod playlist.
+/// NFC case-insensitive name, then with the characters file names cannot hold
+/// replaced by `_`. Each file matches at most one iPod playlist.
 pub fn match_playlists(
     ipod: &[IpodPlaylist],
     library: &[LibPlaylist],
@@ -470,7 +495,6 @@ pub fn match_playlists(
     let map: HashMap<u64, i64> = mapping.iter().copied().collect();
     let mut free: Vec<&LibPlaylist> = library.iter().collect();
     let mut out = PlaylistAdoption::default();
-    let mut pending: Vec<&IpodPlaylist> = Vec::new();
     let take =
         |ip: &IpodPlaylist, i: usize, free: &mut Vec<&LibPlaylist>, out: &mut PlaylistAdoption| {
             let lib = free.remove(i);
@@ -482,18 +506,20 @@ pub fn match_playlists(
                 same_contents: mapped == lib.members,
             });
         };
-    for ip in ipod {
-        match free.iter().position(|l| l.name == ip.name) {
-            Some(i) => take(ip, i, &mut free, &mut out),
-            None => pending.push(ip),
+    let passes: [fn(&str) -> String; 3] = [str::to_owned, loose, file_safe];
+    let mut pending: Vec<&IpodPlaylist> = ipod.iter().collect();
+    for key in passes {
+        let mut next = Vec::new();
+        for ip in pending {
+            let k = key(&ip.name);
+            match free.iter().position(|l| key(&l.name) == k) {
+                Some(i) => take(ip, i, &mut free, &mut out),
+                None => next.push(ip),
+            }
         }
+        pending = next;
     }
-    for ip in pending {
-        match free.iter().position(|l| loose(&l.name) == loose(&ip.name)) {
-            Some(i) => take(ip, i, &mut free, &mut out),
-            None => out.unmatched_ipod.push(ip.name.clone()),
-        }
-    }
+    out.unmatched_ipod = pending.iter().map(|ip| ip.name.clone()).collect();
     out.unmatched_library = free.iter().map(|l| l.name.clone()).collect();
     out.matched.sort_by(|a, b| a.ipod_name.cmp(&b.ipod_name));
     out.unmatched_ipod.sort();
