@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use common::{Kind, fixture};
+use common::{Kind, fairplay_m4a, fixture, id3v24_text, mp3_with_id3v2};
 
 struct Sandbox {
     dir: tempfile::TempDir,
@@ -470,4 +470,62 @@ fn nothing_is_written_outside_the_sandbox_home() {
     assert_ok(&sb.run(&["scan"]));
     assert!(!sb.base().join("home").exists());
     assert!(sb.base().join("data/iprune/iprune.sqlite").is_file());
+}
+
+#[test]
+fn scan_lists_untagged_and_fairplay_files_and_still_succeeds() {
+    let sb = Sandbox::new();
+    sb.init();
+    sb.add_track("clean.mp3", Kind::Mp3, 1);
+    fs::write(
+        sb.music.join("badtag.mp3"),
+        mp3_with_id3v2(
+            2,
+            &[
+                id3v24_text("TIT2", 3, b"Lost"),
+                id3v24_text("TRCK", 1, &[0x31, 0x00, 0x32, 0x00]),
+            ],
+        ),
+    )
+    .unwrap();
+    fs::write(sb.music.join("purchase.m4a"), fairplay_m4a(3)).unwrap();
+    fs::write(sb.music.join("garbage.mp3"), b"nope").unwrap();
+
+    let o = sb.run(&["scan"]);
+    assert_ok(&o);
+    let text = out(&o);
+    assert!(text.contains("3 added"), "{text}");
+    assert!(
+        text.contains("indexed without tags (tags could not be parsed): 1\n  ")
+            && text.contains("badtag.mp3:"),
+        "{text}"
+    );
+    assert!(
+        text.contains("FairPlay protected, indexed as AAC: 1\n  ") && text.contains("purchase.m4a"),
+        "{text}"
+    );
+    assert!(text.contains("unreadable: 1"), "{text}");
+    assert!(text.contains("garbage.mp3"), "{text}");
+    // Files are listed under their own heading only.
+    let untagged_at = text.find("indexed without tags").unwrap();
+    let drm_at = text.find("FairPlay").unwrap();
+    assert!(
+        !text[untagged_at..drm_at].contains("purchase.m4a"),
+        "{text}"
+    );
+    assert!(!text.contains("clean.mp3"), "{text}");
+}
+
+#[test]
+fn scan_of_ordinary_files_prints_no_untagged_or_fairplay_section() {
+    let sb = Sandbox::new();
+    sb.init();
+    sb.add_track("a.mp3", Kind::Mp3, 1);
+    sb.add_track("b.m4a", Kind::Aac, 2);
+    let text = out(&sb.run(&["scan"]));
+    assert!(text.contains("2 added"), "{text}");
+    assert!(
+        !text.contains("without tags") && !text.contains("FairPlay"),
+        "{text}"
+    );
 }

@@ -38,6 +38,12 @@ pub struct ScanReport {
     pub missing: Vec<PathBuf>,
     pub unreadable: Vec<(PathBuf, String)>,
     pub unsupported: Vec<(PathBuf, String)>,
+    /// Present files indexed without tags because their tags could not be
+    /// parsed. Taken from the index: listed on every scan until fixed.
+    pub untagged: Vec<(PathBuf, String)>,
+    /// Present FairPlay protected files (iTunes Store purchases), indexed as
+    /// AAC. Taken from the index.
+    pub drm: Vec<PathBuf>,
     pub non_utf8: Vec<PathBuf>,
     /// Playlists rewritten to follow moved files.
     pub rewritten_playlists: Vec<String>,
@@ -133,7 +139,7 @@ fn without_panics<T>(
 }
 
 fn read_file(s: &Seen) -> Result<FileRecord, ReadError> {
-    let (info, tags) = without_panics(|| tags::read(&s.path))?;
+    let read = without_panics(|| tags::read(&s.path))?;
     let hash = hash_file(&s.path).map_err(|e| ReadError::Unreadable(e.to_string()))?;
     Ok(FileRecord {
         path: s.path.clone(),
@@ -141,8 +147,10 @@ fn read_file(s: &Seen) -> Result<FileRecord, ReadError> {
         size: s.size,
         mtime_ns: s.mtime_ns,
         hash,
-        info,
-        tags,
+        info: read.info,
+        tags: read.tags,
+        tag_error: read.tag_error,
+        drm: read.drm,
     })
 }
 
@@ -192,7 +200,9 @@ pub fn scan(
                 if t.missing_since.is_none()
                     && t.size == s.size
                     && t.mtime_ns == s.mtime_ns
-                    && t.path == s.path =>
+                    && t.path == s.path
+                    // Files whose tags failed are retried on every scan.
+                    && t.tag_error.is_none() =>
             {
                 report.unchanged += 1;
             }
@@ -294,6 +304,10 @@ pub fn scan(
     report.rewritten_playlists = playlists::rewrite_moved(&tx, cfg, &moves)?;
     tx.commit()?;
 
+    // Reported from the index, so they show up on every scan, not just the
+    // one that first read the file.
+    let flagged = store::flagged_tracks(store.conn())?;
+    (report.untagged, report.drm) = (flagged.untagged, flagged.drm);
     report.playlists = playlists::sync_from_disk(store.conn(), cfg, true)?;
     Ok(report)
 }

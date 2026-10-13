@@ -95,6 +95,68 @@ pub fn fixture(kind: Kind, variant: u32) -> PathBuf {
     path
 }
 
+/// One ID3v2.4 frame: id, syncsafe size, no flags, then `data`.
+pub fn id3v24_frame(id: &str, data: &[u8]) -> Vec<u8> {
+    assert_eq!(id.len(), 4);
+    let n = data.len() as u32;
+    assert!(n < 1 << 28);
+    let mut f = id.as_bytes().to_vec();
+    f.extend([
+        (n >> 21) as u8 & 0x7f,
+        (n >> 14) as u8 & 0x7f,
+        (n >> 7) as u8 & 0x7f,
+        n as u8 & 0x7f,
+    ]);
+    f.extend([0, 0]);
+    f.extend(data);
+    f
+}
+
+/// A text frame: encoding byte, then the raw text bytes.
+pub fn id3v24_text(id: &str, encoding: u8, text: &[u8]) -> Vec<u8> {
+    let mut d = vec![encoding];
+    d.extend(text);
+    id3v24_frame(id, d.as_slice())
+}
+
+/// The bytes of the cached Mp3 fixture `variant` with its ID3v2 tag replaced
+/// by a hand-built ID3v2.4 tag made of `frames`. The audio is untouched.
+pub fn mp3_with_id3v2(variant: u32, frames: &[Vec<u8>]) -> Vec<u8> {
+    let raw = fs::read(fixture(Kind::Mp3, variant)).unwrap();
+    let audio = if raw.starts_with(b"ID3") {
+        let size = raw[6..10]
+            .iter()
+            .fold(0usize, |a, b| (a << 7) | *b as usize);
+        &raw[10 + size..]
+    } else {
+        &raw[..]
+    };
+    let body: Vec<u8> = frames.concat();
+    let n = body.len() as u32;
+    let mut out = b"ID3\x04\x00\x00".to_vec();
+    out.extend([
+        (n >> 21) as u8 & 0x7f,
+        (n >> 14) as u8 & 0x7f,
+        (n >> 7) as u8 & 0x7f,
+        n as u8 & 0x7f,
+    ]);
+    out.extend(body);
+    out.extend(audio);
+    out
+}
+
+/// The bytes of the cached Aac fixture `variant` with the `mp4a` sample entry
+/// renamed `drms`, which is how FairPlay protected iTunes Store files look.
+pub fn fairplay_m4a(variant: u32) -> Vec<u8> {
+    let mut b = fs::read(fixture(Kind::Aac, variant)).unwrap();
+    let stsd = b.windows(4).position(|w| w == b"stsd").expect("stsd atom");
+    // stsd: fourcc, version/flags (4), entry count (4), then entry size (4) and format.
+    let at = stsd + 4 + 4 + 4 + 4;
+    assert_eq!(&b[at..at + 4], b"mp4a");
+    b[at..at + 4].copy_from_slice(b"drms");
+    b
+}
+
 pub struct Env {
     _dir: tempfile::TempDir,
     pub music: PathBuf,
@@ -126,6 +188,14 @@ impl Env {
     pub fn relative_playlists(mut self) -> Self {
         self.cfg.playlists.path_style = PathStyle::Relative;
         self
+    }
+
+    /// Writes `bytes` to `rel` under the music folder.
+    pub fn add_bytes(&self, rel: &str, bytes: &[u8]) -> PathBuf {
+        let dest = self.music.join(rel);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, bytes).unwrap();
+        dest
     }
 
     /// Copies a fixture to `rel` under the music folder.

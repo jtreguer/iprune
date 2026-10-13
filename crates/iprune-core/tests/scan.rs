@@ -5,7 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use common::{Env, Kind, chmod_000_blocks_reads, fixture};
+use common::{
+    Env, Kind, chmod_000_blocks_reads, fairplay_m4a, fixture, id3v24_text, mp3_with_id3v2,
+};
 use iprune_core::Error;
 use iprune_core::tags::FileKind;
 
@@ -632,4 +634,256 @@ fn empty_root_with_nothing_indexed_under_it_is_fine() {
     env.cfg.library.roots.push(second);
     let r = env.scan();
     assert_eq!((r.unchanged, r.added, r.missing.len()), (1, 0, 0));
+}
+
+fn tit2(t: &str) -> Vec<u8> {
+    id3v24_text("TIT2", 3, t.as_bytes())
+}
+
+/// UTF-16 text with an invalid BOM: not even Relaxed parsing accepts the tag.
+fn unparseable_tag() -> Vec<Vec<u8>> {
+    vec![
+        tit2("Lost"),
+        id3v24_text("TRCK", 1, &[0x31, 0x00, 0x32, 0x00]),
+    ]
+}
+
+// Prevents: valid MP3s with a quirky tag landing in "unreadable" and never
+// being indexed.
+#[test]
+fn file_with_unparseable_tags_is_indexed_without_tags_and_reported() {
+    let mut env = Env::new();
+    let good = env.add("good.mp3", Kind::Mp3, 1);
+    let bad = env.add_bytes("bad-tag.mp3", &mp3_with_id3v2(2, &unparseable_tag()));
+    let garbage = env.music.join("garbage.mp3");
+    fs::write(&garbage, b"this is not audio at all, just text").unwrap();
+
+    let r = env.scan();
+    assert_eq!(r.added, 2);
+    assert_eq!(r.untagged.len(), 1, "{:?}", r.untagged);
+    assert_eq!(r.untagged[0].0, bad);
+    assert!(!r.untagged[0].1.is_empty());
+    assert_eq!(r.unreadable.len(), 1, "{:?}", r.unreadable);
+    assert_eq!(r.unreadable[0].0, garbage, "garbage stays unreadable");
+    assert!(r.drm.is_empty() && r.unsupported.is_empty());
+
+    let row = env.track(&bad);
+    assert_eq!(row.tags, iprune_core::tags::Tags::default());
+    assert_eq!(row.info.kind, FileKind::Mp3);
+    assert!(
+        row.info.duration_ms.is_some_and(|ms| ms > 900),
+        "{:?}",
+        row.info
+    );
+    assert!(row.missing_since.is_none());
+    assert_eq!(row.hash, *blake3::hash(&fs::read(&bad).unwrap()).as_bytes());
+    assert!(env.tracks().iter().all(|t| t.path != garbage));
+    assert!(!r.untagged.iter().any(|(p, _)| *p == good));
+
+    // A file with a tag error is never "unchanged": it is read again.
+    let r = env.scan();
+    assert_eq!((r.added, r.unchanged, r.updated), (0, 1, 1));
+    assert!(r.unreadable.len() == 1 && r.missing.is_empty());
+}
+
+// Prevents: a skippable frame being reported as a tag failure, or its file
+// losing the tags that did parse.
+#[test]
+fn file_with_one_skippable_frame_is_indexed_with_its_tags_and_not_reported() {
+    let mut env = Env::new();
+    let p = env.add_bytes(
+        "odd.mp3",
+        &mp3_with_id3v2(1, &[tit2("Survivor"), id3v24_text("TDRC", 3, b"notadate")]),
+    );
+    let r = env.scan();
+    assert_eq!(r.added, 1);
+    assert!(r.untagged.is_empty() && r.unreadable.is_empty(), "{r:?}");
+    assert_eq!(env.track(&p).tags.title.as_deref(), Some("Survivor"));
+}
+
+#[test]
+fn file_whose_tags_break_later_is_updated_not_lost() {
+    let mut env = Env::new();
+    let p = env.add_bytes("a.mp3", &mp3_with_id3v2(1, &[tit2("Fine")]));
+    env.add("b.mp3", Kind::Mp3, 2);
+    env.scan();
+    let before = env.track(&p);
+    assert_eq!(before.tags.title.as_deref(), Some("Fine"));
+
+    fs::write(&p, mp3_with_id3v2(1, &unparseable_tag())).unwrap();
+    let r = env.scan();
+    assert_eq!(r.updated, 1);
+    assert_eq!(r.untagged.len(), 1);
+    assert!(r.unreadable.is_empty() && r.missing.is_empty());
+    let after = env.track(&p);
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.tags.title, None);
+    assert!(after.missing_since.is_none());
+}
+
+// Prevents: iTunes Store purchases (`drms` sample entry) being rejected as an
+// unsupported codec.
+#[test]
+fn fairplay_m4a_is_indexed_as_aac_and_reported() {
+    let mut env = Env::new();
+    let store = env.add_bytes("Store/song.m4a", &fairplay_m4a(1));
+    let plain = env.add("plain.m4a", Kind::Aac, 2);
+
+    let r = env.scan();
+    assert_eq!(r.added, 2);
+    assert_eq!(r.drm, vec![store.clone()]);
+    assert!(r.unsupported.is_empty() && r.unreadable.is_empty(), "{r:?}");
+    assert!(r.untagged.is_empty());
+    let row = env.track(&store);
+    assert_eq!(row.info.kind, FileKind::Aac);
+    assert_eq!(row.tags.title.as_deref(), Some("Title1"));
+    assert_eq!(env.track(&plain).info.kind, FileKind::Aac);
+}
+
+const GOOD_TRCK_ENC3: &[u8] = b"1/23";
+
+/// Same byte length as the bad frame: UTF-16 text with a bad BOM is 1 + 4 bytes.
+fn good_track() -> Vec<u8> {
+    id3v24_text("TRCK", 3, GOOD_TRCK_ENC3)
+}
+
+fn set_mtime(p: &std::path::Path, t: SystemTime) {
+    fs::File::options()
+        .write(true)
+        .open(p)
+        .unwrap()
+        .set_modified(t)
+        .unwrap();
+}
+
+// Prevents: a file with unparseable tags being treated as unchanged (and so
+// never retried or reported again) once its size and mtime match the index.
+#[test]
+fn untagged_file_is_listed_and_retried_on_every_scan() {
+    let mut env = Env::new();
+    let bad = env.add_bytes("bad.mp3", &mp3_with_id3v2(2, &unparseable_tag()));
+    env.add("ok.mp3", Kind::Mp3, 1);
+    env.scan();
+    let id = env.track(&bad).id;
+    for round in 1..=3 {
+        let r = env.scan();
+        assert_eq!(
+            (r.added, r.unchanged, r.updated),
+            (0, 1, 1),
+            "round {round}"
+        );
+        assert_eq!(r.untagged.len(), 1, "round {round}: {:?}", r.untagged);
+        assert_eq!(r.untagged[0].0, bad);
+        assert!(!r.untagged[0].1.is_empty());
+        assert!(r.unreadable.is_empty() && r.missing.is_empty());
+        assert_eq!(env.track(&bad).id, id, "same row each time");
+    }
+}
+
+// Prevents: a repaired file staying flagged forever. The repaired file has the
+// same size and mtime as the broken one, so only the retry rule can heal it.
+#[test]
+fn repairing_the_tags_clears_the_flag_even_with_same_size_and_mtime() {
+    let mut env = Env::new();
+    let bad_frames = unparseable_tag();
+    let mut good_frames = bad_frames.clone();
+    good_frames[1] = good_track();
+    let broken = mp3_with_id3v2(2, &bad_frames);
+    let fixed = mp3_with_id3v2(2, &good_frames);
+    assert_eq!(broken.len(), fixed.len(), "fixture precondition");
+
+    let p = env.add_bytes("a.mp3", &broken);
+    env.add("b.mp3", Kind::Mp3, 1);
+    let when = SystemTime::now() - Duration::from_secs(3600);
+    set_mtime(&p, when);
+    let r = env.scan();
+    assert_eq!(r.untagged.len(), 1);
+    let before = env.track(&p);
+    assert!(before.tag_error.is_some());
+    assert_eq!(before.tags.title, None);
+
+    fs::write(&p, &fixed).unwrap();
+    set_mtime(&p, when);
+    let r = env.scan();
+    assert!(r.untagged.is_empty(), "{:?}", r.untagged);
+    assert!(r.unreadable.is_empty());
+    let after = env.track(&p);
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.tag_error, None);
+    assert_eq!(after.tags.title.as_deref(), Some("Lost"));
+    assert_eq!(after.tags.track_no, Some(1));
+
+    // Healed means unchanged from now on.
+    let r = env.scan();
+    assert_eq!((r.unchanged, r.updated), (2, 0));
+    assert!(r.untagged.is_empty());
+}
+
+#[test]
+fn repairing_the_tags_with_a_new_mtime_also_clears_the_flag() {
+    let mut env = Env::new();
+    let p = env.add_bytes("a.mp3", &mp3_with_id3v2(2, &unparseable_tag()));
+    assert_eq!(env.scan().untagged.len(), 1);
+    fs::write(&p, mp3_with_id3v2(2, &[tit2("Fixed")])).unwrap();
+    bump_mtime(&p);
+    let r = env.scan();
+    assert!(r.untagged.is_empty());
+    let t = env.track(&p);
+    assert_eq!(t.tag_error, None);
+    assert_eq!(t.tags.title.as_deref(), Some("Fixed"));
+}
+
+#[test]
+fn a_deleted_untagged_file_drops_out_of_the_list() {
+    let mut env = Env::new();
+    let p = env.add_bytes("a.mp3", &mp3_with_id3v2(2, &unparseable_tag()));
+    env.add("b.mp3", Kind::Mp3, 1);
+    assert_eq!(env.scan().untagged.len(), 1);
+    fs::remove_file(&p).unwrap();
+    let r = env.scan();
+    assert_eq!(r.missing, vec![p.clone()]);
+    assert!(r.untagged.is_empty(), "{:?}", r.untagged);
+    // It comes back flagged if the file returns.
+    fs::write(&p, mp3_with_id3v2(2, &unparseable_tag())).unwrap();
+    let r = env.scan();
+    assert_eq!(r.untagged.len(), 1);
+    assert!(env.track(&p).missing_since.is_none());
+}
+
+// Prevents: the FairPlay list only showing on the scan that first read the file.
+#[test]
+fn fairplay_file_stays_listed_on_rescans_and_leaves_when_deleted() {
+    let mut env = Env::new();
+    let store = env.add_bytes("Store/song.m4a", &fairplay_m4a(1));
+    let plain = env.add("plain.m4a", Kind::Aac, 2);
+    assert_eq!(env.scan().drm, vec![store.clone()]);
+    for round in 1..=2 {
+        let r = env.scan();
+        assert_eq!((r.added, r.unchanged), (0, 2), "round {round}");
+        assert_eq!(r.drm, vec![store.clone()], "round {round}");
+    }
+    assert!(env.track(&store).drm);
+    assert!(!env.track(&plain).drm);
+
+    fs::remove_file(&store).unwrap();
+    let r = env.scan();
+    assert_eq!(r.missing, vec![store.clone()]);
+    assert!(r.drm.is_empty(), "{:?}", r.drm);
+    assert!(
+        env.track(&store).drm,
+        "the row remembers, the report skips it"
+    );
+}
+
+#[test]
+fn replacing_a_fairplay_file_with_an_ordinary_one_clears_the_flag() {
+    let mut env = Env::new();
+    let p = env.add_bytes("a.m4a", &fairplay_m4a(1));
+    env.add("b.mp3", Kind::Mp3, 2);
+    assert_eq!(env.scan().drm.len(), 1);
+    fs::copy(fixture(Kind::Aac, 3), &p).unwrap();
+    bump_mtime(&p);
+    let r = env.scan();
+    assert!(r.drm.is_empty());
+    assert!(!env.track(&p).drm);
 }

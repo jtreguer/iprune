@@ -200,6 +200,18 @@ fn run_scan() -> Result<()> {
     print_list(&mut out, "unsupported", &r.unsupported, |(p, why)| {
         format!("{}: {why}", p.display())
     })?;
+    print_list(
+        &mut out,
+        "indexed without tags (tags could not be parsed)",
+        &r.untagged,
+        |(p, why)| format!("{}: {why}", p.display()),
+    )?;
+    print_list(
+        &mut out,
+        "FairPlay protected, indexed as AAC",
+        &r.drm,
+        |p| p.display().to_string(),
+    )?;
     print_list(&mut out, "names not in UTF-8", &r.non_utf8, |p| {
         p.display().to_string()
     })?;

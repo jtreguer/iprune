@@ -10,7 +10,10 @@ use crate::tags::{AudioInfo, FileKind, Tags};
 use crate::{Error, Result};
 
 /// Numbered migrations, applied in order and tracked with `user_version`.
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_init.sql"),
+    include_str!("migrations/0002_tag_state.sql"),
+];
 
 pub struct Store {
     conn: Connection,
@@ -88,6 +91,10 @@ pub struct TrackRow {
     pub tags_hash: [u8; 32],
     pub added_at: i64,
     pub missing_since: Option<i64>,
+    /// Set when the tags could not be parsed; `tags` is then empty.
+    pub tag_error: Option<String>,
+    /// FairPlay protected.
+    pub drm: bool,
 }
 
 impl TrackRow {
@@ -113,11 +120,13 @@ pub struct FileRecord {
     pub hash: [u8; 32],
     pub info: AudioInfo,
     pub tags: Tags,
+    pub tag_error: Option<String>,
+    pub drm: bool,
 }
 
 const TRACK_COLUMNS: &str = "id, path, path_key, size, mtime_ns, hash, duration_ms, filetype, bitrate, samplerate, \
      title, artist, album, album_artist, composer, genre, year, track_no, track_total, disc_no, disc_total, \
-     compilation, tags_hash, added_at, missing_since";
+     compilation, tags_hash, added_at, missing_since, tag_error, drm";
 
 fn blob32(row: &Row, idx: usize) -> rusqlite::Result<[u8; 32]> {
     let v: Vec<u8> = row.get(idx)?;
@@ -161,6 +170,8 @@ fn track_from_row(r: &Row) -> rusqlite::Result<TrackRow> {
         tags_hash: blob32(r, 22)?,
         added_at: r.get(23)?,
         missing_since: r.get(24)?,
+        tag_error: r.get(25)?,
+        drm: r.get(26)?,
     })
 }
 
@@ -192,8 +203,9 @@ pub fn insert_track(conn: &Connection, f: &FileRecord, added_at: i64) -> Result<
     conn.execute(
         "INSERT INTO tracks (path, path_key, size, mtime_ns, hash, duration_ms, filetype, bitrate, samplerate, \
          title, artist, album, album_artist, composer, genre, year, track_no, track_total, disc_no, disc_total, \
-         compilation, tags_hash, added_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+         compilation, tags_hash, added_at, tag_error, drm) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, \
+         ?24, ?25)",
         params![
             path_str(&f.path),
             f.path_key,
@@ -218,6 +230,8 @@ pub fn insert_track(conn: &Connection, f: &FileRecord, added_at: i64) -> Result<
             f.tags.compilation,
             &f.tags.hash()[..],
             added_at,
+            f.tag_error,
+            f.drm,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -230,7 +244,7 @@ pub fn update_track(conn: &Connection, id: i64, f: &FileRecord) -> Result<()> {
         "UPDATE tracks SET path = ?2, path_key = ?3, size = ?4, mtime_ns = ?5, hash = ?6, duration_ms = ?7, \
          filetype = ?8, bitrate = ?9, samplerate = ?10, title = ?11, artist = ?12, album = ?13, \
          album_artist = ?14, composer = ?15, genre = ?16, year = ?17, track_no = ?18, track_total = ?19, \
-         disc_no = ?20, disc_total = ?21, compilation = ?22, tags_hash = ?23, missing_since = NULL \
+         disc_no = ?20, disc_total = ?21, compilation = ?22, tags_hash = ?23, tag_error = ?24, drm = ?25, missing_since = NULL \
          WHERE id = ?1",
         params![
             id,
@@ -256,6 +270,8 @@ pub fn update_track(conn: &Connection, id: i64, f: &FileRecord) -> Result<()> {
             f.tags.disc_total,
             f.tags.compilation,
             &f.tags.hash()[..],
+            f.tag_error,
+            f.drm,
         ],
     )?;
     Ok(())
@@ -315,6 +331,34 @@ pub fn playlist_summaries(conn: &Connection) -> Result<Vec<PlaylistSummary>> {
         })?
         .collect::<rusqlite::Result<_>>()?;
     Ok(rows)
+}
+
+/// Present tracks the scan reports on every run.
+#[derive(Debug, Default)]
+pub struct Flagged {
+    /// Tags could not be parsed, with the reason.
+    pub untagged: Vec<(PathBuf, String)>,
+    /// FairPlay protected.
+    pub drm: Vec<PathBuf>,
+}
+
+pub fn flagged_tracks(conn: &Connection) -> Result<Flagged> {
+    let mut f = Flagged::default();
+    let mut stmt = conn.prepare(
+        "SELECT path, tag_error, drm FROM tracks \
+         WHERE missing_since IS NULL AND (tag_error IS NOT NULL OR drm) ORDER BY path",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let path = PathBuf::from(r.get::<_, String>(0)?);
+        if let Some(e) = r.get::<_, Option<String>>(1)? {
+            f.untagged.push((path.clone(), e));
+        }
+        if r.get::<_, bool>(2)? {
+            f.drm.push(path);
+        }
+    }
+    Ok(f)
 }
 
 /// Stores a playlist and its items, keeping the row id if the name exists.
@@ -389,6 +433,8 @@ mod tests {
                 compilation: true,
                 ..Tags::default()
             },
+            tag_error: None,
+            drm: false,
         }
     }
 

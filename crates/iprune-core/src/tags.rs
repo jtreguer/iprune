@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::path::Path;
 
-use lofty::config::ParseOptions;
+use lofty::config::{ParseOptions, ParsingMode};
 use lofty::file::{AudioFile, FileType, TaggedFileExt};
 use lofty::mp4::{Mp4Codec, Mp4File};
 use lofty::prelude::{Accessor, ItemKey};
@@ -146,30 +146,74 @@ fn tags_from(tag: &Tag) -> Tags {
     }
 }
 
-fn mp4_kind(path: &Path) -> Result<FileKind, ReadError> {
+/// The codec of an MP4 file, and whether it is FairPlay protected.
+fn mp4_kind(path: &Path) -> Result<(FileKind, bool), ReadError> {
     let mut f = File::open(path).map_err(|e| ReadError::Unreadable(e.to_string()))?;
-    let mp4 = Mp4File::read_from(&mut f, ParseOptions::new().read_tags(false))
-        .map_err(|e| ReadError::Unreadable(e.to_string()))?;
-    match mp4.properties().codec() {
-        Some(Mp4Codec::AAC) => Ok(FileKind::Aac),
-        Some(Mp4Codec::ALAC) => Ok(FileKind::Alac),
+    let opts = ParseOptions::new()
+        .parsing_mode(ParsingMode::Relaxed)
+        .read_tags(false);
+    let mp4 = Mp4File::read_from(&mut f, opts).map_err(|e| ReadError::Unreadable(e.to_string()))?;
+    let props = mp4.properties();
+    match props.codec() {
+        Some(Mp4Codec::AAC) => Ok((FileKind::Aac, props.is_drm_protected())),
+        Some(Mp4Codec::ALAC) => Ok((FileKind::Alac, props.is_drm_protected())),
+        // lofty cannot see the codec inside a FairPlay `drms` entry. The
+        // iTunes Store only ever sold AAC under FairPlay.
+        None if props.is_drm_protected() => Ok((FileKind::Aac, true)),
         other => Err(ReadError::Unsupported(format!("MP4 codec {other:?}"))),
     }
 }
 
+/// What [`read`] learned about a file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileTags {
+    pub info: AudioInfo,
+    pub tags: Tags,
+    /// Set when the tags could not be parsed and the file was read without
+    /// them; `tags` is then empty.
+    pub tag_error: Option<String>,
+    /// FairPlay protected (an iTunes Store purchase).
+    pub drm: bool,
+}
+
+fn open(path: &Path, opts: ParseOptions) -> Result<lofty::file::TaggedFile, String> {
+    Probe::open(path)
+        .map_err(|e| e.to_string())?
+        .options(opts)
+        .guess_file_type()
+        .map_err(|e| e.to_string())?
+        .read()
+        .map_err(|e| e.to_string())
+}
+
 /// Reads audio properties and tags. The kind comes from the content, not the
 /// extension, so an m4a is told apart as AAC or ALAC.
-pub fn read(path: &Path) -> Result<(AudioInfo, Tags), ReadError> {
-    let unreadable = |e: &dyn std::fmt::Display| ReadError::Unreadable(e.to_string());
-    let probe = Probe::open(path).map_err(|e| unreadable(&e))?;
-    let tagged = probe
-        .guess_file_type()
-        .map_err(|e| unreadable(&e))?
-        .read()
-        .map_err(|e| unreadable(&e))?;
+///
+/// Tags are parsed leniently, skipping bad frames. If they still cannot be
+/// parsed the file is read without them: an empty tag never overwrites the
+/// iPod's value, so the track loses nothing.
+pub fn read(path: &Path) -> Result<FileTags, ReadError> {
+    let relaxed = ParseOptions::new().parsing_mode(ParsingMode::Relaxed);
+    let (tagged, tag_error) = match open(path, relaxed) {
+        Ok(t) => (t, None),
+        Err(e) => match open(
+            path,
+            ParseOptions::new()
+                .parsing_mode(ParsingMode::Relaxed)
+                .read_tags(false),
+        ) {
+            Ok(t) => (t, Some(e)),
+            Err(_) => return Err(ReadError::Unreadable(e)),
+        },
+    };
+    let mut drm = false;
     let kind = match tagged.file_type() {
         FileType::Mpeg => FileKind::Mp3,
-        FileType::Mp4 => mp4_kind(path)?,
+        FileType::Mp4 => {
+            let (kind, protected) = mp4_kind(path)?;
+            drm = protected;
+            kind
+        }
         FileType::Wav => FileKind::Wav,
         FileType::Aiff => FileKind::Aiff,
         other => return Err(ReadError::Unsupported(format!("{other:?}"))),
@@ -187,7 +231,12 @@ pub fn read(path: &Path) -> Result<(AudioInfo, Tags), ReadError> {
         .or_else(|| tagged.first_tag())
         .map(tags_from)
         .unwrap_or_default();
-    Ok((info, tags))
+    Ok(FileTags {
+        info,
+        tags,
+        tag_error,
+        drm,
+    })
 }
 
 #[cfg(test)]
