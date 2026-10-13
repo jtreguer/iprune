@@ -268,3 +268,79 @@ fn open_file_on_truncated_database_fails() {
         Err(e) => panic!("{e}"),
     }
 }
+#[test]
+fn master_playlist_is_the_one_named_after_the_ipod() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture_db(dir.path());
+    let master = db.master_playlist().expect("fixture has a master playlist");
+    assert!(master.is_master());
+    assert_eq!(master.name().as_deref(), Some("iPod de Test"));
+    // The fixture has a regular playlist called "80s" too; it is not the master.
+    assert_eq!(master.len(), db.track_count());
+    assert_eq!(db.playlists().filter(|p| p.is_master()).count(), 1);
+}
+
+#[test]
+fn device_info_reads_the_model_from_sysinfo() {
+    // MC297 is the 160 GB black iPod Classic (7th generation).
+    let ipod = FakeIpod::new(Some(
+        "ModelNumStr: MC297\nFirewireGuid: 0x000A27001234ABCD\n",
+    ));
+    let info = Database::open(&ipod.root())
+        .unwrap()
+        .device_info()
+        .expect("info");
+    assert_eq!(info.capacity_gb, 160.0);
+    assert_eq!(info.generation.as_deref(), Some("Classic"));
+    assert!(
+        info.model.as_deref().unwrap().starts_with("Classic"),
+        "{info:?}"
+    );
+    assert!(
+        info.model_number.as_deref().unwrap().ends_with("C297"),
+        "{info:?}"
+    );
+}
+
+#[test]
+fn device_info_distinguishes_models() {
+    let ipod = FakeIpod::new(Some("ModelNumStr: xA450\n"));
+    let info = Database::open(&ipod.root())
+        .unwrap()
+        .device_info()
+        .expect("info");
+    assert_eq!(info.capacity_gb, 80.0);
+    assert!(
+        info.generation.as_deref().unwrap().starts_with("Video"),
+        "{info:?}"
+    );
+}
+
+#[test]
+fn device_info_has_no_capacity_without_a_known_model() {
+    for sysinfo in [
+        None,
+        Some("ModelNumStr: ZZZ\n"),
+        Some("FirewireGuid: 0x1\n"),
+    ] {
+        let ipod = FakeIpod::new(sysinfo);
+        let info = Database::open(&ipod.root()).unwrap().device_info();
+        // libgpod still answers with a placeholder entry; it must not claim a size.
+        let info = info.expect("placeholder entry");
+        assert_eq!(info.capacity_gb, 0.0, "{sysinfo:?}");
+        assert_eq!(info.generation.as_deref(), Some("Unknown"), "{sysinfo:?}");
+    }
+}
+
+#[test]
+fn firewire_guid_none_when_the_value_is_empty_or_blank() {
+    for sysinfo in [
+        "FirewireGuid:\n",
+        "FirewireGuid: \n",
+        "FirewireGuid:   \t\n",
+    ] {
+        let ipod = FakeIpod::new(Some(sysinfo));
+        let db = Database::open(&ipod.root()).unwrap();
+        assert_eq!(db.firewire_guid(), None, "{sysinfo:?}");
+    }
+}

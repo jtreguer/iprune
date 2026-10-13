@@ -9,6 +9,15 @@ use crate::error::take_gerror;
 use crate::list::{self, ListIter};
 use crate::{Error, PlaylistRef, Result, TrackRef};
 
+/// What libgpod knows about the iPod model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceInfo {
+    pub model_number: Option<String>,
+    pub capacity_gb: f64,
+    pub model: Option<String>,
+    pub generation: Option<String>,
+}
+
 /// An open iPod database. libgpod is not thread safe; holding a `NonNull`
 /// keeps this neither `Send` nor `Sync`.
 pub struct Database {
@@ -90,6 +99,40 @@ impl Database {
         })
     }
 
+    /// The master playlist, whose name is the iPod's name.
+    pub fn master_playlist(&self) -> Option<PlaylistRef<'_>> {
+        self.playlists().find(|p| p.is_master())
+    }
+
+    /// Model information libgpod derived from the device's SysInfo, if any.
+    pub fn device_info(&self) -> Option<DeviceInfo> {
+        let device = self.raw().device;
+        if device.is_null() {
+            return None;
+        }
+        unsafe {
+            let info = gpod_sys::itdb_device_get_ipod_info(device);
+            if info.is_null() {
+                return None;
+            }
+            let info = &*info;
+            // These strings are static tables inside libgpod: not freed.
+            let s = |p: *const glib_sys::gchar| {
+                (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
+            };
+            Some(DeviceInfo {
+                model_number: s(info.model_number),
+                capacity_gb: info.capacity,
+                model: s(gpod_sys::itdb_info_get_ipod_model_name_string(
+                    info.ipod_model,
+                )),
+                generation: s(gpod_sys::itdb_info_get_ipod_generation_string(
+                    info.ipod_generation,
+                )),
+            })
+        }
+    }
+
     /// The `FirewireGuid` from the device's SysInfo, if known.
     pub fn firewire_guid(&self) -> Option<String> {
         let device = self.raw().device;
@@ -103,7 +146,8 @@ impl Database {
             }
             let guid = CStr::from_ptr(p).to_string_lossy().into_owned();
             glib_sys::g_free(p.cast());
-            Some(guid)
+            // An empty value identifies nothing.
+            (!guid.trim().is_empty()).then_some(guid)
         }
     }
 }

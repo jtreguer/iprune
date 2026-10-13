@@ -8,7 +8,7 @@ mod playlist;
 pub mod snapshot;
 mod track;
 
-pub use db::Database;
+pub use db::{Database, DeviceInfo};
 pub use error::{Error, Result};
 pub use playlist::PlaylistRef;
 pub use track::TrackRef;

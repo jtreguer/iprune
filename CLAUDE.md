@@ -10,8 +10,8 @@ is right rather than silently picking one.
 
 ## Status
 
-M0 and M1 done (bindings, read-only `gpod` wrapper, `iprune snapshot`; config,
-scan, SQLite index, `.m3u8` editing, `playlist` commands). Work follows the milestones in `docs/technical.md` section 17:
+M0, M1 and M2 done (bindings, read-only `gpod` wrapper, `iprune snapshot`;
+config, scan, SQLite index, `.m3u8` editing, `playlist` commands; `adopt`). Work follows the milestones in `docs/technical.md` section 17:
 
 | # | Deliverable | Writes to iPod |
 |---|---|---|
@@ -49,8 +49,9 @@ through `udisksctl`.
 ```
 crates/gpod-sys/     raw bindgen output, links libgpod-1.0 via pkg-config
 crates/gpod/         safe wrapper; the only crate allowed to contain unsafe
-crates/iprune-core/  config, store, scan, playlist (.m3u8 format), playlists (operations);
-                     later device, adopt, plan, exec, verify, stats
+crates/iprune-core/  config, store, scan, playlist (.m3u8 format), playlists (operations),
+                     device (mount detection), ipod (read a database), adopt (pure
+                     matching), adoption (run, report, save); later plan, exec, verify, stats
 crates/iprune/       binary: CLI and TUI
 crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c
 ```

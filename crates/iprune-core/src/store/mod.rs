@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod devices;
+
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::error::IoContext;

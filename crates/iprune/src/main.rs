@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use iprune_core::config::{Config, PathStyle, Paths};
 use iprune_core::store::Store;
-use iprune_core::{playlists, scan};
+use iprune_core::{adoption, device, playlists, scan};
 
 /// Exit code when the user answers no to a confirmation.
 const EXIT_DECLINED: u8 = 4;
@@ -37,6 +37,20 @@ enum Command {
     },
     /// Index the library and load the playlists.
     Scan,
+    /// Match the tracks already on the iPod to library files. Only reads
+    /// the iPod.
+    Adopt {
+        /// Read this iTunesDB file instead of a connected iPod. Report only:
+        /// nothing is saved.
+        #[arg(long, value_name = "ITUNESDB")]
+        file: Option<PathBuf>,
+        /// Take the default match for every proposal.
+        #[arg(long)]
+        accept_proposals: bool,
+        /// Replace an earlier adoption of this iPod.
+        #[arg(long)]
+        force: bool,
+    },
     /// List and edit playlists.
     #[command(subcommand)]
     Playlist(PlaylistCommand),
@@ -246,6 +260,73 @@ fn run_scan() -> Result<()> {
     Ok(())
 }
 
+fn find_mountpoint(config: &Config) -> Result<PathBuf> {
+    if !config.device.mountpoint.as_os_str().is_empty() {
+        return Ok(config.device.mountpoint.clone());
+    }
+    let found = device::find_ipods()?;
+    match found.as_slice() {
+        [] => bail!(
+            "no mounted iPod found; connect and mount it, or set device.mountpoint in the config"
+        ),
+        [one] => Ok(one.mountpoint.clone()),
+        many => {
+            let list: Vec<String> = many
+                .iter()
+                .map(|m| m.mountpoint.display().to_string())
+                .collect();
+            bail!(
+                "several iPods are mounted ({}); set device.mountpoint in the config",
+                list.join(", ")
+            )
+        }
+    }
+}
+
+fn adopt(file: Option<&Path>, accept_proposals: bool, force: bool) -> Result<()> {
+    let (config, store) = load()?;
+    let conn = store.conn();
+    playlists::sync_from_disk(conn, &config, false)?;
+    let db = match file {
+        Some(f) => gpod::Database::open_file(f)?,
+        None => {
+            let mp = find_mountpoint(&config)?;
+            eprintln!("reading the iPod at {}", mp.display());
+            gpod::Database::open(&mp)?
+        }
+    };
+    let run = adoption::run(conn, &db, accept_proposals)?;
+    let report_path = paths()?.data_dir.join("adopt-report.txt");
+    std::fs::write(&report_path, adoption::report(&run))
+        .with_context(|| format!("writing {}", report_path.display()))?;
+    println!("{}", adoption::summary(&run));
+    println!("full report: {}", report_path.display());
+    if file.is_some() {
+        println!("read from a file: nothing saved");
+        return Ok(());
+    }
+    let Some(guid) = run.ipod.firewire_guid.clone() else {
+        bail!(
+            "the iPod has no FirewireGuid in iPod_Control/Device/SysInfo, so it cannot be identified; \
+             run ipod-read-sysinfo-extended on it first. Nothing saved"
+        );
+    };
+    if !accept_proposals && !run.adoption.proposals.is_empty() {
+        println!(
+            "{} proposals need a decision: review the report, then run again with --accept-proposals. Nothing saved",
+            run.adoption.proposals.len()
+        );
+        return Ok(());
+    }
+    adoption::save(conn, &run, &guid, force)?;
+    println!(
+        "saved: {} tracks and {} playlists mapped to iPod {guid}",
+        run.mapping.len(),
+        run.playlists.matched.len()
+    );
+    Ok(())
+}
+
 fn confirm(question: &str) -> Result<bool> {
     if !io::stdin().is_terminal() {
         bail!("{question} needs confirmation; pass --yes");
@@ -332,6 +413,11 @@ fn main() -> ExitCode {
             force,
         } => init(library, playlists, *path_style, *force).map(|()| Outcome::Done),
         Command::Scan => run_scan().map(|()| Outcome::Done),
+        Command::Adopt {
+            file,
+            accept_proposals,
+            force,
+        } => adopt(file.as_deref(), *accept_proposals, *force).map(|()| Outcome::Done),
         Command::Playlist(cmd) => playlist(cmd),
         Command::Snapshot { path } => snapshot(path).map(|()| Outcome::Done),
     };

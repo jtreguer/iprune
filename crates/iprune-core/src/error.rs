@@ -25,6 +25,10 @@ pub enum Error {
     RootMissing(PathBuf),
     #[error("found no audio files under {}; refusing to mark {tracks} tracks missing (is the disk mounted?)", root.display())]
     EmptyRoot { root: PathBuf, tracks: usize },
+    #[error("the library index is empty; run `iprune scan` first")]
+    EmptyIndex,
+    #[error("the iPod {0} was already adopted; use --force to replace its mapping")]
+    AlreadyAdopted(String),
     #[error("{}: not valid UTF-8", .0.display())]
     NotUtf8(PathBuf),
     #[error("{} was changed by another program while iprune was editing it; nothing written, try again", .0.display())]

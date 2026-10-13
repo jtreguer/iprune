@@ -285,3 +285,121 @@ pub fn chmod_000_blocks_reads(dir: &Path) -> bool {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
     blocked
 }
+
+// ---- iPod databases built by libgpod
+
+/// Compiles `crates/gpod/tests/c/make_ipod.c` once per test binary. The C
+/// program uses only libgpod, so the fixture does not depend on the Rust code
+/// under test.
+fn make_ipod_tool() -> PathBuf {
+    static TOOL: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    TOOL.get_or_init(|| {
+        let flags = Command::new("pkg-config")
+            .args(["--cflags", "--libs", "libgpod-1.0", "glib-2.0"])
+            .output()
+            .expect("pkg-config");
+        assert!(flags.status.success(), "pkg-config libgpod-1.0");
+        let flags = String::from_utf8(flags.stdout).unwrap();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../gpod/tests/c/make_ipod.c");
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("c-tools");
+        fs::create_dir_all(&dir).unwrap();
+        // Several test binaries may build it at once: private name, then rename.
+        let tmp = dir.join(format!(".make_ipod-{}", std::process::id()));
+        let status = Command::new("gcc")
+            .arg("-o")
+            .arg(&tmp)
+            .arg(&src)
+            .args(flags.split_whitespace())
+            .status()
+            .expect("gcc");
+        assert!(status.success(), "compiling {}", src.display());
+        let out = dir.join(format!("make_ipod-{}", std::process::id()));
+        fs::rename(&tmp, &out).unwrap();
+        out
+    })
+    .clone()
+}
+
+/// One iPod track for [`write_itunesdb`].
+#[derive(Clone, Default)]
+pub struct IpodSpec {
+    pub dbid: u64,
+    pub size: u64,
+    pub ms: u32,
+    pub title: &'static str,
+    pub artist: &'static str,
+    pub album: &'static str,
+    pub plays: u32,
+}
+
+/// An iPod playlist (`smart` or regular) with members by dbid, in order.
+pub struct PlaylistSpec {
+    pub name: &'static str,
+    pub smart: bool,
+    pub members: Vec<u64>,
+}
+
+pub fn ipod_playlist(name: &'static str, members: &[u64]) -> PlaylistSpec {
+    PlaylistSpec {
+        name,
+        smart: false,
+        members: members.to_vec(),
+    }
+}
+
+/// Writes an iTunesDB at `db` with libgpod, from the given tracks and playlists.
+pub fn write_itunesdb(db: &Path, master: &str, tracks: &[IpodSpec], playlists: &[PlaylistSpec]) {
+    let mut manifest = format!("M\t{master}\n");
+    for t in tracks {
+        manifest += &format!(
+            "T\t{:x}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            t.dbid, t.size, t.ms, t.title, t.artist, t.album, t.plays
+        );
+    }
+    for p in playlists {
+        let members: Vec<String> = p.members.iter().map(|d| format!("{d:x}")).collect();
+        manifest += &format!(
+            "{}\t{}\t{}\n",
+            if p.smart { "S" } else { "P" },
+            p.name,
+            members.join(",")
+        );
+    }
+    let work = tempfile::tempdir().unwrap();
+    let file = work.path().join("manifest.tsv");
+    fs::write(&file, manifest).unwrap();
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let out = Command::new(make_ipod_tool())
+        .arg(db)
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "make_ipod failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A fake iPod tree: `<dir>/iPod_Control/iTunes/iTunesDB` from the given
+/// tracks and playlists, plus a `SysInfo` when given. Returns the mountpoint.
+pub fn fake_ipod(
+    dir: &Path,
+    sysinfo: Option<&str>,
+    tracks: &[IpodSpec],
+    playlists: &[PlaylistSpec],
+) -> PathBuf {
+    let ctl = dir.join("iPod_Control");
+    fs::create_dir_all(ctl.join("Device")).unwrap();
+    fs::create_dir_all(ctl.join("Music")).unwrap();
+    write_itunesdb(
+        &ctl.join("iTunes/iTunesDB"),
+        "iPod de Test",
+        tracks,
+        playlists,
+    );
+    if let Some(s) = sysinfo {
+        fs::write(ctl.join("Device/SysInfo"), s).unwrap();
+    }
+    dir.to_owned()
+}

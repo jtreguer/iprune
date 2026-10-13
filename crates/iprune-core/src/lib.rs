@@ -1,7 +1,11 @@
 //! Library, playlists, planner and executor. No UI.
 
+pub mod adopt;
+pub mod adoption;
 pub mod config;
+pub mod device;
 mod error;
+pub mod ipod;
 pub mod paths;
 pub mod playlist;
 pub mod playlists;

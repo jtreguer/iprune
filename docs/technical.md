@@ -328,18 +328,33 @@ library track.
 2. For each iPod track, take candidates with equal size. Keep those with
    `|duration difference| <= 1000 ms`.
 3. Score the remaining candidates on normalized title and artist (lowercase,
-   NFKD, strip punctuation and leading "the "). Exact match scores 2, one of
-   the two matches scores 1.
-4. One candidate with score 2: accepted. One candidate with score 1, or
-   several with score 2: proposed. No candidate: unmatched.
+   NFKD without accents, punctuation removed, leading "the " dropped). Exact
+   match scores 2, one of the two matches scores 1. A library file with no
+   title tag is compared by its file name, which is what iTunes used as the
+   title. An artist missing on both sides counts as a match when the titles
+   match; a title missing on both sides is no evidence.
+4. One candidate with the top score of 2: accepted. A single top candidate
+   with a lower score, or several tied: proposed. The top candidate is the
+   default when its score is above 0; for ties (duplicate library files) the
+   next free tied copy is taken. A score of 0 never gets a default: equal
+   size and duration alone are not enough. No candidate: unmatched.
 5. A library track can be claimed by only one iPod track. If two iPod tracks
    claim it, both become proposals. This catches the duplicates already on the
    iPod.
 6. Second pass for unmatched iPod tracks: same normalized artist, title and
    album, duration within two seconds, any size. These are proposals, covering
-   files whose tags were edited after they were copied.
+   files whose tags were edited after they were copied. A default needs a
+   single candidate and a non-empty album.
+7. Proposals are resolved strongest first (duplicates on the iPod, duplicate
+   library files, weak tags, tags only; then by score), so a weak default
+   never takes a file from a better match.
 
-Output is written to `adopt-report.txt` and shown in the interface. Accepted
+Output is written to `adopt-report.txt` in the data folder, summarised on
+the terminal, and shown in the interface. From the command line, nothing is
+saved while proposals are pending: the user reads the report and runs again
+with `--accept-proposals`, which takes every default. Proposals left without
+a usable default keep their iPod track unmanaged. A second adoption of the
+same iPod needs `--force`. Accepted
 and confirmed matches go into `device_tracks` with `synced_tags_hash` computed
 from the iPod's current values, so the first sync updates tags only where they
 really differ.
@@ -350,7 +365,18 @@ then by NFC-normalized, case-insensitive name. Matches go into
 
 This step only reads the iPod. It can also run against the backup with
 `iprune adopt --file /mnt/seagate-1tb/iPod-backup-2026-10/iTunes/iTunesDB`,
-which is how the algorithm gets tuned before the device is involved.
+which is how the algorithm gets tuned before the device is involved; with
+`--file` nothing is saved.
+
+Results on the backup (2026-10-13): 9,534 of 9,669 iPod tracks matched,
+87 weak proposals (mostly WAV files whose artist exists only in the iTunes
+database), 11 duplicate-file proposals, 6 tag-only proposals, 31 iPod tracks
+with no file, 35 library files not on the iPod. With `--accept-proposals`,
+9,630 tracks are mapped and 8 proposals stay open (score 0, or tags only
+without an album). The backup's `iTunesDB`
+predates the 2026-10-12 repair: 322 of its playlists are exactly double their
+`.m3u8` file and 4 follow the repair tool's other pattern, so on the backup
+every playlist reports a difference.
 
 ## 11. Sync
 
