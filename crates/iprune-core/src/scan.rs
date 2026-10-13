@@ -121,8 +121,13 @@ fn walk(cfg: &Config, report: &mut ScanReport, progress: &(dyn Fn(Progress) + Sy
 }
 
 fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
+    hash_reader(File::open(path)?)
+}
+
+/// The content hash stored in the index.
+pub(crate) fn hash_reader(r: impl std::io::Read) -> std::io::Result<[u8; 32]> {
     let mut h = blake3::Hasher::new();
-    h.update_reader(File::open(path)?)?;
+    h.update_reader(r)?;
     Ok(*h.finalize().as_bytes())
 }
 

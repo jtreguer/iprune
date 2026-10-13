@@ -295,7 +295,16 @@ fn adopt(file: Option<&Path>, accept_proposals: bool, force: bool) -> Result<()>
             gpod::Database::open(&mp)?
         }
     };
-    let run = adoption::run(conn, &db, accept_proposals)?;
+    let tty = io::stderr().is_terminal();
+    let progress = |done: usize, total: usize| {
+        if tty {
+            eprint!("\rcomparing iPod files with the library {done}/{total}      ");
+            if done == total {
+                eprintln!();
+            }
+        }
+    };
+    let run = adoption::run(conn, &db, accept_proposals, &progress)?;
     let report_path = paths()?.data_dir.join("adopt-report.txt");
     std::fs::write(&report_path, adoption::report(&run))
         .with_context(|| format!("writing {}", report_path.display()))?;

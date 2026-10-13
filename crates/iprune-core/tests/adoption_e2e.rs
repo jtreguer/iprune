@@ -175,7 +175,7 @@ fn reads_the_ipod_database_into_plain_data() {
 #[test]
 fn adoption_matches_the_scenario() {
     let w = world(None);
-    let run = adoption::run(w.env.store.conn(), &w.open(), false).unwrap();
+    let run = adoption::run(w.env.store.conn(), &w.open(), false, &|_, _| {}).unwrap();
     let a = &run.adoption;
     let (mp3one, aacone, untagged) = (w.id("mp3one"), w.id("aacone"), w.id("untagged"));
 
@@ -209,7 +209,7 @@ fn adoption_matches_the_scenario() {
     assert_eq!(run.left.len(), 4);
 
     // With it, each default is taken, and the contested file goes to 7 only.
-    let run = adoption::run(w.env.store.conn(), &w.open(), true).unwrap();
+    let run = adoption::run(w.env.store.conn(), &w.open(), true, &|_, _| {}).unwrap();
     let mut want = vec![
         (HIGH_BIT, mp3one),
         (2, w.id("mp3two")),
@@ -226,7 +226,7 @@ fn adoption_matches_the_scenario() {
 #[test]
 fn playlists_are_matched_by_name_and_compared_through_the_mapping() {
     let w = world(None);
-    let run = adoption::run(w.env.store.conn(), &w.open(), false).unwrap();
+    let run = adoption::run(w.env.store.conn(), &w.open(), false, &|_, _| {}).unwrap();
     let m = &run.playlists;
     let by_name: HashMap<&str, _> = m
         .matched
@@ -251,7 +251,7 @@ fn playlists_are_matched_by_name_and_compared_through_the_mapping() {
 fn saved_hash_is_the_ipods_and_equals_the_librarys_when_tags_agree() {
     let w = world(Some("FirewireGuid: 0x000A27001234ABCD\n"));
     let conn = w.env.store.conn();
-    let run = adoption::run(conn, &w.open(), true).unwrap();
+    let run = adoption::run(conn, &w.open(), true, &|_, _| {}).unwrap();
     adoption::save(conn, &run, "GUID-A", false).unwrap();
 
     let dev = devices::device_id(conn, "GUID-A").unwrap().unwrap();
@@ -289,7 +289,7 @@ fn saved_hash_is_the_ipods_and_equals_the_librarys_when_tags_agree() {
 fn save_writes_the_device_and_playlists_then_refuses_a_second_adoption() {
     let w = world(None);
     let conn = w.env.store.conn();
-    let run = adoption::run(conn, &w.open(), false).unwrap();
+    let run = adoption::run(conn, &w.open(), false, &|_, _| {}).unwrap();
     adoption::save(conn, &run, "GUID-A", false).unwrap();
 
     let dev = devices::device_id(conn, "GUID-A").unwrap().unwrap();
@@ -322,7 +322,7 @@ fn save_writes_the_device_and_playlists_then_refuses_a_second_adoption() {
     assert_eq!(before.len(), 3);
 
     // Same iPod again, now with the proposals accepted: refused, nothing changed.
-    let run2 = adoption::run(conn, &w.open(), true).unwrap();
+    let run2 = adoption::run(conn, &w.open(), true, &|_, _| {}).unwrap();
     let err = adoption::save(conn, &run2, "GUID-A", false).unwrap_err();
     assert!(
         matches!(&err, Error::AlreadyAdopted(g) if g == "GUID-A"),
@@ -352,7 +352,7 @@ fn adoption_only_reads_the_ipod() {
         v
     };
     let tree_before = tree(&w.ipod_root);
-    let run = adoption::run(w.env.store.conn(), &w.open(), true).unwrap();
+    let run = adoption::run(w.env.store.conn(), &w.open(), true, &|_, _| {}).unwrap();
     let _ = adoption::report(&run);
     let _ = adoption::summary(&run);
     assert_eq!(fs::read(&db_file).unwrap(), before);
@@ -377,7 +377,7 @@ fn an_empty_index_is_an_error_not_an_empty_library() {
     let dir = tempfile::tempdir().unwrap();
     let root = fake_ipod(dir.path(), None, &[], &[]);
     let db = gpod::Database::open(&root).unwrap();
-    let err = adoption::run(env.store.conn(), &db, false)
+    let err = adoption::run(env.store.conn(), &db, false, &|_, _| {})
         .err()
         .expect("empty index must fail");
     assert!(matches!(err, Error::EmptyIndex), "{err}");
@@ -389,7 +389,7 @@ fn tracks_missing_from_disk_are_not_candidates() {
     let gone = w.id("mp3one");
     fs::remove_file(&w.files["mp3one"]).unwrap();
     w.env.scan();
-    let run = adoption::run(w.env.store.conn(), &w.open(), true).unwrap();
+    let run = adoption::run(w.env.store.conn(), &w.open(), true, &|_, _| {}).unwrap();
     let a = &run.adoption;
     assert!(!a.accepted.iter().any(|&(_, id)| id == gone));
     assert!(!run.mapping.iter().any(|&(_, id)| id == gone));
@@ -403,7 +403,7 @@ fn tracks_missing_from_disk_are_not_candidates() {
 #[test]
 fn report_and_summary_name_what_was_decided() {
     let w = world(None);
-    let run = adoption::run(w.env.store.conn(), &w.open(), false).unwrap();
+    let run = adoption::run(w.env.store.conn(), &w.open(), false, &|_, _| {}).unwrap();
     let report = adoption::report(&run);
     // Stable fragments only: the iPod name, library paths, the unmatched dbid
     // in the 16 digit form the report uses, and the playlist names.
@@ -491,4 +491,236 @@ fn model_is_none_when_libgpod_only_has_a_placeholder() {
         let w = world(sysinfo);
         assert_eq!(ipod::read(&w.open()).model, None, "{sysinfo:?}");
     }
+}
+
+// ---- content check against files on a mounted fake iPod
+
+/// Where `make_ipod.c` puts the file of the track at `index` in the manifest.
+fn ipod_file(root: &std::path::Path, index: usize) -> PathBuf {
+    root.join(format!(
+        "iPod_Control/Music/F{:02}/T{:04}.mp3",
+        index % 50,
+        index
+    ))
+}
+
+fn put(root: &std::path::Path, index: usize, bytes: &[u8]) -> PathBuf {
+    let p = ipod_file(root, index);
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    fs::write(&p, bytes).unwrap();
+    p
+}
+
+struct Content {
+    env: Env,
+    dir: tempfile::TempDir,
+    root: PathBuf,
+    lib: Vec<PathBuf>,
+}
+
+/// Library of `n` mp3 files; the iPod has one track per file, in order, with
+/// the library's size but a wrong duration (x3) and unrelated tags, so only
+/// the content can match them. No iPod file exists yet.
+fn content_world(n: usize) -> Content {
+    let mut env = Env::new();
+    let lib: Vec<PathBuf> = (0..n)
+        .map(|i| env.add(&format!("f{i}.mp3"), Kind::Mp3, i as u32 + 1))
+        .collect();
+    env.scan();
+    let dir = tempfile::tempdir().unwrap();
+    let tracks: Vec<IpodSpec> = lib
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let t = env.track(p);
+            IpodSpec {
+                dbid: i as u64 + 1,
+                size: fs::metadata(p).unwrap().len(),
+                ms: t.info.duration_ms.unwrap() * 3,
+                title: "Unrelated",
+                artist: "Nobody",
+                album: "",
+                plays: 0,
+            }
+        })
+        .collect();
+    let root = fake_ipod(dir.path(), None, &tracks, &[]);
+    Content {
+        env,
+        dir,
+        root,
+        lib,
+    }
+}
+
+impl Content {
+    fn run(&self) -> adoption::Run {
+        let db = gpod::Database::open(&self.root).unwrap();
+        adoption::run(self.env.store.conn(), &db, false, &|_, _| {}).unwrap()
+    }
+}
+
+#[test]
+fn identical_files_are_matched_by_content_despite_wrong_durations_and_tags() {
+    let c = content_world(3);
+    let _keep = &c.dir;
+    // Tracks 1 and 2 hold the library files' bytes. Track 3's file has the
+    // same size as its library file but one byte changed.
+    put(&c.root, 0, &fs::read(&c.lib[0]).unwrap());
+    put(&c.root, 1, &fs::read(&c.lib[1]).unwrap());
+    let mut other = fs::read(&c.lib[2]).unwrap();
+    let last = other.len() - 1;
+    other[last] ^= 0xff;
+    put(&c.root, 2, &other);
+
+    let calls = std::cell::RefCell::new(Vec::new());
+    let db = gpod::Database::open(&c.root).unwrap();
+    let run = adoption::run(c.env.store.conn(), &db, false, &|d, t| {
+        calls.borrow_mut().push((d, t))
+    })
+    .unwrap();
+
+    let id = |i: usize| c.env.track(&c.lib[i]).id;
+    assert_eq!(run.adoption.accepted, vec![(1, id(0)), (2, id(1))]);
+    assert_eq!(run.adoption.identical, vec![1, 2]);
+    assert_eq!(run.mapping, vec![(1, id(0)), (2, id(1))]);
+    // The changed file is not taken for the library file on size alone.
+    assert_eq!(run.adoption.unmatched_ipod, vec![3]);
+    assert!(run.unreadable.is_empty(), "{:?}", run.unreadable);
+    assert_eq!(run.compared, 3);
+    assert_eq!(*calls.borrow(), vec![(1, 3), (2, 3), (3, 3)]);
+}
+
+#[test]
+fn settled_tracks_are_not_read_and_unreadable_files_do_not_stop_the_run() {
+    let c = content_world(3);
+    let _keep = &c.dir;
+    // Track 1: file absent. Track 2: file present. Track 3: path is a directory.
+    put(&c.root, 1, &fs::read(&c.lib[1]).unwrap());
+    fs::create_dir_all(ipod_file(&c.root, 2)).unwrap();
+    let run = c.run();
+
+    assert_eq!(run.compared, 1);
+    let bad: Vec<u64> = run.unreadable.iter().map(|(d, _)| *d).collect();
+    assert_eq!(bad, vec![1, 3]);
+    assert!(run.unreadable.iter().all(|(_, why)| !why.is_empty()));
+    assert_eq!(run.adoption.identical, vec![2]);
+    assert_eq!(run.mapping, vec![(2, c.env.track(&c.lib[1]).id)]);
+    assert_eq!(run.adoption.unmatched_ipod, vec![1, 3]);
+    let report = adoption::report(&run);
+    assert!(report.contains("could not be read"), "{report}");
+    assert!(report.contains(&format!("{:016x}", 3)), "{report}");
+}
+
+#[test]
+fn no_unreadable_section_when_everything_was_read() {
+    let c = content_world(1);
+    let _keep = &c.dir;
+    put(&c.root, 0, &fs::read(&c.lib[0]).unwrap());
+    let run = c.run();
+    assert!(run.unreadable.is_empty());
+    assert!(!adoption::report(&run).contains("could not be read"));
+}
+
+#[test]
+fn a_database_file_without_a_mountpoint_hashes_nothing() {
+    let c = content_world(2);
+    let _keep = &c.dir;
+    // The files exist, so a pass that wrongly ran would match them.
+    for i in 0..2 {
+        put(&c.root, i, &fs::read(&c.lib[i]).unwrap());
+    }
+    let db = gpod::Database::open_file(&c.root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+    assert_eq!(db.mountpoint(), None);
+    let called = std::cell::Cell::new(false);
+    let run = adoption::run(c.env.store.conn(), &db, false, &|_, _| called.set(true)).unwrap();
+    assert_eq!(run.compared, 0);
+    assert!(run.unreadable.is_empty());
+    assert!(!called.get());
+    assert!(run.adoption.accepted.is_empty() && run.adoption.identical.is_empty());
+    assert_eq!(run.adoption.unmatched_ipod, vec![1, 2]);
+}
+
+#[test]
+fn a_content_identical_file_wins_the_shared_library_file_over_a_tag_match() {
+    // Track 1 holds the bytes with a wrong duration; track 2 has the library
+    // file's tags, size and duration, and is in a playlist.
+    let mut env = Env::new();
+    let lib = env.add("f.mp3", Kind::Mp3, 1);
+    env.scan();
+    let row = env.track(&lib);
+    let size = fs::metadata(&lib).unwrap().len();
+    let title: &'static str = Box::leak(row.display_title().into_owned().into_boxed_str());
+    let artist: &'static str =
+        Box::leak(row.tags.artist.clone().unwrap_or_default().into_boxed_str());
+    let tracks = [
+        IpodSpec {
+            dbid: 1,
+            size,
+            ms: row.info.duration_ms.unwrap() * 3,
+            title: "Unrelated",
+            artist: "Nobody",
+            ..IpodSpec::default()
+        },
+        IpodSpec {
+            dbid: 2,
+            size,
+            ms: row.info.duration_ms.unwrap(),
+            title,
+            artist,
+            ..IpodSpec::default()
+        },
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let root = fake_ipod(dir.path(), None, &tracks, &[ipod_playlist("P", &[2])]);
+    put(&root, 0, &fs::read(&lib).unwrap());
+    let db = gpod::Database::open(&root).unwrap();
+    let run = adoption::run(env.store.conn(), &db, true, &|_, _| {}).unwrap();
+    // Track 2 is settled on tags alone, so it is accepted before the content
+    // pass and track 1 is compared: both claim the file.
+    let defaults: Vec<_> = run
+        .adoption
+        .proposals
+        .iter()
+        .map(|p| (p.dbid, p.default))
+        .collect();
+    assert_eq!(defaults, vec![(1, Some(row.id)), (2, None)]);
+    assert_eq!(run.mapping, vec![(1, row.id)]);
+}
+
+/// Reading the iPod must not touch its access times (a flash iPod would
+/// otherwise be written to by every read).
+#[test]
+fn hashing_the_ipod_files_leaves_their_access_time_alone() {
+    let c = content_world(1);
+    let _keep = &c.dir;
+    let f = put(&c.root, 0, &fs::read(&c.lib[0]).unwrap());
+    let old = "2001-02-03 04:05:06";
+    let status = std::process::Command::new("touch")
+        .args(["-a", "-d", old])
+        .arg(&f)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let before = fs::metadata(&f).unwrap().accessed().unwrap();
+    // Control: an ordinary read does move the old access time on this
+    // filesystem, otherwise the test below proves nothing.
+    let probe = c.dir.path().join("probe");
+    fs::write(&probe, b"x").unwrap();
+    std::process::Command::new("touch")
+        .args(["-a", "-d", old])
+        .arg(&probe)
+        .status()
+        .unwrap();
+    let probe_before = fs::metadata(&probe).unwrap().accessed().unwrap();
+    let _ = fs::read(&probe).unwrap();
+    if fs::metadata(&probe).unwrap().accessed().unwrap() == probe_before {
+        eprintln!("skipped: this filesystem does not update access times on read");
+        return;
+    }
+
+    let run = c.run();
+    assert_eq!(run.compared, 1);
+    assert_eq!(run.adoption.identical, vec![1]);
+    assert_eq!(fs::metadata(&f).unwrap().accessed().unwrap(), before);
 }

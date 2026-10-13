@@ -1,6 +1,7 @@
 //! Reading an iPod database into plain data for adoption and planning.
 
 use std::collections::{BTreeSet, HashMap};
+use std::path::{Component, Path, PathBuf};
 
 use crate::adopt::{IpodPlaylist, IpodTrack};
 use crate::tags::Tags;
@@ -52,6 +53,15 @@ pub fn tags_of(t: &gpod::TrackRef<'_>) -> Tags {
     }
 }
 
+/// The file behind an iPod path such as `:iPod_Control:Music:F12:ABCD.mp3`,
+/// under `mountpoint`. `None` for a path that is empty or would leave the
+/// mountpoint. FAT ignores case, so the iPod's spelling is used as is.
+pub fn file_path(mountpoint: &Path, ipod_path: &str) -> Option<PathBuf> {
+    let rel: PathBuf = ipod_path.strip_prefix(':')?.split(':').collect();
+    let plain = rel.components().all(|c| matches!(c, Component::Normal(_)));
+    (plain && rel.components().next().is_some()).then(|| mountpoint.join(rel))
+}
+
 pub fn read(db: &gpod::Database) -> Contents {
     let mut in_playlists: HashMap<u64, usize> = HashMap::new();
     let mut playlists = Vec::new();
@@ -87,6 +97,7 @@ pub fn read(db: &gpod::Database) -> Contents {
                     album: tags.album.clone(),
                     playlists: in_playlists.get(&t.dbid()).copied().unwrap_or(0),
                     playcount: t.playcount(),
+                    hash: None,
                 },
                 tags,
                 ipod_path: t.ipod_path().map(|p| p.into_owned()),

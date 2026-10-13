@@ -3,7 +3,7 @@
 
 use iprune_core::adopt::{
     Adoption, IpodPlaylist, IpodTrack, LibPlaylist, LibTrack, Proposal, Reason, adopt,
-    match_playlists, normalize, resolve,
+    match_playlists, normalize, resolve, to_compare,
 };
 
 fn ip(dbid: u64, size: u64, ms: u32, title: &str, artist: &str) -> IpodTrack {
@@ -16,6 +16,7 @@ fn ip(dbid: u64, size: u64, ms: u32, title: &str, artist: &str) -> IpodTrack {
         album: Some("Al".into()),
         playlists: 0,
         playcount: 0,
+        hash: None,
     }
 }
 
@@ -27,6 +28,7 @@ fn lib(id: i64, size: u64, ms: u32, title: &str, artist: &str) -> LibTrack {
         title: Some(title.into()),
         artist: Some(artist.into()),
         album: Some("Al".into()),
+        hash: [id as u8; 32],
     }
 }
 
@@ -522,6 +524,7 @@ fn random_case(rng: &mut Lcg) -> (Vec<IpodTrack>, Vec<LibTrack>) {
             album: pick(rng),
             playlists: rng.next(3) as usize,
             playcount: rng.next(3) as u32,
+            hash: None,
         })
         .collect();
     let library = (0..rng.next(12))
@@ -532,6 +535,7 @@ fn random_case(rng: &mut Lcg) -> (Vec<IpodTrack>, Vec<LibTrack>) {
             title: pick(rng),
             artist: pick(rng),
             album: pick(rng),
+            hash: [i as u8; 32],
         })
         .collect();
     (ipod, library)
@@ -856,4 +860,234 @@ fn tied_at_score_zero_has_no_default_but_score_one_and_two_do() {
             assert_eq!(left.len(), 2);
         }
     }
+}
+
+// ---- content check (technical.md section 10, step 8)
+
+fn with_hash(mut t: IpodTrack, byte: u8) -> IpodTrack {
+    t.hash = Some([byte; 32]);
+    t
+}
+
+#[test]
+fn identical_content_beats_a_wrong_duration_and_other_tags() {
+    // The iPod says 30 s and other tags; the file is the library's file 10.
+    let mut i = with_hash(ip(1, 100, 30_000, "Zzz", "Nobody"), 10);
+    i.album = None;
+    let a = adopt(&[i], &[lib(10, 100, 5000, "A", "X")]);
+    assert_eq!(a.accepted, vec![(1, 10)]);
+    assert_eq!(a.identical, vec![1]);
+    assert!(a.proposals.is_empty(), "{:?}", a.proposals);
+    assert!(a.unmatched_ipod.is_empty());
+    assert!(a.unmatched_library.is_empty());
+
+    // The same track without the hash stays unmatched: that is the bug the
+    // content check fixes.
+    let mut i = ip(1, 100, 30_000, "Zzz", "Nobody");
+    i.album = None;
+    let a = adopt(&[i], &[lib(10, 100, 5000, "A", "X")]);
+    assert!(a.accepted.is_empty() && a.identical.is_empty());
+    assert_eq!(a.unmatched_ipod, vec![1]);
+}
+
+#[test]
+fn identical_content_wins_over_a_better_tagged_decoy_of_the_same_size() {
+    // File 11 has the iPod's tags, size and duration; file 10 has the bytes.
+    let i = with_hash(ip(1, 100, 5000, "Song", "Band"), 10);
+    let a = adopt(
+        &[i],
+        &[
+            lib(10, 100, 9000, "Other", "Else"),
+            lib(11, 100, 5000, "Song", "Band"),
+        ],
+    );
+    assert_eq!(a.accepted, vec![(1, 10)]);
+    assert_eq!(a.identical, vec![1]);
+    assert_eq!(a.unmatched_library, vec![11]);
+}
+
+fn same_bytes(mut l: LibTrack, byte: u8) -> LibTrack {
+    l.hash = [byte; 32];
+    l
+}
+
+#[test]
+fn identical_to_several_library_files_is_several_candidates_even_at_score_zero() {
+    // Library order is not id order; tags disagree completely.
+    let library = [
+        same_bytes(lib(12, 100, 5000, "C", "C"), 7),
+        same_bytes(lib(10, 100, 5000, "A", "A"), 7),
+        same_bytes(lib(11, 100, 5000, "B", "B"), 7),
+    ];
+    let i = with_hash(ip(1, 100, 99_000, "Zzz", "Nobody"), 7);
+    let a = adopt(&[i], &library);
+    assert!(a.accepted.is_empty() && a.identical.is_empty());
+    let p = proposal(&a, 1);
+    assert_eq!(p.reason, Reason::SeveralCandidates);
+    assert_eq!(p.score, 0);
+    assert_eq!(p.candidates, vec![10, 11, 12]);
+    assert_eq!(p.default, Some(10));
+}
+
+#[test]
+fn resolve_hands_out_the_next_free_identical_copy() {
+    let library = [
+        same_bytes(lib(10, 100, 5000, "A", "A"), 7),
+        same_bytes(lib(11, 100, 5000, "B", "B"), 7),
+    ];
+    let ipod = [
+        with_hash(ip(1, 100, 99_000, "x", "y"), 7),
+        with_hash(ip(2, 100, 99_000, "x", "y"), 7),
+        with_hash(ip(3, 100, 99_000, "x", "y"), 7),
+    ];
+    let a = adopt(&ipod, &library);
+    assert!(a.proposals.iter().all(|p| p.default == Some(10)));
+    let (mapping, left) = resolve(&a, true);
+    assert_eq!(mapping, vec![(1, 10), (2, 11)]);
+    assert_eq!(left.iter().map(|p| p.dbid).collect::<Vec<_>>(), vec![3]);
+    let (mapping, left) = resolve(&a, false);
+    assert!(mapping.is_empty());
+    assert_eq!(left.len(), 3);
+}
+
+#[test]
+fn two_ipod_tracks_identical_to_one_library_file_share_it() {
+    let mut first = with_hash(ip(1, 100, 99_000, "x", "y"), 10);
+    let mut second = with_hash(ip(2, 100, 1, "p", "q"), 10);
+    first.playlists = 0;
+    second.playlists = 2;
+    let a = adopt(&[first, second], &[lib(10, 100, 5000, "A", "X")]);
+    assert!(a.accepted.is_empty(), "{:?}", a.accepted);
+    assert!(a.identical.is_empty(), "contested, so not content-accepted");
+    let got: Vec<_> = a
+        .proposals
+        .iter()
+        .map(|p| (p.dbid, p.reason, p.candidates.clone(), p.default))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (1, Reason::SharedWithAnotherIpodTrack, vec![10], None),
+            (2, Reason::SharedWithAnotherIpodTrack, vec![10], Some(10)),
+        ]
+    );
+    let (mapping, _) = resolve(&a, true);
+    assert_eq!(mapping, vec![(2, 10)]);
+}
+
+#[test]
+fn a_hash_that_matches_nothing_changes_nothing() {
+    let library = [
+        lib(10, 100, 5400, "a", "x"),
+        lib(20, 200, 5000, "B", "other"),
+        lib(30, 300, 5000, "C", "Z"),
+        lib(31, 300, 5000, "c", "z"),
+        lib(40, 400, 7000, "D", "W"),
+    ];
+    let plain = [
+        ip(1, 100, 5000, "A", "X"),
+        ip(2, 200, 5000, "B", "Y"),
+        ip(3, 300, 5000, "C", "Z"),
+        ip(4, 400, 5000, "D", "W"),
+        ip(5, 999, 5000, "Gone", "Nobody"),
+    ];
+    // No library hash is [200; 32].
+    let hashed: Vec<IpodTrack> = plain.iter().cloned().map(|t| with_hash(t, 200)).collect();
+    let want = adopt(&plain, &library);
+    // Make sure the scenario is not trivial.
+    assert_eq!(want.accepted, vec![(1, 10)]);
+    assert_eq!(want.proposals.len(), 3);
+    assert_eq!(want.unmatched_ipod, vec![5]);
+    assert_eq!(adopt(&hashed, &library), want);
+}
+
+#[test]
+fn identical_lists_exactly_the_content_accepted_dbids() {
+    let library = [
+        lib(10, 100, 5000, "A", "X"),
+        lib(20, 200, 5000, "B", "Y"),
+        lib(30, 300, 5000, "C", "Z"),
+    ];
+    let ipod = [
+        // Content match with wrong duration and tags.
+        with_hash(ip(1, 100, 40_000, "?", "?"), 10),
+        // Accepted on tags, no hash.
+        ip(2, 200, 5000, "B", "Y"),
+        // Accepted on tags; its hash matches no library file.
+        with_hash(ip(3, 300, 5000, "C", "Z"), 201),
+    ];
+    let a = adopt(&ipod, &library);
+    assert_eq!(a.accepted, vec![(1, 10), (2, 20), (3, 30)]);
+    assert_eq!(a.identical, vec![1]);
+}
+
+// ---- to_compare
+
+#[test]
+fn to_compare_picks_unsettled_tracks_with_a_same_size_library_file() {
+    let library = [
+        lib(10, 100, 5000, "A", "X"),
+        lib(20, 200, 5000, "B", "Y"),
+        lib(30, 300, 5000, "C", "Z"),
+        lib(50, 500, 5000, "E", "V"),
+        lib(60, 600, 5000, "F", "U"),
+    ];
+    let mut tagsonly = ip(5, 601, 5000, "F", "U");
+    tagsonly.album = Some("Al".into());
+    let ipod = [
+        // Accepted on tags: not compared.
+        ip(1, 100, 5000, "A", "X"),
+        // Weak proposal, same size: compared.
+        ip(2, 200, 5000, "B", "Other"),
+        // Wrong duration, tags differ, same size: unmatched, compared.
+        ip(4, 300, 60_000, "Q", "Q"),
+        // No library file of this size: not compared.
+        ip(3, 777, 5000, "G", "T"),
+        // Tags-only proposal, but the size differs: not compared.
+        tagsonly,
+        // Two iPod tracks for one file: both proposals, both compared.
+        ip(7, 500, 5000, "E", "V"),
+        ip(6, 500, 5000, "E", "V"),
+    ];
+    let a = adopt(&ipod, &library);
+    // Pin down the starting point so the test cannot pass by accident.
+    assert_eq!(a.accepted, vec![(1, 10)]);
+    assert!(a.unmatched_ipod.contains(&4) && a.unmatched_ipod.contains(&3));
+    assert_eq!(proposal(&a, 5).reason, Reason::TagsOnly);
+    assert_eq!(proposal(&a, 2).reason, Reason::WeakTags);
+    assert_eq!(to_compare(&a, &ipod, &library), vec![2, 4, 6, 7]);
+}
+
+#[test]
+fn to_compare_is_empty_for_an_empty_adoption_or_library() {
+    let ipod = [ip(1, 100, 5000, "A", "X")];
+    assert!(to_compare(&Adoption::default(), &ipod, &[]).is_empty());
+    assert!(to_compare(&Adoption::default(), &[], &[lib(1, 100, 1, "A", "X")]).is_empty());
+}
+
+#[test]
+fn a_content_identical_claimant_gets_the_default_over_a_better_used_tag_match() {
+    // B matches X on size, duration and tags and is in more playlists; A is
+    // byte-identical to X but its duration and tags are wrong.
+    let x = lib(10, 100, 5000, "Song", "Band");
+    let a_track = with_hash(ip(1, 100, 40_000, "?", "?"), 10);
+    let mut b_track = ip(2, 100, 5000, "Song", "Band");
+    b_track.playlists = 3;
+    b_track.playcount = 9;
+    let a = adopt(&[a_track, b_track], &[x]);
+    assert!(a.accepted.is_empty() && a.identical.is_empty());
+    let got: Vec<_> = a
+        .proposals
+        .iter()
+        .map(|p| (p.dbid, p.reason, p.default))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (1, Reason::SharedWithAnotherIpodTrack, Some(10)),
+            (2, Reason::SharedWithAnotherIpodTrack, None),
+        ]
+    );
+    let (mapping, _) = resolve(&a, true);
+    assert_eq!(mapping, vec![(1, 10)]);
 }

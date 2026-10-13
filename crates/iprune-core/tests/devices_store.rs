@@ -188,6 +188,7 @@ fn ipod_track(dbid: u64, size: u64, tags: Tags) -> ipod::Track {
             album: tags.album.clone(),
             playlists: 0,
             playcount: 0,
+            hash: None,
         },
         tags,
         ipod_path: None,
@@ -216,6 +217,8 @@ fn run_of(tracks: &[TrackRow], ipod_tracks: Vec<ipod::Track>, pairs: &[(u64, usi
         left: vec![],
         playlists: PlaylistAdoption::default(),
         library: tracks.iter().map(|t| (t.id, t.clone())).collect(),
+        compared: 0,
+        unreadable: vec![],
     }
 }
 

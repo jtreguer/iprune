@@ -467,6 +467,7 @@ dependencies = [
  "blake3",
  "directories",
  "gpod",
+ "libc",
  "lofty",
  "rayon",
  "rusqlite",

@@ -348,6 +348,20 @@ library track.
 7. Proposals are resolved strongest first (duplicates on the iPod, duplicate
    library files, weak tags, tags only; then by score), so a weak default
    never takes a file from a better match.
+8. Content check, only when reading a mounted iPod. Every iPod track not
+   accepted by steps 1 to 7 whose size equals some library file's size is
+   read from the iPod and hashed (blake3, as in the index), one file at a
+   time. Matching then runs again with an extra first step: an iPod file
+   byte-identical to exactly one library file is accepted whatever its
+   duration and tags say; identical to several (duplicates in the library),
+   it is a duplicate-file proposal with the first copy as default. When an
+   identical file and a tag match claim the same library file (step 5), the
+   identical one gets the default. Files are opened with `O_NOATIME`, so
+   reading them does not touch their access dates. A file
+   that cannot be read is listed in the report and matched on tags as
+   before. Durations are unreliable for some MP3s on both sides (the iPod
+   and lofty were each off by a factor of two to six on real files), so
+   content is the deciding evidence when it is available.
 
 Output is written to `adopt-report.txt` in the data folder, summarised on
 the terminal, and shown in the interface. From the command line, nothing is
@@ -377,6 +391,16 @@ without an album). The backup's `iTunesDB`
 predates the 2026-10-12 repair: 322 of its playlists are exactly double their
 `.m3u8` file and 4 follow the repair tool's other pattern, so on the backup
 every playlist reports a difference.
+
+Results on the device (2026-10-13, iPod Classic 160 GB, GUID read from
+`SysInfoExtended`): 9,672 tracks; before the content check, 9,537 matched,
+104 proposals and 31 iPod tracks with no library file. All 31 have a
+byte-identical library file whose duration disagrees with the iPod's.
+With the content check (130 iPod files read, 79 s): 9,657 matched, 121 of
+them by identical file; 15 proposals (8 among identical duplicate WAVs, 2
+duplicates on the iPod, 5 tags-only MP3s about 8 KB smaller in the library,
+same duration, no album); no iPod track without a library file; 2 library
+files not on the iPod; 13 playlists differ from their file.
 
 ## 11. Sync
 

@@ -251,7 +251,10 @@ tracks are matched on content:
 3. Normalized title and artist.
 
 A match on all three is accepted. Size and duration without matching tags is
-proposed for confirmation. Anything else is listed as unmatched. Unmatched iPod
+proposed for confirmation. When the iPod is mounted, tracks the first three
+checks leave open are read from the iPod and compared byte for byte with the
+library files of the same size: an identical file is accepted, because
+durations recorded on either side are sometimes wrong. Anything else is listed as unmatched. Unmatched iPod
 tracks are left on the device as unmanaged; unmatched library tracks are copied
 on the next sync.
 

@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::path::Path;
 
 use rusqlite::Connection;
 
@@ -22,9 +23,67 @@ pub struct Run {
     pub playlists: PlaylistAdoption,
     /// Present library tracks, by id.
     pub library: HashMap<i64, TrackRow>,
+    /// iPod files read to compare them with the library.
+    pub compared: usize,
+    /// `(dbid, why)` for iPod files that could not be read for the comparison.
+    pub unreadable: Vec<(u64, String)>,
 }
 
-pub fn run(conn: &Connection, db: &gpod::Database, accept_proposals: bool) -> Result<Run> {
+/// Opens an iPod file for reading without updating its access time, so
+/// reading leaves the device untouched. `O_NOATIME` needs the caller to own
+/// the file (on vfat, the `uid=` mount option); otherwise a plain open.
+fn open_untouched(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOATIME)
+        .open(path)
+    {
+        Err(e) if e.raw_os_error() == Some(libc::EPERM) => std::fs::File::open(path),
+        r => r,
+    }
+}
+
+/// Hashes the iPod files of `dbids`, one at a time: the iPod is a single
+/// disk. Reports `(done, total)` after each file.
+fn hash_ipod_files(
+    mountpoint: &Path,
+    tracks: &mut [adopt::IpodTrack],
+    ipod: &Contents,
+    dbids: &[u64],
+    progress: &dyn Fn(usize, usize),
+) -> Vec<(u64, String)> {
+    let paths: HashMap<u64, Option<&str>> = ipod
+        .tracks
+        .iter()
+        .map(|t| (t.adopt.dbid, t.ipod_path.as_deref()))
+        .collect();
+    let wanted: std::collections::HashSet<u64> = dbids.iter().copied().collect();
+    let mut unreadable = Vec::new();
+    let mut done = 0;
+    for t in tracks.iter_mut().filter(|t| wanted.contains(&t.dbid)) {
+        let file = paths[&t.dbid].and_then(|p| ipod::file_path(mountpoint, p));
+        match file.map(|f| open_untouched(&f).and_then(crate::scan::hash_reader)) {
+            Some(Ok(h)) => t.hash = Some(h),
+            Some(Err(e)) => unreadable.push((t.dbid, e.to_string())),
+            None => unreadable.push((t.dbid, "no usable path in the iPod database".into())),
+        }
+        done += 1;
+        progress(done, dbids.len());
+    }
+    unreadable
+}
+
+/// Matches the iPod in `db` with the index. When the database comes from a
+/// mounted iPod, the files the tags cannot settle are read and compared with
+/// the library; `progress` reports `(done, total)` files. The iPod is only
+/// read.
+pub fn run(
+    conn: &Connection,
+    db: &gpod::Database,
+    accept_proposals: bool,
+    progress: &dyn Fn(usize, usize),
+) -> Result<Run> {
     let library: HashMap<i64, TrackRow> = store::all_tracks(conn)?
         .into_iter()
         .filter(|t| t.missing_since.is_none())
@@ -44,12 +103,22 @@ pub fn run(conn: &Connection, db: &gpod::Database, accept_proposals: bool) -> Re
             title: Some(t.display_title().into_owned()),
             artist: t.tags.artist.clone(),
             album: t.tags.album.clone(),
+            hash: t.hash,
         })
         .collect();
     lib.sort_by_key(|t| t.id);
     let ipod = ipod::read(db);
-    let tracks: Vec<adopt::IpodTrack> = ipod.tracks.iter().map(|t| t.adopt.clone()).collect();
-    let adoption = adopt::adopt(&tracks, &lib);
+    let mut tracks: Vec<adopt::IpodTrack> = ipod.tracks.iter().map(|t| t.adopt.clone()).collect();
+    let mut adoption = adopt::adopt(&tracks, &lib);
+    let (mut compared, mut unreadable) = (0, Vec::new());
+    if let Some(mountpoint) = db.mountpoint() {
+        let dbids = adopt::to_compare(&adoption, &tracks, &lib);
+        if !dbids.is_empty() {
+            unreadable = hash_ipod_files(&mountpoint, &mut tracks, &ipod, &dbids, progress);
+            compared = dbids.len() - unreadable.len();
+            adoption = adopt::adopt(&tracks, &lib);
+        }
+    }
     let (mapping, left) = adopt::resolve(&adoption, accept_proposals);
     let left = left.into_iter().cloned().collect();
     let playlists = adopt::match_playlists(
@@ -64,6 +133,8 @@ pub fn run(conn: &Connection, db: &gpod::Database, accept_proposals: bool) -> Re
         left,
         playlists,
         library,
+        compared,
+        unreadable,
     })
 }
 
@@ -174,6 +245,16 @@ pub fn report(r: &Run) -> String {
             let _ = writeln!(w, "  {mark} {}", lib_line(*id));
         }
     }
+    if !r.unreadable.is_empty() {
+        let _ = writeln!(
+            w,
+            "\n== iPod files that could not be read for the comparison ({})",
+            r.unreadable.len()
+        );
+        for (dbid, why) in &r.unreadable {
+            let _ = writeln!(w, "  {}\n    {why}", ipod_line(*dbid));
+        }
+    }
     let _ = writeln!(
         w,
         "\n== iPod tracks with no library file ({}), left on the iPod unmanaged",
@@ -229,9 +310,10 @@ pub fn summary(r: &Run) -> String {
     let mut reasons: Vec<_> = by_reason.into_iter().collect();
     reasons.sort();
     let mut s = format!(
-        "iPod tracks: {}\n  matched: {}\n  proposals: {}",
+        "iPod tracks: {}\n  matched: {} ({} by identical file)\n  proposals: {}",
         r.ipod.tracks.len(),
         a.accepted.len(),
+        a.identical.len(),
         a.proposals.len()
     );
     for (reason_, n) in reasons {
@@ -254,5 +336,13 @@ pub fn summary(r: &Run) -> String {
         r.playlists.unmatched_library.len(),
         r.ipod.smart_playlists,
     );
+    if r.compared + r.unreadable.len() > 0 {
+        let _ = write!(
+            s,
+            "\niPod files compared with the library: {} ({} unreadable)",
+            r.compared,
+            r.unreadable.len()
+        );
+    }
     s
 }

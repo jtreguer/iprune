@@ -24,6 +24,9 @@ pub struct IpodTrack {
     /// Number of regular playlists the track is in, repeats counted once.
     pub playlists: usize,
     pub playcount: u32,
+    /// Content hash of the file on the iPod, when it was read. Only tracks
+    /// the tags could not settle are read, see [`to_compare`].
+    pub hash: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +37,8 @@ pub struct LibTrack {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    /// Content hash of the file, as in the index.
+    pub hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -41,7 +46,8 @@ pub enum Reason {
     /// Same size and duration, but only one of title and artist matches, or
     /// neither does.
     WeakTags,
-    /// Several library files match equally well (duplicates in the library).
+    /// Several library files match equally well (duplicates in the library),
+    /// or the iPod file is identical to several library files.
     SeveralCandidates,
     /// Another iPod track matched the same library file (duplicates on the
     /// iPod).
@@ -67,6 +73,9 @@ pub struct Proposal {
 pub struct Adoption {
     /// `(dbid, library id)` matched without doubt.
     pub accepted: Vec<(u64, i64)>,
+    /// The dbids in `accepted` matched because the iPod file is identical to
+    /// the library file.
+    pub identical: Vec<u64>,
     pub proposals: Vec<Proposal>,
     /// iPod tracks with no candidate. Left on the iPod, unmanaged.
     pub unmatched_ipod: Vec<u64>,
@@ -142,10 +151,31 @@ enum First {
     None,
 }
 
+/// The iPod tracks whose file is worth comparing with the library: those
+/// not accepted, for which a library file has exactly the same size. Durations
+/// are unreliable for some MP3s on both sides, and tags are often missing, but
+/// a byte-identical file is the same track.
+pub fn to_compare(a: &Adoption, ipod: &[IpodTrack], library: &[LibTrack]) -> Vec<u64> {
+    let sizes: HashSet<u64> = library.iter().map(|l| l.size).collect();
+    let accepted: HashSet<u64> = a.accepted.iter().map(|&(dbid, _)| dbid).collect();
+    let mut out: Vec<u64> = ipod
+        .iter()
+        .filter(|t| !accepted.contains(&t.dbid) && sizes.contains(&t.size))
+        .map(|t| t.dbid)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
 pub fn adopt(ipod: &[IpodTrack], library: &[LibTrack]) -> Adoption {
     let mut by_size: HashMap<u64, Vec<&LibTrack>> = HashMap::new();
+    let mut by_hash: HashMap<[u8; 32], Vec<i64>> = HashMap::new();
     for t in library {
         by_size.entry(t.size).or_default().push(t);
+        by_hash.entry(t.hash).or_default().push(t.id);
+    }
+    for ids in by_hash.values_mut() {
+        ids.sort_unstable();
     }
     let lib_norm: HashMap<i64, Norm> = library
         .iter()
@@ -157,14 +187,35 @@ pub fn adopt(ipod: &[IpodTrack], library: &[LibTrack]) -> Adoption {
         })
         .collect();
 
-    // Pass 1: size, then duration, then tags.
+    // Pass 1: identical content, then size, duration and tags.
     let mut first: BTreeMap<u64, First> = BTreeMap::new();
+    let mut identical: HashSet<u64> = HashSet::new();
     for it in ipod {
         let norm = Norm::of(
             it.title.as_deref(),
             it.artist.as_deref(),
             it.album.as_deref(),
         );
+        let same_bytes = it.hash.and_then(|h| by_hash.get(&h));
+        if let Some(ids) = same_bytes {
+            let decision = match ids[..] {
+                [id] => {
+                    identical.insert(it.dbid);
+                    First::Exact(id)
+                }
+                // Identical duplicates in the library: any copy will do.
+                _ => {
+                    let score = ids
+                        .iter()
+                        .map(|id| norm.score(&lib_norm[id]))
+                        .max()
+                        .unwrap_or(0);
+                    First::Proposed(Reason::SeveralCandidates, score, ids.clone(), Some(ids[0]))
+                }
+            };
+            first.insert(it.dbid, decision);
+            continue;
+        }
         let mut scored: Vec<(u8, i64)> = by_size
             .get(&it.size)
             .into_iter()
@@ -209,9 +260,9 @@ pub fn adopt(ipod: &[IpodTrack], library: &[LibTrack]) -> Adoption {
     }
 
     // A library track can be claimed by one iPod track only. When several
-    // claim it, all become proposals and the default goes to the one the
-    // user cares about most: in more playlists, then played more, then the
-    // lowest dbid.
+    // claim it, all become proposals and the default goes to an identical
+    // file, then to the one the user cares about most: in more playlists,
+    // then played more, then the lowest dbid.
     let ipod_by_dbid: HashMap<u64, &IpodTrack> = ipod.iter().map(|t| (t.dbid, t)).collect();
     let mut claims: HashMap<i64, Vec<u64>> = HashMap::new();
     for (&dbid, d) in &first {
@@ -224,12 +275,18 @@ pub fn adopt(ipod: &[IpodTrack], library: &[LibTrack]) -> Adoption {
     for (id, mut dbids) in claims {
         if let [dbid] = dbids[..] {
             out.accepted.push((dbid, id));
+            if identical.contains(&dbid) {
+                out.identical.push(dbid);
+            }
             taken.insert(id);
             continue;
         }
+        // A track proven identical to the file comes first: another
+        // claimant matched only on size, duration and tags.
         dbids.sort_by_key(|d| {
             let t = ipod_by_dbid[d];
             (
+                !identical.contains(d),
                 std::cmp::Reverse(t.playlists),
                 std::cmp::Reverse(t.playcount),
                 *d,
@@ -322,6 +379,7 @@ pub fn adopt(ipod: &[IpodTrack], library: &[LibTrack]) -> Adoption {
         .filter(|id| !mentioned.contains(id))
         .collect();
     out.accepted.sort_unstable();
+    out.identical.sort_unstable();
     out.proposals.sort_by_key(|p| (p.reason, p.dbid));
     out.unmatched_ipod.sort_unstable();
     out.unmatched_library.sort_unstable();
@@ -457,6 +515,7 @@ mod tests {
             album: Some("Al".into()),
             playlists: 0,
             playcount: 0,
+            hash: None,
         }
     }
 
@@ -468,6 +527,7 @@ mod tests {
             title: Some(title.into()),
             artist: Some(artist.into()),
             album: Some("Al".into()),
+            hash: [id as u8; 32],
         }
     }
 
