@@ -115,6 +115,7 @@ fn world(sysinfo: Option<&str>) -> World {
     let smart = PlaylistSpec {
         name: "Top rated",
         smart: true,
+        podcasts: false,
         members: vec![3],
     };
     let playlists = [

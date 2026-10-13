@@ -38,14 +38,24 @@ pub fn mapped_track_count(conn: &Connection, device_id: i64) -> Result<usize> {
     Ok(n as usize)
 }
 
-/// One adopted track: the library id, the iPod's dbid, and the iPod's tag
-/// hash and size at adoption time.
+/// One mapped track: the library id, the iPod's dbid, the iPod's tag hash
+/// and size, and the library file's duration at the last sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackMapping {
     pub track_id: i64,
     pub dbid: u64,
     pub synced_tags_hash: [u8; 32],
     pub synced_size: u64,
+    pub synced_duration_ms: Option<u32>,
+}
+
+/// One mapped playlist. `ipod_id` is `None` for mappings saved before ids
+/// were recorded; the name is then the only way to find the iPod playlist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistMapping {
+    pub playlist_id: i64,
+    pub ipod_id: Option<u64>,
+    pub ipod_name: String,
 }
 
 /// Replaces every mapping of `device_id` with the given ones.
@@ -53,7 +63,7 @@ pub fn replace_mappings(
     conn: &Connection,
     device_id: i64,
     tracks: &[TrackMapping],
-    playlists: &[(i64, String)],
+    playlists: &[PlaylistMapping],
 ) -> Result<()> {
     conn.execute(
         "DELETE FROM device_tracks WHERE device_id = ?1",
@@ -64,7 +74,8 @@ pub fn replace_mappings(
         [device_id],
     )?;
     let mut stmt = conn.prepare(
-        "INSERT INTO device_tracks (device_id, track_id, dbid, synced_tags_hash, synced_size) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO device_tracks (device_id, track_id, dbid, synced_tags_hash, synced_size, synced_duration_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     for m in tracks {
         // dbid is a u64; SQLite stores it bit for bit as an i64.
@@ -73,21 +84,51 @@ pub fn replace_mappings(
             m.track_id,
             m.dbid as i64,
             &m.synced_tags_hash[..],
-            m.synced_size as i64
+            m.synced_size as i64,
+            m.synced_duration_ms
         ])?;
     }
     let mut stmt = conn.prepare(
-        "INSERT INTO device_playlists (device_id, playlist_id, ipod_name) VALUES (?1, ?2, ?3)",
+        "INSERT INTO device_playlists (device_id, playlist_id, ipod_name, ipod_id) VALUES (?1, ?2, ?3, ?4)",
     )?;
-    for (playlist_id, name) in playlists {
-        stmt.execute(params![device_id, playlist_id, name])?;
+    for m in playlists {
+        stmt.execute(params![
+            device_id,
+            m.playlist_id,
+            m.ipod_name,
+            m.ipod_id.map(|id| id as i64)
+        ])?;
     }
+    // Tombstones no device maps any more have nothing left to delete.
+    conn.execute(
+        "DELETE FROM playlists WHERE removed_at IS NOT NULL \
+         AND id NOT IN (SELECT playlist_id FROM device_playlists)",
+        [],
+    )?;
     Ok(())
+}
+
+/// Every playlist mapped on the device, tombstones included.
+pub fn playlist_mappings(conn: &Connection, device_id: i64) -> Result<Vec<PlaylistMapping>> {
+    let mut stmt = conn.prepare(
+        "SELECT playlist_id, ipod_id, ipod_name FROM device_playlists WHERE device_id = ?1 ORDER BY playlist_id",
+    )?;
+    let rows = stmt
+        .query_map([device_id], |r| {
+            Ok(PlaylistMapping {
+                playlist_id: r.get(0)?,
+                ipod_id: r.get::<_, Option<i64>>(1)?.map(|id| id as u64),
+                ipod_name: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 pub fn track_mappings(conn: &Connection, device_id: i64) -> Result<Vec<TrackMapping>> {
     let mut stmt = conn.prepare(
-        "SELECT track_id, dbid, synced_tags_hash, synced_size FROM device_tracks WHERE device_id = ?1 ORDER BY track_id",
+        "SELECT track_id, dbid, synced_tags_hash, synced_size, synced_duration_ms FROM device_tracks \
+         WHERE device_id = ?1 ORDER BY track_id",
     )?;
     let rows = stmt
         .query_map([device_id], |r| {
@@ -103,6 +144,7 @@ pub fn track_mappings(conn: &Connection, device_id: i64) -> Result<Vec<TrackMapp
                     )
                 })?,
                 synced_size: r.get::<_, i64>(3)? as u64,
+                synced_duration_ms: r.get(4)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -113,7 +155,8 @@ pub fn track_mappings(conn: &Connection, device_id: i64) -> Result<Vec<TrackMapp
 pub fn library_playlists(conn: &Connection) -> Result<Vec<LibPlaylist>> {
     let mut stmt = conn.prepare(
         "SELECT p.id, p.name, i.position, i.track_id FROM playlists p \
-         LEFT JOIN playlist_items i ON i.playlist_id = p.id ORDER BY p.name, i.position",
+         LEFT JOIN playlist_items i ON i.playlist_id = p.id WHERE p.removed_at IS NULL \
+         ORDER BY p.name, i.position",
     )?;
     let mut out: Vec<LibPlaylist> = Vec::new();
     let mut rows = stmt.query([])?;

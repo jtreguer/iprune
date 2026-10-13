@@ -9,7 +9,7 @@ use rusqlite::Connection;
 
 use crate::adopt::{self, Adoption, PlaylistAdoption, Proposal, Reason};
 use crate::ipod::{self, Contents};
-use crate::store::devices::{self, TrackMapping};
+use crate::store::devices::{self, PlaylistMapping, TrackMapping};
 use crate::store::{self, TrackRow};
 use crate::{Error, Result};
 
@@ -164,14 +164,22 @@ pub fn save(conn: &Connection, r: &Run, guid: &str, force: bool) -> Result<()> {
                     // tags that really differ from the file.
                     synced_tags_hash: t.tags.hash(),
                     synced_size: t.adopt.size,
+                    // The file's, since the iPod's durations are sometimes
+                    // wrong: a later change of the file is measured
+                    // against what it was at adoption.
+                    synced_duration_ms: r.library.get(&track_id).and_then(|l| l.info.duration_ms),
                 }
             })
             .collect();
-        let playlists: Vec<(i64, String)> = r
+        let playlists: Vec<PlaylistMapping> = r
             .playlists
             .matched
             .iter()
-            .map(|m| (m.playlist_id, m.ipod_name.clone()))
+            .map(|m| PlaylistMapping {
+                playlist_id: m.playlist_id,
+                ipod_id: Some(m.ipod_id),
+                ipod_name: m.ipod_name.clone(),
+            })
             .collect();
         devices::replace_mappings(conn, device, &tracks, &playlists)
     })

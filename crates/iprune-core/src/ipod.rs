@@ -12,6 +12,9 @@ pub struct Track {
     pub adopt: IpodTrack,
     pub tags: Tags,
     pub ipod_path: Option<String>,
+    /// Plays and skips since the last database write, from `Play Counts`.
+    pub recent_plays: u32,
+    pub recent_skips: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -67,7 +70,8 @@ pub fn read(db: &gpod::Database) -> Contents {
     let mut playlists = Vec::new();
     let mut smart_playlists = 0;
     for pl in db.playlists() {
-        if pl.is_master() {
+        // The master and Podcasts playlists belong to the iPod itself.
+        if pl.is_master() || pl.is_podcasts() {
             continue;
         }
         if pl.is_smart() {
@@ -79,6 +83,7 @@ pub fn read(db: &gpod::Database) -> Contents {
             *in_playlists.entry(*dbid).or_default() += 1;
         }
         playlists.push(IpodPlaylist {
+            id: pl.id(),
             name: pl.name().map(|n| n.into_owned()).unwrap_or_default(),
             members,
         });
@@ -101,6 +106,8 @@ pub fn read(db: &gpod::Database) -> Contents {
                 },
                 tags,
                 ipod_path: t.ipod_path().map(|p| p.into_owned()),
+                recent_plays: t.recent_playcount(),
+                recent_skips: t.recent_skipcount(),
             }
         })
         .collect();

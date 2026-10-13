@@ -42,6 +42,11 @@ impl<'db> PlaylistRef<'db> {
         unsafe { gpod_sys::itdb_playlist_is_mpl(self.raw.as_ptr()) != 0 }
     }
 
+    /// The Podcasts system playlist.
+    pub fn is_podcasts(&self) -> bool {
+        unsafe { gpod_sys::itdb_playlist_is_podcasts(self.raw.as_ptr()) != 0 }
+    }
+
     pub fn is_smart(&self) -> bool {
         self.raw().is_spl != 0
     }

@@ -12,7 +12,7 @@ use iprune_core::adopt::{Adoption, IpodTrack, PlaylistAdoption, PlaylistMatch};
 use iprune_core::adoption::{self, Run};
 use iprune_core::device::{Mount, parse_mountinfo};
 use iprune_core::ipod::{self, Contents};
-use iprune_core::store::devices::{self, TrackMapping};
+use iprune_core::store::devices::{self, PlaylistMapping, TrackMapping};
 use iprune_core::store::{self, TrackRow};
 use iprune_core::tags::Tags;
 
@@ -33,6 +33,15 @@ fn mapping(track_id: i64, dbid: u64, tag: u8, size: u64) -> TrackMapping {
         dbid,
         synced_tags_hash: [tag; 32],
         synced_size: size,
+        synced_duration_ms: Some(1000),
+    }
+}
+
+fn pm(playlist_id: i64, name: &str) -> PlaylistMapping {
+    PlaylistMapping {
+        playlist_id,
+        ipod_id: None,
+        ipod_name: name.into(),
     }
 }
 
@@ -99,19 +108,13 @@ fn replace_mappings_replaces_and_leaves_other_devices_alone() {
         conn,
         a,
         &[mapping(t[0].id, 10, 1, 1), mapping(t[1].id, 11, 1, 1)],
-        &[(p1, "One".into()), (p2, "Two".into())],
+        &[pm(p1, "One"), pm(p2, "Two")],
     )
     .unwrap();
     let b_rows = vec![mapping(t[0].id, 10, 9, 9)];
-    devices::replace_mappings(conn, b, &b_rows, &[(p1, "uno".into())]).unwrap();
+    devices::replace_mappings(conn, b, &b_rows, &[pm(p1, "uno")]).unwrap();
 
-    devices::replace_mappings(
-        conn,
-        a,
-        &[mapping(t[2].id, 12, 2, 2)],
-        &[(p2, "TWO".into())],
-    )
-    .unwrap();
+    devices::replace_mappings(conn, a, &[mapping(t[2].id, 12, 2, 2)], &[pm(p2, "TWO")]).unwrap();
 
     assert_eq!(
         devices::track_mappings(conn, a).unwrap(),
@@ -192,6 +195,8 @@ fn ipod_track(dbid: u64, size: u64, tags: Tags) -> ipod::Track {
         },
         tags,
         ipod_path: None,
+        recent_plays: 0,
+        recent_skips: 0,
     }
 }
 
@@ -343,6 +348,7 @@ fn save_stores_matched_playlists_with_their_ipod_names() {
     let p = store::put_playlist(conn, "Road", Path::new("/p/Road.m3u8"), 1, &[]).unwrap();
     let mut run = run_of(&t, vec![ipod_track(1, 10, tags("a", "b"))], &[(1, 0)]);
     run.playlists.matched = vec![PlaylistMatch {
+        ipod_id: 0xABCD_0000_0000_0001,
         ipod_name: "ROAD".into(),
         playlist_id: p,
         library_name: "Road".into(),
@@ -352,6 +358,15 @@ fn save_stores_matched_playlists_with_their_ipod_names() {
     adoption::save(conn, &run, "G1", false).unwrap();
     let dev = devices::device_id(conn, "G1").unwrap().unwrap();
     assert_eq!(playlist_rows(conn, dev), vec![(p, "ROAD".into())]);
+    // The iPod's playlist id is kept bit for bit, high bit included.
+    assert_eq!(
+        devices::playlist_mappings(conn, dev).unwrap(),
+        vec![PlaylistMapping {
+            playlist_id: p,
+            ipod_id: Some(0xABCD_0000_0000_0001),
+            ipod_name: "ROAD".into(),
+        }]
+    );
 }
 
 // ---- parse_mountinfo

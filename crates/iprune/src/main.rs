@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use iprune_core::config::{Config, PathStyle, Paths};
 use iprune_core::store::Store;
-use iprune_core::{adoption, device, playlists, scan};
+use iprune_core::{adoption, device, playlists, scan, sync};
 
 /// Exit code when the user answers no to a confirmation.
 const EXIT_DECLINED: u8 = 4;
@@ -50,6 +50,19 @@ enum Command {
         /// Replace an earlier adoption of this iPod.
         #[arg(long)]
         force: bool,
+    },
+    /// Scan the library and plan a sync with the connected iPod. Only
+    /// planning is available for now: writing to the iPod comes in M4.
+    Sync {
+        /// Show the plan without applying it.
+        #[arg(long)]
+        plan_only: bool,
+        /// List every change, not only the counts.
+        #[arg(short, long)]
+        verbose: bool,
+        /// Print the plan as JSON instead of text.
+        #[arg(long, conflicts_with = "verbose")]
+        json: bool,
     },
     /// List and edit playlists.
     #[command(subcommand)]
@@ -176,8 +189,7 @@ fn print_list<T>(
     Ok(())
 }
 
-fn run_scan() -> Result<()> {
-    let (config, mut store) = load()?;
+fn scan_with_progress(config: &Config, store: &mut Store) -> Result<scan::ScanReport> {
     let tty = io::stderr().is_terminal();
     let progress = |p: scan::Progress| {
         if tty {
@@ -189,10 +201,16 @@ fn run_scan() -> Result<()> {
             }
         }
     };
-    let r = scan::scan(&mut store, &config, &progress)?;
+    let r = scan::scan(store, config, &progress)?;
     if tty {
         eprintln!();
     }
+    Ok(r)
+}
+
+fn run_scan() -> Result<()> {
+    let (config, mut store) = load()?;
+    let r = scan_with_progress(&config, &mut store)?;
     let mut out = io::stdout().lock();
     writeln!(
         out,
@@ -336,6 +354,47 @@ fn adopt(file: Option<&Path>, accept_proposals: bool, force: bool) -> Result<()>
     Ok(())
 }
 
+fn run_sync(plan_only: bool, verbose: bool, json: bool) -> Result<()> {
+    if !plan_only {
+        bail!(
+            "only `iprune sync --plan-only` is available for now; writing to the iPod comes in M4"
+        );
+    }
+    let (config, mut store) = load()?;
+    let r = scan_with_progress(&config, &mut store)?;
+    eprintln!(
+        "library: {} unchanged, {} added, {} updated, {} moved, {} missing",
+        r.unchanged,
+        r.added,
+        r.updated + r.returned,
+        r.moved.len(),
+        r.missing.len()
+    );
+    let mp = find_mountpoint(&config)?;
+    eprintln!("reading the iPod at {}", mp.display());
+    let db = gpod::Database::open(&mp)?;
+    let prepared = sync::prepare(store.conn(), &config, &db)?;
+    let plan_json = serde_json::to_string_pretty(&prepared.plan)?;
+    let plan_path = paths()?.data_dir.join("plan.json");
+    std::fs::write(&plan_path, &plan_json)
+        .with_context(|| format!("writing {}", plan_path.display()))?;
+    let mut out = io::stdout().lock();
+    if json {
+        writeln!(out, "{plan_json}")?;
+    } else {
+        write!(out, "{}", sync::describe(&prepared, verbose))?;
+        writeln!(
+            out,
+            "plan saved to {}; nothing was written to the iPod",
+            plan_path.display()
+        )?;
+    }
+    if !prepared.plan.space.fits {
+        bail!("the plan needs more space than the iPod has free");
+    }
+    Ok(())
+}
+
 fn confirm(question: &str) -> Result<bool> {
     if !io::stdin().is_terminal() {
         bail!("{question} needs confirmation; pass --yes");
@@ -427,6 +486,11 @@ fn main() -> ExitCode {
             accept_proposals,
             force,
         } => adopt(file.as_deref(), *accept_proposals, *force).map(|()| Outcome::Done),
+        Command::Sync {
+            plan_only,
+            verbose,
+            json,
+        } => run_sync(*plan_only, *verbose, *json).map(|()| Outcome::Done),
         Command::Playlist(cmd) => playlist(cmd),
         Command::Snapshot { path } => snapshot(path).map(|()| Outcome::Done),
     };

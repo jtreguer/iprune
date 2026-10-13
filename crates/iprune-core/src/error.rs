@@ -33,6 +33,16 @@ pub enum Error {
     NotUtf8(PathBuf),
     #[error("{} was changed by another program while iprune was editing it; nothing written, try again", .0.display())]
     ChangedOnDisk(PathBuf),
+    #[error(
+        "the iPod has no FireWire GUID in iPod_Control/Device/SysInfo or SysInfoExtended, so it cannot be identified"
+    )]
+    NoFirewireGuid,
+    #[error(
+        "the iPod {0} has not been adopted; run `iprune adopt` first, or every track would be copied again"
+    )]
+    NotAdopted(String),
+    #[error("{0}; nothing planned")]
+    BadScope(String),
     #[error("position {position} is out of range (playlist has {len} entries)")]
     BadPosition { position: usize, len: usize },
 }

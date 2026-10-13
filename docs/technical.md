@@ -260,10 +260,18 @@ CREATE TABLE stats (
 Migrations are numbered SQL files applied in order, tracked with
 `PRAGMA user_version`.
 
-To settle in M4: `device_playlists.playlist_id` has no `ON DELETE` action, so
-deleting a playlist file that is mapped to an iPod playlist fails the reload
-with a foreign key error. The sync needs the mapping to delete the iPod
-playlist, so the row must outlive the file until the next sync.
+Migration 0003 adds `playlists.removed_at`. When a playlist file is deleted
+while an iPod playlist is mapped to it, the row stays as a tombstone (items
+dropped, `removed_at` set) so the next sync knows which iPod playlist to
+delete; the executor drops the tombstone after that sync. A file that comes
+back under the same name revives the row and its mapping. Renaming a
+playlist onto a tombstone's name moves the tombstone aside (name and file
+`.removed-<id>`, which no playlist file can have), so the next sync still
+deletes its iPod playlist. Re-adoption drops tombstones no device maps any
+more. The same migration adds `device_playlists.ipod_id`, the iPod
+playlist's persistent id, and `device_tracks.synced_duration_ms`, the
+library file's duration at the last sync, filled from the index for
+existing mappings.
 
 ## 7. Library scan
 
@@ -411,34 +419,99 @@ files not on the iPod; 13 playlists differ from their file.
 
 ### 11.1 Planner
 
+`plan.rs`, pure. `sync.rs` gathers its input from the index and the iPod
+(`ipod::read`, the device's mappings, `statvfs` on the mountpoint) and
+describes the result.
+
 ```rust
 pub struct PlanInput<'a> {
-    pub library: &'a [LibTrack],             // in-scope tracks only
-    pub playlists: &'a [LibPlaylist],        // resolved to track ids
-    pub device: &'a DeviceSnapshot,          // tracks and playlists read from the iPod
-    pub mapping: &'a Mapping,                // track_id <-> dbid
-    pub config: &'a SyncConfig,
+    pub library: &'a [TrackRow],             // every indexed track, missing ones too
+    pub playlists: &'a [LibPlaylist],        // playlists with a file, resolved to track ids
+    pub removed_playlists: &'a [(i64, String)], // tombstones still mapped to the iPod
+    pub device: &'a Contents,                // tracks and regular playlists read from the iPod
+    pub tracks_map: &'a [TrackMapping],      // track_id <-> dbid, synced tag hash and size
+    pub playlists_map: &'a [(i64, String)],  // playlist_id <-> iPod playlist name
+    pub scope: Scope<'a>,                    // All | Playlists(names)
+    pub remove_unmanaged: bool,
+    pub space: Option<Space>,                // capacity and free bytes
 }
 
 pub struct Plan {
-    pub copy: Vec<CopyOp>,                   // track_id, source path, bytes
-    pub replace: Vec<ReplaceOp>,             // audio changed
-    pub update_tags: Vec<TagOp>,             // dbid, field diffs
+    pub copy: Vec<CopyOp>,                   // track_id, path, size
+    pub replace: Vec<ReplaceOp>,             // audio changed: copy new, remove old_dbid
+    pub update_tags: Vec<TagOp>,             // dbid, field changes
     pub remove: Vec<RemoveOp>,               // dbid, reason
-    pub playlists: Vec<PlaylistOp>,          // Create | SetMembers | Rename | Delete
-    pub unmanaged: Unmanaged,                // reported only
-    pub skipped: Vec<Skipped>,               // unsupported format, missing file
-    pub expected: ExpectedState,             // used by verify
+    pub playlists: Vec<PlaylistOp>,          // Delete | Rename | Create | SetMembers
+    pub unmanaged: Unmanaged,                // kept, reported
+    pub skipped: Vec<Skipped>,               // FairPlay files not on the iPod yet
+    pub entries_skipped: Vec<EntrySkipped>,  // unresolved, missing or skipped entries
+    pub stale_mappings: Vec<StaleMapping>,   // mapped dbid no longer on the iPod
+    pub stats_to_pull: usize,
+    pub space: SpaceCheck,
+    pub expected: Expected,                  // track count and managed playlists
 }
 
 pub fn plan(input: &PlanInput) -> Plan;
 ```
 
+Rules, in the order the planner applies them:
+
+1. Scope: every present track, or the present members of the configured
+   playlists.
+2. A track in scope with no mapping, or whose mapped dbid is gone from the
+   iPod (a stale mapping), is copied. An unmapped FairPlay file is skipped:
+   the iPod may not be authorised to play it. Section 18 has the open
+   question.
+3. A mapped track whose size differs from the synced size and whose duration
+   differs by more than one second from the file's duration at the last sync
+   (`synced_duration_ms`) is replaced. The iPod's own durations are not used,
+   since some are wrong by a factor of two to six. Otherwise,
+   when its tag hash differs from the synced one, the fields where the
+   library has a value the iPod lacks or differs from are updated. An empty
+   library field never clears an iPod value; a missing compilation mark never
+   clears the iPod's.
+4. A mapped iPod track whose library file is gone, or that left the scope, is
+   removed. Unmapped iPod tracks are kept and reported, or removed when
+   `remove_unmanaged` is set.
+5. Playlists. A mapped playlist claims the iPod playlist with its stored
+   id (`device_playlists.ipod_id`), or by stored name for a mapping saved
+   without an id. A recorded id no longer on the iPod claims nothing; the
+   playlist then goes through the name passes below like an unmapped one. A tombstone's iPod playlist is deleted, and so is a mapped playlist
+   that left the scope. Unmapped playlists in scope then match free iPod
+   playlists by the three name passes of adoption (exact, NFC
+   case-insensitive, file-name characters). Unmatched ones are created.
+   Remaining regular iPod playlists are unmanaged: kept, or deleted with
+   `remove_unmanaged`. The master, Podcasts and smart playlists are never
+   part of the plan.
+6. A matched playlist keeps its iPod name when that name differs from the
+   file's only by file-name characters or Unicode form (`BO - 2001: a Space
+   Odyssey` for `BO - 2001_ a Space Odyssey.m3u8`); otherwise, a change of
+   case included, it is renamed to the file's name. Its members are set as a whole when the iPod's list of dbids differs
+   from the file's, or when a member is copied or replaced. Entries that
+   resolve to nothing, to a missing file or to a skipped track are left out
+   and listed.
+7. Playlist operations run deletes first, then renames, creates and member
+   updates, each group by name, so no operation meets a name about to be
+   freed.
+
 The planner is deterministic: same input, same plan, same ordering. `Plan`
 serializes to JSON for the backup folder and for `iprune sync --plan-only`.
 
-Free space check: sum of bytes to copy minus bytes freed must fit in the
-iPod's free space with 1% margin, else the plan is refused.
+Free space check: removals run before copies, but a replaced file is
+removed only after its new copy is written. The peak, bytes copied minus
+bytes removed, must fit in the iPod's free space with a margin of 1% of its
+capacity; otherwise `fits` is false and the plan must not be applied.
+
+`prepare` refuses a `playlists` scope that is empty or names a playlist that
+does not exist, since it would plan the removal of every managed track. For
+M4: the executor also asks for confirmation, and a plan that removes more
+than a tenth of the managed tracks needs an explicit flag.
+
+`iprune sync --plan-only` scans the library, reads the iPod, prints the
+summary of section 7.3 of the design (every change with `--verbose`, the
+plan as JSON with `--json`) and saves the plan to `plan.json` in the data
+folder. It refuses an iPod that has not been adopted, since every track
+would otherwise be copied again.
 
 ### 11.2 Executor
 
@@ -519,7 +592,7 @@ onto the iPod, then rolls the SQLite mappings back to the matching
 iprune init
 iprune scan
 iprune adopt [--file <iTunesDB>] [--accept-proposals]
-iprune sync [--plan-only] [--yes]
+iprune sync [--plan-only] [--verbose] [--json] [--yes]
 iprune playlist list|show|new|rm|rename|add|remove|move ...
 iprune device info
 iprune backups
@@ -622,3 +695,4 @@ can be checked against the backup with the existing C tools.
 | libgpod does not understand some iTunes smart playlist rules ("Unknown action type 1" on write) and may rewrite them | check in M4 whether a write changes the 7 smart playlists, by comparing the raw `mhyp` records before and after |
 | Artwork database corruption | iprune never touches artwork; `ArtworkDB` backed up with every sync |
 | Losing play counts | pulled and committed before any write, exported to CSV |
+| FairPlay files (one in the library, "Bailemos") may not play on an iPod that is not authorised for that Apple account | the planner skips unmapped ones and leaves mapped ones in place; M5 decides whether copying them is worth offering |

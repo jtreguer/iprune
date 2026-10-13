@@ -443,6 +443,8 @@ pub fn resolve(a: &Adoption, accept_proposals: bool) -> (Vec<(u64, i64)>, Vec<&P
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpodPlaylist {
+    /// libgpod's persistent playlist id.
+    pub id: u64,
     pub name: String,
     pub members: Vec<u64>,
 }
@@ -457,6 +459,7 @@ pub struct LibPlaylist {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaylistMatch {
+    pub ipod_id: u64,
     pub ipod_name: String,
     pub playlist_id: i64,
     pub library_name: String,
@@ -480,9 +483,21 @@ fn loose(name: &str) -> String {
 /// to files got `_` in their place: "Dance/Trance" became "Dance_Trance".
 const NOT_IN_FILE_NAMES: [char; 9] = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
 
-fn file_safe(name: &str) -> String {
+/// NFC, with the characters file names cannot hold replaced by `_`; case
+/// kept. Two names equal under this differ only in how they were stored.
+pub(crate) fn file_chars(name: &str) -> String {
+    name.nfc()
+        .collect::<String>()
+        .replace(NOT_IN_FILE_NAMES, "_")
+}
+
+pub(crate) fn file_safe(name: &str) -> String {
     loose(name).replace(NOT_IN_FILE_NAMES, "_")
 }
+
+/// The ways two playlist names are compared, strictest first: exact, then
+/// NFC case-insensitive, then with file-name characters replaced.
+pub(crate) const NAME_PASSES: [fn(&str) -> String; 3] = [str::to_owned, loose, file_safe];
 
 /// Matches regular iPod playlists to playlist files by exact name, then by
 /// NFC case-insensitive name, then with the characters file names cannot hold
@@ -500,15 +515,15 @@ pub fn match_playlists(
             let lib = free.remove(i);
             let mapped: Vec<Option<i64>> = ip.members.iter().map(|d| map.get(d).copied()).collect();
             out.matched.push(PlaylistMatch {
+                ipod_id: ip.id,
                 ipod_name: ip.name.clone(),
                 playlist_id: lib.id,
                 library_name: lib.name.clone(),
                 same_contents: mapped == lib.members,
             });
         };
-    let passes: [fn(&str) -> String; 3] = [str::to_owned, loose, file_safe];
     let mut pending: Vec<&IpodPlaylist> = ipod.iter().collect();
-    for key in passes {
+    for key in NAME_PASSES {
         let mut next = Vec::new();
         for ip in pending {
             let k = key(&ip.name);
@@ -680,14 +695,17 @@ mod tests {
     fn playlists_match_exact_then_loose() {
         let ipod = vec![
             IpodPlaylist {
+                id: 1,
                 name: "80s".into(),
                 members: vec![1, 2],
             },
             IpodPlaylist {
+                id: 2,
                 name: "jazz".into(),
                 members: vec![],
             },
             IpodPlaylist {
+                id: 3,
                 name: "Gone".into(),
                 members: vec![],
             },

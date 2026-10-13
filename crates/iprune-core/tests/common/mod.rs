@@ -336,6 +336,8 @@ pub struct IpodSpec {
 pub struct PlaylistSpec {
     pub name: &'static str,
     pub smart: bool,
+    /// The Podcasts playlist, which iprune never manages.
+    pub podcasts: bool,
     pub members: Vec<u64>,
 }
 
@@ -343,6 +345,7 @@ pub fn ipod_playlist(name: &'static str, members: &[u64]) -> PlaylistSpec {
     PlaylistSpec {
         name,
         smart: false,
+        podcasts: false,
         members: members.to_vec(),
     }
 }
@@ -360,7 +363,13 @@ pub fn write_itunesdb(db: &Path, master: &str, tracks: &[IpodSpec], playlists: &
         let members: Vec<String> = p.members.iter().map(|d| format!("{d:x}")).collect();
         manifest += &format!(
             "{}\t{}\t{}\n",
-            if p.smart { "S" } else { "P" },
+            if p.podcasts {
+                "C"
+            } else if p.smart {
+                "S"
+            } else {
+                "P"
+            },
             p.name,
             members.join(",")
         );

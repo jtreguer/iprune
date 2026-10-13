@@ -15,6 +15,7 @@ use crate::{Error, Result};
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_init.sql"),
     include_str!("migrations/0002_tag_state.sql"),
+    include_str!("migrations/0003_playlist_tombstones.sql"),
 ];
 
 pub struct Store {
@@ -304,7 +305,7 @@ pub struct PlaylistSummary {
 
 pub fn playlists(conn: &Connection) -> Result<Vec<PlaylistRow>> {
     let mut stmt =
-        conn.prepare("SELECT id, name, file, file_mtime_ns FROM playlists ORDER BY name")?;
+        conn.prepare("SELECT id, name, file, file_mtime_ns FROM playlists WHERE removed_at IS NULL ORDER BY name")?;
     let rows = stmt
         .query_map([], |r| {
             Ok(PlaylistRow {
@@ -321,7 +322,8 @@ pub fn playlists(conn: &Connection) -> Result<Vec<PlaylistRow>> {
 pub fn playlist_summaries(conn: &Connection) -> Result<Vec<PlaylistSummary>> {
     let mut stmt = conn.prepare(
         "SELECT p.name, COUNT(i.position), COUNT(i.position) - COUNT(i.track_id) \
-         FROM playlists p LEFT JOIN playlist_items i ON i.playlist_id = p.id GROUP BY p.id ORDER BY p.name",
+         FROM playlists p LEFT JOIN playlist_items i ON i.playlist_id = p.id \
+         WHERE p.removed_at IS NULL GROUP BY p.id ORDER BY p.name",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -385,8 +387,8 @@ fn put_playlist_rows(
 ) -> Result<i64> {
     let id: i64 = conn.query_row(
         "INSERT INTO playlists (name, file, file_mtime_ns) VALUES (?1, ?2, ?3) \
-         ON CONFLICT(name) DO UPDATE SET file = excluded.file, file_mtime_ns = excluded.file_mtime_ns \
-         RETURNING id",
+         ON CONFLICT(name) DO UPDATE SET file = excluded.file, file_mtime_ns = excluded.file_mtime_ns, \
+         removed_at = NULL RETURNING id",
         params![name, path_str(file), mtime_ns],
         |r| r.get(0),
     )?;
@@ -399,17 +401,66 @@ fn put_playlist_rows(
     Ok(id)
 }
 
+/// Renames a playlist, keeping its row id so the iPod playlist it maps to is
+/// renamed rather than replaced. A tombstone under the new name is moved
+/// aside, keeping its mapping, so the next sync still deletes its iPod
+/// playlist.
 pub fn rename_playlist(conn: &Connection, old: &str, new: &str, file: &Path) -> Result<()> {
+    savepoint(conn, || {
+        set_tombstone_aside(conn, new)?;
+        conn.execute(
+            "UPDATE playlists SET name = ?2, file = ?3 WHERE name = ?1",
+            params![old, new, path_str(file)],
+        )?;
+        Ok(())
+    })
+}
+
+/// Gives a tombstone named `name` an internal name and file starting with
+/// `.`, which no playlist file can have, freeing `name`.
+fn set_tombstone_aside(conn: &Connection, name: &str) -> Result<()> {
     conn.execute(
-        "UPDATE playlists SET name = ?2, file = ?3 WHERE name = ?1",
-        params![old, new, path_str(file)],
+        "UPDATE playlists SET name = '.removed-' || id, file = '.removed-' || id \
+         WHERE name = ?1 AND removed_at IS NOT NULL",
+        [name],
     )?;
     Ok(())
 }
 
+/// Forgets a playlist whose file is gone. One mapped to an iPod playlist
+/// becomes a tombstone, so the next sync can delete the iPod playlist.
 pub fn delete_playlist(conn: &Connection, name: &str) -> Result<()> {
-    conn.execute("DELETE FROM playlists WHERE name = ?1", [name])?;
-    Ok(())
+    savepoint(conn, || {
+        let mapped: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM device_playlists d JOIN playlists p ON p.id = d.playlist_id \
+             WHERE p.name = ?1)",
+            [name],
+            |r| r.get(0),
+        )?;
+        if mapped {
+            conn.execute(
+                "DELETE FROM playlist_items WHERE playlist_id = (SELECT id FROM playlists WHERE name = ?1)",
+                [name],
+            )?;
+            conn.execute(
+                "UPDATE playlists SET removed_at = ?2 WHERE name = ?1 AND removed_at IS NULL",
+                params![name, crate::now_unix()],
+            )?;
+        } else {
+            conn.execute("DELETE FROM playlists WHERE name = ?1", [name])?;
+        }
+        Ok(())
+    })
+}
+
+/// `(id, name)` of the tombstones: deleted playlists still mapped to an iPod.
+pub fn removed_playlists(conn: &Connection) -> Result<Vec<(i64, String)>> {
+    let mut stmt =
+        conn.prepare("SELECT id, name FROM playlists WHERE removed_at IS NOT NULL ORDER BY name")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 #[cfg(test)]

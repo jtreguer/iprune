@@ -9,6 +9,7 @@
      T <dbid hex> <size> <tracklen ms> <title> <artist> <album> <playcount>
      P <name> <dbid hex>,<dbid hex>,...        regular playlist, members in order
      S <name> <dbid hex>,...                   smart playlist
+     C <name>                                  the Podcasts playlist (not a regular one)
 */
 #include <gpod/itdb.h>
 #include <stdio.h>
@@ -90,6 +91,10 @@ int main(int argc, char **argv) {
             Itdb_Playlist *pl = itdb_playlist_new(f[1], f[0][0] == 'S');
             itdb_playlist_add(db, pl, -1);
             if (n >= 3 && f[2][0]) members(db, pl, f[2]);
+        } else if (!strcmp(f[0], "C") && n >= 2) {
+            Itdb_Playlist *pl = itdb_playlist_new(f[1], FALSE);
+            itdb_playlist_set_podcasts(pl);
+            itdb_playlist_add(db, pl, -1);
         } else {
             fprintf(stderr, "bad manifest line: %s\n", f[0]);
             return 2;

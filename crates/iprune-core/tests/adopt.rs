@@ -612,6 +612,7 @@ fn random_inputs_keep_the_invariants() {
 
 fn ipl(name: &str, members: &[u64]) -> IpodPlaylist {
     IpodPlaylist {
+        id: 0,
         name: name.into(),
         members: members.to_vec(),
     }
