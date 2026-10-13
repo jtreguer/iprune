@@ -191,10 +191,11 @@ is lost, without running adoption again.
 ```sql
 CREATE TABLE tracks (
   id            INTEGER PRIMARY KEY,
-  path          TEXT NOT NULL UNIQUE,        -- absolute, NFC normalized
+  path          TEXT NOT NULL UNIQUE,        -- exact on-disk path, absolute
+  path_key      TEXT NOT NULL UNIQUE,        -- NFC form of path, for lookups
   size          INTEGER NOT NULL,
   mtime_ns      INTEGER NOT NULL,
-  hash          BLOB,                        -- blake3 of the whole file
+  hash          BLOB NOT NULL,               -- blake3 of the whole file
   duration_ms   INTEGER,
   filetype      TEXT NOT NULL,               -- mp3, aac, alac, wav, aiff
   bitrate       INTEGER, samplerate INTEGER,
@@ -258,22 +259,38 @@ CREATE TABLE stats (
 Migrations are numbered SQL files applied in order, tracked with
 `PRAGMA user_version`.
 
+To settle in M4: `device_playlists.playlist_id` has no `ON DELETE` action, so
+deleting a playlist file that is mapped to an iPod playlist fails the reload
+with a foreign key error. The sync needs the mapping to delete the iPod
+playlist, so the row must outlive the file until the next sync.
+
 ## 7. Library scan
 
-1. Walk every root, skipping excluded extensions and hidden folders.
+1. Walk every root, skipping excluded extensions and hidden folders. A root
+   that is not a readable folder stops the scan, and so does a walk that finds
+   no audio at all while the index has tracks: an unmounted disk must never
+   look like an empty library. Nothing under a folder that failed to read is
+   marked missing.
 2. For each file compare `(size, mtime_ns)` with the stored row. Unchanged
    files are skipped, so a rescan of 9,675 files takes about a second.
 3. New or changed files are read in parallel with `lofty` (tags, duration,
    codec, embedded picture presence). New files are also hashed with BLAKE3.
    The first full hash of 77 GB on a USB hard disk takes 10 to 15 minutes and
    runs once; progress is shown.
-4. Move detection: a path that disappeared and a new path with the same hash
-   in the same scan are the same track. The row keeps its id, its path is
+4. Move detection: a new path is the same track as a path that disappeared
+   in this scan, or one already marked missing, when exactly one such track
+   and exactly one new file share the hash. Anything ambiguous is an
+   addition plus a missing track. The row keeps its id, its path is
    updated, and every `.m3u8` that referenced the old path is rewritten.
 5. Paths that disappeared without a match get `missing_since` set. They are
    deleted from the index after the next successful sync has removed them from
    the iPod, so the mapping is never orphaned.
 6. Filetype for m4a comes from the codec (AAC or ALAC), not the extension.
+7. Paths are stored exactly as on disk, so files can always be opened; the
+   library has at least one file whose name is in NFD. Lookups from playlist
+   entries and the command line go through `path_key`, the NFC form.
+8. Files that cannot be read are reported and left out of the index; if they
+   were indexed before, their row is kept as it was.
 
 ## 8. Playlists
 
@@ -283,9 +300,12 @@ Migrations are numbered SQL files applied in order, tracked with
 - Write: always `#EXTM3U`, then `#EXTINF:<seconds>,<artist> - <title>` and
   the path for each entry, LF line endings. Written to a temporary file in the
   same folder, `fsync`ed, then renamed over the original.
-- External edits are detected by `mtime`. If a file changed on disk while the
-  interface has unsaved changes for it, the interface reloads it and shows a
-  message instead of overwriting.
+- External edits are detected by `mtime`. Every edit records the file's mtime
+  when it reads it and refuses to replace the file if it changed meanwhile.
+  If a file changed on disk while the interface has unsaved changes for it,
+  the interface reloads it and shows a message instead of overwriting.
+- Creating and renaming never replace an existing file (no-clobber persist,
+  hard link then unlink).
 - Unresolved entries are kept verbatim in the file so iprune never deletes a
   line it does not understand.
 

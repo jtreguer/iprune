@@ -10,7 +10,8 @@ is right rather than silently picking one.
 
 ## Status
 
-M0 done (bindings, read-only `gpod` wrapper, `iprune snapshot`). Work follows the milestones in `docs/technical.md` section 17:
+M0 and M1 done (bindings, read-only `gpod` wrapper, `iprune snapshot`; config,
+scan, SQLite index, `.m3u8` editing, `playlist` commands). Work follows the milestones in `docs/technical.md` section 17:
 
 | # | Deliverable | Writes to iPod |
 |---|---|---|
@@ -48,7 +49,8 @@ through `udisksctl`.
 ```
 crates/gpod-sys/     raw bindgen output, links libgpod-1.0 via pkg-config
 crates/gpod/         safe wrapper; the only crate allowed to contain unsafe
-crates/iprune-core/  config, store, scan, playlist, device, adopt, plan, exec, verify, stats (from M1)
+crates/iprune-core/  config, store, scan, playlist (.m3u8 format), playlists (operations);
+                     later device, adopt, plan, exec, verify, stats
 crates/iprune/       binary: CLI and TUI
 crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c
 ```
@@ -57,7 +59,8 @@ crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c
 
 ```
 cargo build
-cargo test                                  # needs gcc: compiles the C snapshot tool
+cargo test                                  # needs gcc (C snapshot tool) and ffmpeg with
+                                            # libmp3lame, aac, alac, libopus (audio fixtures)
 cargo test -p gpod -- --include-ignored     # also compares against the real backup, read only
 cargo clippy --all-targets -- -D warnings
 cargo fmt
@@ -107,7 +110,10 @@ must pass at the end. Mention in the commit message that both steps ran.
 - An empty library tag never overwrites a non-empty iPod value.
 - `.m3u8` writes go to a temp file in the same folder, `fsync`, then rename.
   Unresolved entries are kept verbatim.
-- Paths are NFC normalized before lookup and storage.
+- Paths are stored exactly as on disk and looked up by their NFC form
+  (`path_key`). At least one library file has an NFD name.
+- A scan never marks tracks missing when a root is absent, a folder failed to
+  read, or the walk found nothing: an unmounted disk is not an empty library.
 
 ## libgpod wrapper rules
 
