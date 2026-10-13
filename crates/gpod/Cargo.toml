@@ -1,0 +1,13 @@
+[package]
+name = "gpod"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+glib-sys = "0.22.9"
+gpod-sys = { version = "0.1.0", path = "../gpod-sys" }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+tempfile = "3.27.0"

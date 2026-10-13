@@ -517,5 +517,6 @@ can be checked against the backup with the existing C tools.
 | libgpod is unmaintained since 2015 | it is stable and still packaged; the wrapper keeps it behind one crate so a pure Rust writer could replace it later |
 | Struct layout mismatch with the installed headers | bindgen at build time against the system headers; M0 test against the real database |
 | Large database write is slow (22 MB `iTunesDB`) | measured in M0; checkpoints sized accordingly |
+| libgpod does not understand some iTunes smart playlist rules ("Unknown action type 1" on write) and may rewrite them | check in M4 whether a write changes the 7 smart playlists, by comparing the raw `mhyp` records before and after |
 | Artwork database corruption | iprune never touches artwork; `ArtworkDB` backed up with every sync |
 | Losing play counts | pulled and committed before any write, exported to CSV |

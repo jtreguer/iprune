@@ -10,7 +10,7 @@ is right rather than silently picking one.
 
 ## Status
 
-No code yet. Work follows the milestones in `docs/technical.md` section 17:
+M0 done (bindings, read-only `gpod` wrapper, `iprune snapshot`). Work follows the milestones in `docs/technical.md` section 17:
 
 | # | Deliverable | Writes to iPod |
 |---|---|---|
@@ -48,22 +48,38 @@ through `udisksctl`.
 ```
 crates/gpod-sys/     raw bindgen output, links libgpod-1.0 via pkg-config
 crates/gpod/         safe wrapper; the only crate allowed to contain unsafe
-crates/iprune-core/  config, store, scan, playlist, device, adopt, plan, exec, verify, stats
+crates/iprune-core/  config, store, scan, playlist, device, adopt, plan, exec, verify, stats (from M1)
 crates/iprune/       binary: CLI and TUI
-tests/fixtures/
+crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c
 ```
 
 ## Commands
 
 ```
 cargo build
-cargo test
+cargo test                                  # needs gcc: compiles the C snapshot tool
+cargo test -p gpod -- --include-ignored     # also compares against the real backup, read only
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
 
 Requires `libgpod` installed (`pacman -S libgpod`) and `pkg-config libgpod-1.0`
 to resolve.
+
+## Review and tests before every commit
+
+No code is committed or pushed until both of these are done, for every
+change, however small:
+
+1. **Tests by Aldo.** Launch the `aldo-test-specialist` agent on the change. It
+   writes or extends the tests, shows them failing against broken code, and
+   passing against the change.
+2. **Review by Vera.** Launch the `vera` agent on the diff (code and Aldo's
+   tests). Fix what she finds, or record why a finding was rejected, then have
+   her check the fixes.
+
+`cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`
+must pass at the end. Mention in the commit message that both steps ran.
 
 ## Rules that must hold
 
@@ -108,9 +124,9 @@ to resolve.
 ## Testing
 
 - Unit: planner, playlist parsing, adoption scoring, tag diffing, table driven.
-- Bindings (M0): Rust `snapshot` output must match the C `snapshot` tool from
-  `/mnt/seagate-1tb/iPod-backup-2026-10/tools/` byte for byte on the backup
-  `iTunesDB`.
+- Bindings (M0): `gpod::snapshot` output must match the C `snapshot` tool byte
+  for byte, on a fixture built by `make_fixture.c` (always) and on the backup
+  `iTunesDB` (ignored test). Do not change the snapshot format.
 - Integration: full sync against a fake iPod from `itdb_init_ipod` with a
   `SysInfo` containing a `FirewireGuid`; audio fixtures generated with ffmpeg.
 - Regression: syncing the same plan twice must give an empty second plan and an

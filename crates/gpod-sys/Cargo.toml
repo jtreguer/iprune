@@ -1,0 +1,13 @@
+[package]
+name = "gpod-sys"
+links = "gpod"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+glib-sys = "0.22.9"
+
+[build-dependencies]
+bindgen = "0.73.2"
+pkg-config = "0.3.34"
