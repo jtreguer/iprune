@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use common::{Env, IpodSpec, Kind, PlaylistSpec, fake_ipod, ipod_playlist};
 use iprune_core::config::Scope as ConfigScope;
 use iprune_core::plan::{
-    Member, Plan, PlaylistDeleteReason, PlaylistOp, RemoveReason, Space, SpaceCheck,
+    Member, Plan, PlaylistDeleteReason, PlaylistOp, PlaylistSkipReason, RemoveReason, Space,
+    SpaceCheck,
 };
 use iprune_core::sync::{self, Prepared};
 use iprune_core::{Error, adoption, ipod, playlists};
@@ -452,6 +453,98 @@ fn the_podcasts_playlist_is_never_planned_not_even_for_removal() {
     let p = w.plan();
     assert!(p.is_empty(), "{p:?}");
     assert!(p.unmanaged.playlists.is_empty());
+}
+
+// ---- smart playlist exports
+
+fn smart(name: &'static str) -> PlaylistSpec {
+    PlaylistSpec {
+        name,
+        smart: true,
+        podcasts: false,
+        members: vec![D1],
+    }
+}
+
+/// The world plus a file `<name>.m3u8` holding track one, then adopted.
+fn adopted_with_export(ipod_extra: Vec<PlaylistSpec>, name: &str) -> World {
+    let w = world(Some(SYSINFO), ipod_extra);
+    w.env.write_playlist(name, &format!("{}\n", w.abs("one")));
+    w.reload_playlists();
+    w.adopt();
+    w
+}
+
+#[test]
+fn a_file_named_like_a_smart_playlist_is_skipped_not_created() {
+    let w = adopted_with_export(vec![smart("Top rated")], "Top rated");
+    let c = ipod::read(&w.open());
+    assert_eq!(c.smart_playlists, vec!["Top rated".to_owned()]);
+    let p = w.plan();
+    assert_eq!(p.playlists_skipped.len(), 1, "{:?}", p.playlists_skipped);
+    assert_eq!(p.playlists_skipped[0].name, "Top rated");
+    assert_eq!(
+        p.playlists_skipped[0].reason,
+        PlaylistSkipReason::SmartOnIpod
+    );
+    assert!(p.playlists.is_empty(), "{:?}", p.playlists);
+    assert!(p.entries_skipped.is_empty());
+    let expected: Vec<&str> = p
+        .expected
+        .playlists
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(expected, vec!["Mix", "Road"]);
+    // Nothing else to do: the skip is the only thing in the plan.
+    assert!(p.is_empty(), "{p:?}");
+    // The smart playlist itself is untouched and not offered for removal.
+    assert!(p.unmanaged.playlists.is_empty());
+}
+
+#[test]
+fn the_same_file_is_created_when_the_ipod_has_no_such_smart_playlist() {
+    let w = adopted_with_export(vec![smart("Something else")], "Top rated");
+    let p = w.plan();
+    assert!(p.playlists_skipped.is_empty(), "{:?}", p.playlists_skipped);
+    assert!(
+        p.playlists
+            .iter()
+            .any(|o| matches!(o, PlaylistOp::Create { name, .. } if name == "Top rated")),
+        "{:?}",
+        p.playlists
+    );
+}
+
+#[test]
+fn a_skipped_export_stays_skipped_on_the_next_prepare() {
+    let w = adopted_with_export(vec![smart("Top rated")], "Top rated");
+    let (a, b) = (w.plan(), w.plan());
+    assert_eq!(a.playlists_skipped, b.playlists_skipped);
+    assert_eq!(a.playlists_skipped.len(), 1);
+}
+
+#[test]
+fn describe_lists_the_playlist_files_not_synced() {
+    let w = adopted_with_export(vec![smart("Top rated")], "Top rated");
+    // The section is listed in the verbose output; the summary line always.
+    let brief = sync::describe(&w.prepare().unwrap(), false);
+    assert!(brief.contains("skipped: 0 tracks, 1 playlist,"), "{brief}");
+    assert!(!brief.contains("Playlist files not synced"), "{brief}");
+    let text = sync::describe(&w.prepare().unwrap(), true);
+    assert!(text.contains("Playlist files not synced"), "{text}");
+    assert!(text.contains("Top rated"), "{text}");
+    // The summary line counts it: 0 tracks, 1 playlist, 0 entries.
+    assert!(text.contains("skipped: 0 tracks, 1 playlist,"), "{text}");
+    assert!(text.contains("playlists: 0 new"), "{text}");
+}
+
+#[test]
+fn describe_has_no_such_section_when_nothing_was_skipped() {
+    let w = adopted();
+    let text = sync::describe(&w.prepare().unwrap(), true);
+    assert!(!text.contains("Playlist files not synced"), "{text}");
+    assert!(!text.contains("skipped:"), "{text}");
 }
 
 // ---- scope

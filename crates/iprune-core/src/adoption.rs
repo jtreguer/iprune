@@ -342,7 +342,7 @@ pub fn summary(r: &Run) -> String {
             .count(),
         r.playlists.unmatched_ipod.len(),
         r.playlists.unmatched_library.len(),
-        r.ipod.smart_playlists,
+        r.ipod.smart_playlists.len(),
     );
     if r.compared + r.unreadable.len() > 0 {
         let _ = write!(

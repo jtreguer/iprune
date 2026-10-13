@@ -8,7 +8,8 @@ use iprune_core::adopt::{IpodPlaylist, IpodTrack, LibPlaylist};
 use iprune_core::ipod::{Contents, Track};
 use iprune_core::plan::{
     self, EntryReason, EntrySkipped, ExpectedPlaylist, Field, Member, Plan, PlanInput,
-    PlaylistDeleteReason, PlaylistOp, RemoveReason, Scope, SkipReason, Space, tag_changes,
+    PlaylistDeleteReason, PlaylistOp, PlaylistSkipReason, PlaylistSkipped, RemoveReason, Scope,
+    SkipReason, Space, tag_changes,
 };
 use iprune_core::store::TrackRow;
 use iprune_core::store::devices::{PlaylistMapping, TrackMapping};
@@ -523,6 +524,96 @@ fn tag_changes_table() {
     }
 }
 
+// ---- tag comparison: library wins, compared cleaned
+
+/// Every text field set to `v`.
+fn all_text(v: &str) -> Tags {
+    t(|x| {
+        x.title = Some(v.into());
+        x.artist = Some(v.into());
+        x.album = Some(v.into());
+        x.album_artist = Some(v.into());
+        x.composer = Some(v.into());
+        x.genre = Some(v.into());
+    })
+}
+
+fn pairs(lib: &Tags, ipod: &Tags) -> Vec<(Field, Option<String>, String)> {
+    tag_changes(lib, ipod)
+        .into_iter()
+        .map(|c| (c.field, c.ipod, c.library))
+        .collect()
+}
+
+// Prevents ID3v1 space padding from making every such track a tag update.
+#[test]
+fn spaces_around_a_text_tag_are_not_a_change_on_either_side() {
+    let clean = all_text("Stella By Starlight");
+    let padded = all_text("Stella By Starlight           ");
+    let lead = all_text("  Stella By Starlight");
+    assert_eq!(pairs(&clean, &padded), vec![], "padded on the iPod");
+    assert_eq!(pairs(&padded, &clean), vec![], "padded in the library");
+    assert_eq!(pairs(&lead, &clean), vec![], "leading, library");
+    assert_eq!(pairs(&clean, &lead), vec![], "leading, iPod");
+}
+
+// Prevents NFD vs NFC spellings of one name from being re-sent every sync.
+#[test]
+fn the_same_text_in_nfd_and_nfc_is_not_a_change() {
+    let nfc = all_text("Soukai\u{ef}na");
+    let nfd = all_text("Soukai\u{69}\u{308}na");
+    assert_ne!(
+        nfc.title, nfd.title,
+        "the fixture must differ at byte level"
+    );
+    assert_eq!(pairs(&nfd, &nfc), vec![], "NFD in the library");
+    assert_eq!(pairs(&nfc, &nfd), vec![], "NFD on the iPod");
+}
+
+// Prevents a whitespace-only library tag from wiping the iPod value.
+#[test]
+fn a_library_value_of_only_spaces_is_empty_and_never_clears_the_ipod() {
+    let blank = all_text("   ");
+    assert_eq!(pairs(&blank, &all_text("Kept")), vec![]);
+    // Nothing on the iPod either: still nothing to send.
+    assert_eq!(pairs(&blank, &Tags::default()), vec![]);
+    assert_eq!(pairs(&blank, &all_text("")), vec![]);
+}
+
+// Prevents the raw (padded, NFD) library value from reaching the iPod.
+#[test]
+fn a_real_change_sends_the_trimmed_nfc_library_value() {
+    let lib = t(|x| x.album = Some("  Cafe\u{301} Noir   ".into()));
+    let ipod = t(|x| x.album = Some("Old".into()));
+    let got = tag_changes(&lib, &ipod);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].field, Field::Album);
+    assert_eq!(got[0].library, "Caf\u{e9} Noir");
+    assert_eq!(got[0].ipod.as_deref(), Some("Old"));
+}
+
+// An iPod value with padding still differs from another text.
+#[test]
+fn a_padded_ipod_value_against_a_different_library_value_is_a_change() {
+    let lib = t(|x| x.title = Some("New".into()));
+    let ipod = t(|x| x.title = Some("Old   ".into()));
+    assert_eq!(
+        pairs(&lib, &ipod),
+        vec![change(Field::Title, Some("Old   "), "New")]
+    );
+}
+
+// Prevents a padded tag from producing an update op in a whole plan.
+#[test]
+fn a_padded_tag_on_a_track_with_a_changed_hash_makes_no_update_op() {
+    let mut w = World::default();
+    w.synced(1, 0xA1);
+    w.lib_mut(1).tags.title = Some("Title1   ".into());
+    w.mapping_mut(1).synced_tags_hash = [9; 32];
+    let p = w.plan();
+    assert!(p.update_tags.is_empty(), "{:?}", p.update_tags);
+}
+
 #[test]
 fn an_empty_library_compilation_mark_does_not_clear_the_ipod_in_a_plan() {
     let mut w = World::default();
@@ -849,6 +940,209 @@ fn unmapped_playlists_match_free_ipod_playlists_by_name_or_are_created() {
             assert_eq!(p.unmanaged.playlists, vec![on_ipod.to_owned()], "{case}");
         }
     }
+}
+
+// ---- smart playlist exports
+
+impl World {
+    fn smart(&mut self, names: &[&str]) -> &mut Self {
+        self.device.smart_playlists = names.iter().map(|n| n.to_string()).collect();
+        self
+    }
+}
+
+fn skipped(name: &str) -> PlaylistSkipped {
+    PlaylistSkipped {
+        name: name.into(),
+        reason: PlaylistSkipReason::SmartOnIpod,
+    }
+}
+
+#[test]
+fn a_file_named_like_a_smart_playlist_is_skipped_by_each_name_pass() {
+    // (file name, smart playlist name on the iPod)
+    let cases = [
+        ("Top rated", "Top rated"),
+        ("top RATED", "Top rated"),
+        ("Dance_Trance", "Dance/Trance"),
+        // NFD in the file, NFC on the iPod.
+        ("Ann\u{65}\u{301}es 90", "Ann\u{e9}es 90"),
+    ];
+    for (file, smart) in cases {
+        let mut w = World::default();
+        w.synced(1, 0xA1).smart(&[smart]);
+        // An unresolved entry would show up in entries_skipped if the file
+        // were planned at all.
+        w.playlist(10, file, &[Some(1), None], None);
+        let p = w.plan();
+        let case = format!("{file:?} vs {smart:?}");
+        assert_eq!(p.playlists_skipped, vec![skipped(file)], "{case}");
+        assert!(p.playlists.is_empty(), "{case}: {:?}", p.playlists);
+        assert!(p.entries_skipped.is_empty(), "{case}");
+        assert!(p.expected.playlists.is_empty(), "{case}");
+        assert!(p.is_empty(), "{case}: {p:?}");
+    }
+}
+
+#[test]
+fn a_file_not_named_like_a_smart_playlist_is_created_and_not_listed() {
+    let mut w = World::default();
+    w.synced(1, 0xA1).smart(&["Top rated"]);
+    w.playlist(10, "Top rated 2", &ids(&[1]), None);
+    let p = w.plan();
+    assert!(p.playlists_skipped.is_empty(), "{:?}", p.playlists_skipped);
+    assert_eq!(names(&p), vec![("create", "Top rated 2".to_owned())]);
+    assert_eq!(p.expected.playlists.len(), 1);
+}
+
+#[test]
+fn only_the_smart_named_files_are_skipped_and_the_others_still_synced() {
+    let mut w = World::default();
+    w.synced(1, 0xA1).smart(&["Zeta", "Alpha"]);
+    w.playlist(10, "Zeta", &ids(&[1]), None);
+    w.playlist(11, "Alpha", &ids(&[1]), None);
+    w.playlist(12, "Normal", &ids(&[1]), None);
+    let p = w.plan();
+    // In name order, like the rest of the plan.
+    assert_eq!(p.playlists_skipped, vec![skipped("Alpha"), skipped("Zeta")]);
+    assert_eq!(names(&p), vec![("create", "Normal".to_owned())]);
+    let exp: Vec<&str> = p
+        .expected
+        .playlists
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(exp, vec!["Normal"]);
+}
+
+#[test]
+fn a_smart_named_file_mapped_to_a_regular_ipod_playlist_is_synced() {
+    let mut w = World::default();
+    w.synced(1, 0xA1).synced(2, 0xA2).smart(&["Mix"]);
+    w.ipod_playlist(7, "Mix", &[0xA2]);
+    w.playlist(10, "Mix", &ids(&[1]), Some("Mix"));
+    let p = w.plan();
+    assert!(p.playlists_skipped.is_empty(), "{:?}", p.playlists_skipped);
+    assert_eq!(
+        p.playlists,
+        vec![PlaylistOp::SetMembers {
+            playlist_id: 10,
+            ipod_id: 7,
+            name: "Mix".into(),
+            members: vec![Member::Track(0xA1)],
+        }]
+    );
+    assert_eq!(p.expected.playlists.len(), 1);
+}
+
+#[test]
+fn a_smart_named_file_mapped_by_id_to_a_differently_named_playlist_is_synced() {
+    let mut w = World::default();
+    w.synced(1, 0xA1).synced(2, 0xA2).smart(&["Mix"]);
+    w.ipod_playlist(7, "Old name", &[0xA2]);
+    w.playlist(10, "Mix", &ids(&[1]), None);
+    w.map_playlist(10, Some(7), "Old name");
+    let p = w.plan();
+    assert!(p.playlists_skipped.is_empty(), "{:?}", p.playlists_skipped);
+    assert_eq!(
+        names(&p),
+        vec![("rename", "Mix".to_owned()), ("set", "Mix".to_owned())]
+    );
+}
+
+#[test]
+fn a_smart_named_file_matching_a_regular_ipod_playlist_by_name_is_synced() {
+    // Each pass: exact, case, file-name characters.
+    for (file, regular) in [("Mix", "Mix"), ("mix", "MIX"), ("A_B", "A/B")] {
+        let mut w = World::default();
+        w.synced(1, 0xA1).synced(2, 0xA2).smart(&[regular]);
+        w.ipod_playlist(7, regular, &[0xA2]);
+        w.playlist(10, file, &ids(&[1]), None);
+        let p = w.plan();
+        let case = format!("{file:?} vs {regular:?}");
+        assert!(p.playlists_skipped.is_empty(), "{case}");
+        assert!(
+            p.playlists
+                .iter()
+                .any(|o| matches!(o, PlaylistOp::SetMembers { ipod_id: 7, .. })),
+            "{case}: {:?}",
+            p.playlists
+        );
+        assert!(
+            !p.playlists
+                .iter()
+                .any(|o| matches!(o, PlaylistOp::Create { .. })),
+            "{case}"
+        );
+        assert_eq!(p.expected.playlists.len(), 1, "{case}");
+    }
+}
+
+#[test]
+fn a_regular_playlist_claimed_once_leaves_a_second_smart_named_file_skipped() {
+    // Two files "Mix" and "mix"; one regular "Mix" and one smart "Mix". The
+    // regular one goes to the first file by name, the other is an export.
+    let mut w = World::default();
+    w.synced(1, 0xA1).smart(&["Mix"]);
+    w.ipod_playlist(7, "Mix", &[]);
+    w.playlist(10, "Mix", &ids(&[1]), None);
+    w.playlist(11, "mix", &ids(&[1]), None);
+    let p = w.plan();
+    // Sorted by name: "Mix" < "mix", so "Mix" takes the regular playlist.
+    assert_eq!(p.playlists_skipped, vec![skipped("mix")]);
+    assert_eq!(
+        p.playlists,
+        vec![PlaylistOp::SetMembers {
+            playlist_id: 10,
+            ipod_id: 7,
+            name: "Mix".into(),
+            members: vec![Member::Track(0xA1)],
+        }]
+    );
+}
+
+#[test]
+fn playlists_out_of_scope_are_not_listed_as_skipped() {
+    let mut w = World::default();
+    w.synced(1, 0xA1).smart(&["Top rated"]);
+    w.playlist(10, "In", &ids(&[1]), None);
+    w.playlist(11, "Top rated", &ids(&[1]), None);
+    w.scope = Some(vec!["In".into()]);
+    let p = w.plan();
+    assert!(p.playlists_skipped.is_empty(), "{:?}", p.playlists_skipped);
+    assert_eq!(names(&p), vec![("create", "In".to_owned())]);
+}
+
+// An unnamed smart playlist matches nothing, whatever the file is called.
+#[test]
+fn an_unnamed_smart_playlist_skips_no_file() {
+    for file in ["", "  "] {
+        let mut w = World::default();
+        w.synced(1, 0xA1).smart(&["", "  "]);
+        w.playlist(10, file, &ids(&[1]), None);
+        let p = w.plan();
+        let case = format!("file {file:?}");
+        assert!(p.playlists_skipped.is_empty(), "{case}");
+        assert_eq!(names(&p), vec![("create", file.to_owned())], "{case}");
+    }
+    // And it does not hide a real name next to it.
+    let mut w = World::default();
+    w.synced(1, 0xA1).smart(&["", "Top rated"]);
+    w.playlist(10, "Top rated", &ids(&[1]), None);
+    w.playlist(11, "Other", &ids(&[1]), None);
+    let p = w.plan();
+    assert_eq!(p.playlists_skipped, vec![skipped("Top rated")]);
+    assert_eq!(names(&p), vec![("create", "Other".to_owned())]);
+}
+
+#[test]
+fn no_smart_playlists_on_the_ipod_skips_nothing() {
+    let mut w = World::default();
+    w.synced(1, 0xA1);
+    w.playlist(10, "Top rated", &ids(&[1]), None);
+    let p = w.plan();
+    assert!(p.playlists_skipped.is_empty());
+    assert_eq!(names(&p), vec![("create", "Top rated".to_owned())]);
 }
 
 #[test]

@@ -35,6 +35,11 @@ and tested.
   `.m3u8` folder.
 - No cover art work of any kind. Leave existing iPod artwork alone.
 - Play statistics come from the iPod only; no iTunes XML import.
+- The library is the reference, as with iTunes: file tags and `.m3u8`
+  files win over the iPod, the first sync after adoption included. Only an
+  empty file tag leaves the iPod value alone.
+- Playlist files named like an iPod smart playlist, with no regular iPod
+  playlist of their own, are exports of it and are not synced.
 - The interface is a GTK4 desktop window with an iTunes-style grid
   (sidebar, sortable columns, drag and drop), not a terminal UI.
 

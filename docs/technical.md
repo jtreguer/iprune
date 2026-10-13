@@ -467,9 +467,9 @@ Rules, in the order the planner applies them:
    (`synced_duration_ms`) is replaced. The iPod's own durations are not used,
    since some are wrong by a factor of two to six. Otherwise,
    when its tag hash differs from the synced one, the fields where the
-   library has a value the iPod lacks or differs from are updated. An empty
-   library field never clears an iPod value; a missing compilation mark never
-   clears the iPod's.
+   library has a value the iPod lacks or differs from are updated. Text is
+   compared and sent trimmed and in NFC. An empty library field, spaces only
+   included, never clears an iPod value; a missing compilation mark never clears the iPod's.
 4. A mapped iPod track whose library file is gone, or that left the scope, is
    removed. Unmapped iPod tracks are kept and reported, or removed when
    `remove_unmanaged` is set.
@@ -480,7 +480,10 @@ Rules, in the order the planner applies them:
    that left the scope. Unmapped playlists in scope then match free iPod
    playlists by the three name passes of adoption (exact, NFC
    case-insensitive, file-name characters). Unmatched ones are created.
-   Remaining regular iPod playlists are unmanaged: kept, or deleted with
+   A playlist still unmatched whose name matches an iPod smart playlist by
+   one of those passes is an export of it: it goes to `playlists_skipped`
+   and is not created. Remaining regular iPod playlists are unmanaged: kept,
+   or deleted with
    `remove_unmanaged`. The master, Podcasts and smart playlists are never
    part of the plan.
 6. A matched playlist keeps its iPod name when that name differs from the

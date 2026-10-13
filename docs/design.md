@@ -225,8 +225,15 @@ tags (section 4).
 | Tags changed | managed | update iPod database fields, no file copy |
 | Audio changed (size and duration differ) | managed | copy new file, remove old one |
 
-When local tags are empty for a field that has a value on the iPod, the iPod
-value is kept. This protects metadata that iTunes stored only in its database,
+The library is the reference, as with iTunes: the iPod is never ahead of the
+computer. Where a file's tag and the iPod differ, the file's value goes to the
+iPod, including on the first sync after adoption (the iPod's French genre
+names from iTunes, such as "Bande originale", become the files' "Soundtrack").
+Values are compared without surrounding spaces and in one Unicode form, so
+the same text stored two ways is not a change.
+
+When local tags are empty (or only spaces) for a field that has a value on
+the iPod, the iPod value is kept. This protects metadata that iTunes stored only in its database,
 which matters for the 79 WAV files.
 
 Files the iPod Classic cannot play (anything other than MP3, AAC, ALAC, WAV,
@@ -243,6 +250,10 @@ two videos. Transcoding is planned for later (section 12).
 - iPod playlists with no matching file are reported and kept, unless the user
   chooses to remove them.
 - The master playlist and smart playlists are never edited directly.
+- A playlist file named like a smart playlist on the iPod, with no regular
+  iPod playlist of its own, is an export of it and is not synced; the plan
+  lists it. The library has seven, among them
+  "Musique classique" and "Années 90".
 
 ### Play statistics
 
@@ -303,6 +314,8 @@ In rough order of value:
    smaller iPod.
 3. Watching the library folders for changes while the window is open.
 4. A second iPod.
+5. Recreating iTunes' "Ajouté récemment" (recently added) smart playlist,
+   from the index's `added_at`.
 
 ## 13. Decisions
 

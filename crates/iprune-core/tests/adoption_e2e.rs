@@ -148,7 +148,7 @@ fn reads_the_ipod_database_into_plain_data() {
     assert_eq!(c.name.as_deref(), Some("iPod de Test"));
     assert!(c.firewire_guid.unwrap().ends_with("000A27001234ABCD"));
     assert_eq!(c.tracks.len(), 8);
-    assert_eq!(c.smart_playlists, 1);
+    assert_eq!(c.smart_playlists.len(), 1);
     // Master and smart playlists are not in the regular list.
     let names: Vec<&str> = c.playlists.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["Road", "MIX", "OnlyIpod", "Empty", "Wavs"]);
@@ -245,7 +245,7 @@ fn playlists_are_matched_by_name_and_compared_through_the_mapping() {
     assert!(by_name["Empty"].same_contents);
     assert_eq!(m.unmatched_ipod, vec!["OnlyIpod", "Wavs"]);
     assert_eq!(m.unmatched_library, vec!["NewFile"]);
-    assert_eq!(run.ipod.smart_playlists, 1);
+    assert_eq!(run.ipod.smart_playlists.len(), 1);
 }
 
 #[test]
@@ -449,7 +449,7 @@ fn reads_the_real_backup_database() {
         assert!(p.members.iter().all(|d| dbids.contains(d)), "{}", p.name);
     }
     assert_eq!(
-        c.playlists.len() + c.smart_playlists + 1,
+        c.playlists.len() + c.smart_playlists.len() + 1,
         db.playlist_count()
     );
 }

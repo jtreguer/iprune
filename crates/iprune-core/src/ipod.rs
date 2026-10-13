@@ -26,7 +26,8 @@ pub struct Contents {
     pub tracks: Vec<Track>,
     /// Regular playlists, in iPod order.
     pub playlists: Vec<IpodPlaylist>,
-    pub smart_playlists: usize,
+    /// Names of the smart playlists, in iPod order. Never edited.
+    pub smart_playlists: Vec<String>,
 }
 
 fn non_empty(s: Option<std::borrow::Cow<'_, str>>) -> Option<String> {
@@ -68,14 +69,14 @@ pub fn file_path(mountpoint: &Path, ipod_path: &str) -> Option<PathBuf> {
 pub fn read(db: &gpod::Database) -> Contents {
     let mut in_playlists: HashMap<u64, usize> = HashMap::new();
     let mut playlists = Vec::new();
-    let mut smart_playlists = 0;
+    let mut smart_playlists = Vec::new();
     for pl in db.playlists() {
         // The master and Podcasts playlists belong to the iPod itself.
         if pl.is_master() || pl.is_podcasts() {
             continue;
         }
         if pl.is_smart() {
-            smart_playlists += 1;
+            smart_playlists.push(pl.name().map(|n| n.into_owned()).unwrap_or_default());
             continue;
         }
         let members: Vec<u64> = pl.members().map(|t| t.dbid()).collect();

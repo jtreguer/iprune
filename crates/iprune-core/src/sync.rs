@@ -12,7 +12,7 @@ use crate::error::IoContext;
 use crate::ipod::{self, Contents};
 use crate::plan::{
     self, EntryReason, Field, Member, Plan, PlanInput, PlaylistDeleteReason, PlaylistOp,
-    RemoveReason, Scope, SkipReason, Space,
+    PlaylistSkipReason, RemoveReason, Scope, SkipReason, Space,
 };
 use crate::store::{self, TrackRow, devices};
 use crate::{Error, Result};
@@ -206,11 +206,15 @@ pub fn describe(p: &Prepared, verbose: bool) -> String {
         plural(plan.unmanaged.tracks.len(), "track", "tracks"),
         plural(plan.unmanaged.playlists.len(), "playlist", "playlists")
     );
-    if !plan.skipped.is_empty() || !plan.entries_skipped.is_empty() {
+    if !plan.skipped.is_empty()
+        || !plan.entries_skipped.is_empty()
+        || !plan.playlists_skipped.is_empty()
+    {
         let _ = writeln!(
             w,
-            "  skipped: {}, {}",
+            "  skipped: {}, {}, {}",
             plural(plan.skipped.len(), "track", "tracks"),
+            plural(plan.playlists_skipped.len(), "playlist", "playlists"),
             plural(
                 plan.entries_skipped.len(),
                 "playlist entry",
@@ -355,6 +359,18 @@ pub fn describe(p: &Prepared, verbose: bool) -> String {
             .iter()
             .map(|t| match t.reason {
                 SkipReason::FairPlay => format!("{} (FairPlay protected)", t.path.display()),
+            })
+            .collect(),
+    );
+    section(
+        w,
+        "Playlist files not synced",
+        plan.playlists_skipped
+            .iter()
+            .map(|p| match p.reason {
+                PlaylistSkipReason::SmartOnIpod => {
+                    format!("{} (named like a smart playlist on the iPod)", p.name)
+                }
             })
             .collect(),
     );

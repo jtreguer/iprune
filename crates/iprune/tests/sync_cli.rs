@@ -274,6 +274,58 @@ fn json_prints_the_plan_that_is_saved() {
     assert!(!out(&o).contains("nothing was written"), "{}", out(&o));
 }
 
+/// The adopted world, plus a file `Top rated.m3u8` and a smart playlist of
+/// that name on the iPod (written before adoption).
+fn with_smart_export() -> Sandbox {
+    let sb = world();
+    let tracks = [
+        sb.spec("one.mp3", u64::MAX - 1, "Title1", "Artist1"),
+        sb.spec("two.m4a", 2, "Title1", "Artist1"),
+        sb.spec("three.wav", 3, "Title3", "Artist3"),
+    ];
+    let mut lists = vec![ipod_playlist("Road", &[u64::MAX - 1, 2])];
+    lists.push(common::PlaylistSpec {
+        name: "Top rated",
+        smart: true,
+        podcasts: false,
+        members: vec![2],
+    });
+    fake_ipod(&sb.ipod, Some(GUID_SYSINFO), &tracks, &lists);
+    fs::write(
+        sb.lists.join("Top rated.m3u8"),
+        format!("{}\n", sb.music.join("one.mp3").display()),
+    )
+    .unwrap();
+    sb.ok(&["adopt"]);
+    sb
+}
+
+#[test]
+fn a_smart_playlist_export_is_in_the_json_plan_and_not_in_its_operations() {
+    let sb = with_smart_export();
+    let ipod_before = sb.tree(&sb.ipod);
+    let o = sb.ok(&["sync", "--plan-only", "--json"]);
+    let plan: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(
+        plan["playlists_skipped"],
+        serde_json::json!([{"name": "Top rated", "reason": "smart_on_ipod"}]),
+        "{plan}"
+    );
+    assert_eq!(plan["playlists"].as_array().unwrap().len(), 0, "{plan}");
+    let expected: Vec<&str> = plan["expected"]["playlists"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(expected, vec!["Road"], "{plan}");
+    assert_eq!(sb.tree(&sb.ipod), ipod_before, "the iPod is only read");
+
+    let text = out(&sb.ok(&["sync", "--plan-only", "--verbose"]));
+    assert!(text.contains("Playlist files not synced"), "{text}");
+    assert!(text.contains("Top rated"), "{text}");
+}
+
 #[test]
 fn json_and_verbose_together_are_a_usage_error() {
     let sb = adopted();

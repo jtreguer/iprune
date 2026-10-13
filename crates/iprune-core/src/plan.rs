@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::Serialize;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::adopt::{self, IpodPlaylist, LibPlaylist, NAME_PASSES};
 use crate::ipod::{self, Contents};
@@ -61,6 +62,8 @@ pub struct Plan {
     pub unmanaged: Unmanaged,
     pub skipped: Vec<Skipped>,
     pub entries_skipped: Vec<EntrySkipped>,
+    /// Playlist files not synced, by name.
+    pub playlists_skipped: Vec<PlaylistSkipped>,
     /// Mappings whose iPod track is gone (deleted on the device, or the
     /// database was restored). In scope, the track is copied again.
     pub stale_mappings: Vec<StaleMapping>,
@@ -232,6 +235,20 @@ pub enum EntryReason {
     TrackSkipped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaylistSkipReason {
+    /// Named like a smart playlist on the iPod: the file is an export of it,
+    /// and a static copy would sit next to the live one.
+    SmartOnIpod,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlaylistSkipped {
+    pub name: String,
+    pub reason: PlaylistSkipReason,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EntrySkipped {
     pub playlist: String,
@@ -284,19 +301,26 @@ impl Plan {
     }
 }
 
+/// A tag value without surrounding spaces (ID3v1 pads with them) and in NFC,
+/// so the same text stored two ways compares equal. `None` when empty.
+fn clean(s: &Option<String>) -> Option<String> {
+    let s = s.as_deref()?.trim();
+    (!s.is_empty()).then(|| s.nfc().collect())
+}
+
 fn text_change(
     out: &mut Vec<TagChange>,
     field: Field,
     lib: &Option<String>,
     ipod: &Option<String>,
 ) {
-    if let Some(l) = lib
-        && ipod.as_ref() != Some(l)
+    if let Some(l) = clean(lib)
+        && clean(ipod).as_ref() != Some(&l)
     {
         out.push(TagChange {
             field,
             ipod: ipod.clone(),
-            library: l.clone(),
+            library: l,
         });
     }
 }
@@ -313,9 +337,11 @@ fn number_change(out: &mut Vec<TagChange>, field: Field, lib: Option<u32>, ipod:
     }
 }
 
-/// The fields where the library has a value the iPod lacks or differs from.
-/// An empty library field never clears an iPod value, and a library track not
-/// marked as a compilation never clears the iPod's mark.
+/// The fields where the library has a value the iPod lacks or differs from,
+/// ignoring surrounding spaces and Unicode form. The library value is sent
+/// cleaned. An empty library field, spaces only included, never clears an
+/// iPod value, and a library track not marked as a compilation never clears
+/// the iPod's mark.
 pub fn tag_changes(lib: &Tags, ipod: &Tags) -> Vec<TagChange> {
     let mut out = Vec::new();
     text_change(&mut out, Field::Title, &lib.title, &ipod.title);
@@ -585,7 +611,31 @@ pub fn plan(input: &PlanInput) -> Plan {
         }
         pending = next;
     }
-    for p in live.iter().filter(|p| synced(p)) {
+    // A file with no iPod playlist of its own but named like a smart one is
+    // an export of it: skipped rather than created next to it.
+    let mut smart_exports: HashSet<i64> = HashSet::new();
+    for p in pending {
+        let smart = NAME_PASSES.iter().any(|key| {
+            let k = key(&p.name);
+            // An unnamed smart playlist matches nothing.
+            input
+                .device
+                .smart_playlists
+                .iter()
+                .any(|s| !s.trim().is_empty() && key(s) == k)
+        });
+        if smart {
+            smart_exports.insert(p.id);
+            plan.playlists_skipped.push(PlaylistSkipped {
+                name: p.name.clone(),
+                reason: PlaylistSkipReason::SmartOnIpod,
+            });
+        }
+    }
+    for p in live
+        .iter()
+        .filter(|p| synced(p) && !smart_exports.contains(&p.id))
+    {
         let mut members = Vec::new();
         for (i, entry) in p.members.iter().enumerate() {
             let reason = match entry {
