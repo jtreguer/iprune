@@ -24,7 +24,7 @@ pub struct Database {
     raw: NonNull<Itdb_iTunesDB>,
 }
 
-fn c_path(path: &Path) -> Result<CString> {
+pub(crate) fn c_path(path: &Path) -> Result<CString> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| Error::NulInPath(path.to_owned()))
 }
 
@@ -63,8 +63,12 @@ impl Database {
         }
     }
 
-    fn raw(&self) -> &Itdb_iTunesDB {
+    pub(crate) fn raw(&self) -> &Itdb_iTunesDB {
         unsafe { self.raw.as_ref() }
+    }
+
+    pub(crate) fn raw_mut(&mut self) -> *mut Itdb_iTunesDB {
+        self.raw.as_ptr()
     }
 
     pub fn tracks(&self) -> impl Iterator<Item = TrackRef<'_>> {

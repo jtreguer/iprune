@@ -9,6 +9,18 @@ pub enum Error {
     Parse { path: PathBuf, message: String },
     #[error("path contains a NUL byte: {}", .0.display())]
     NulInPath(PathBuf),
+    #[error("name contains a NUL byte: {0:?}")]
+    NulInName(String),
+    #[error("no playlist with id {0:016x}")]
+    NoSuchPlaylist(u64),
+    #[error(
+        "playlist {0:016x} is the master, a smart or the Podcasts playlist, which iprune never changes"
+    )]
+    ProtectedPlaylist(u64),
+    #[error("no track with dbid {0:016x}")]
+    NoSuchTrack(u64),
+    #[error("writing the iPod database failed: {0}")]
+    Write(String),
 }
 
 /// Takes ownership of a `GError`, returns its message and frees it.

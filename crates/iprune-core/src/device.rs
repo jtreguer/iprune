@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::Result;
 use crate::error::IoContext;
+use crate::{Error, Result};
 
 /// A mounted filesystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +61,69 @@ pub fn itunesdb(mountpoint: &Path) -> PathBuf {
     mountpoint.join("iPod_Control/iTunes/iTunesDB")
 }
 
+/// Refuses to write to `mountpoint` when the filesystem holding it is
+/// mounted read-only, or when it is itself a mounted filesystem other than
+/// vfat (FAT32, the only format supported; a real iPod is always mounted at
+/// its root). A folder inside another filesystem (a copy, a test) passes
+/// the format check.
+pub fn check_writable(mountpoint: &Path) -> Result<()> {
+    let path = Path::new("/proc/self/mountinfo");
+    let text = std::fs::read_to_string(path).at(path)?;
+    check_mount(&parse_mountinfo(&text), mountpoint)
+}
+
+fn check_mount(mounts: &[Mount], mountpoint: &Path) -> Result<()> {
+    // Symlinks and `..` resolved first. The filesystem holding the path is
+    // the longest mountpoint it is under, the last such entry winning.
+    let path = std::fs::canonicalize(mountpoint).unwrap_or_else(|_| mountpoint.to_owned());
+    let holder = mounts
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| path.starts_with(&m.mountpoint))
+        .max_by_key(|(i, m)| (m.mountpoint.components().count(), *i))
+        .map(|(_, m)| m);
+    match holder {
+        Some(m) if m.read_only => Err(Error::NotWritable(format!(
+            "{} is on a read-only mount",
+            mountpoint.display()
+        ))),
+        Some(m) if m.mountpoint == path && m.fstype != "vfat" => Err(Error::NotWritable(format!(
+            "{} is {}, and iprune writes only to FAT32 (vfat) iPods",
+            mountpoint.display(),
+            m.fstype
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The FireWire GUID of the iPod at `mountpoint`, read from
+/// `SysInfoExtended` or `SysInfo` without parsing the database, so it works
+/// when the database is damaged. Upper-case hex without `0x`.
+pub fn firewire_guid(mountpoint: &Path) -> Option<String> {
+    let dir = mountpoint.join("iPod_Control/Device");
+    let clean = |s: &str| {
+        let s = s.trim();
+        let s = s
+            .strip_prefix("0x")
+            .or_else(|| s.strip_prefix("0X"))
+            .unwrap_or(s);
+        (!s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit())).then(|| s.to_ascii_uppercase())
+    };
+    if let Ok(text) = std::fs::read_to_string(dir.join("SysInfoExtended")) {
+        let after_key = text.split("<key>FireWireGUID</key>").nth(1);
+        let value = after_key
+            .and_then(|r| r.split("<string>").nth(1))
+            .and_then(|r| r.split("</string>").next());
+        if let Some(g) = value.and_then(clean) {
+            return Some(g);
+        }
+    }
+    let text = std::fs::read_to_string(dir.join("SysInfo")).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("FirewireGuid:"))
+        .and_then(clean)
+}
+
 /// Mounted filesystems that hold an iPod database.
 pub fn find_ipods() -> Result<Vec<Mount>> {
     let path = Path::new("/proc/self/mountinfo");
@@ -98,5 +161,102 @@ garbage line
         assert_eq!(unescape("a\\134b"), "a\\b");
         assert_eq!(unescape("tail\\04"), "tail\\04");
         assert_eq!(unescape("x\\0"), "x\\0");
+    }
+
+    fn mount(path: &str, fstype: &str, read_only: bool) -> Mount {
+        Mount {
+            mountpoint: PathBuf::from(path),
+            fstype: fstype.into(),
+            read_only,
+        }
+    }
+
+    #[test]
+    fn check_mount_accepts_a_writable_vfat_mount() {
+        let mounts = [
+            mount("/", "ext4", false),
+            mount("/run/media/x/IPOD", "vfat", false),
+        ];
+        assert!(check_mount(&mounts, Path::new("/run/media/x/IPOD")).is_ok());
+    }
+
+    #[test]
+    fn check_mount_refuses_a_read_only_mount() {
+        let mounts = [mount("/run/media/x/IPOD", "vfat", true)];
+        let e = check_mount(&mounts, Path::new("/run/media/x/IPOD")).unwrap_err();
+        assert!(
+            matches!(e, Error::NotWritable(ref m) if m.contains("read-only")),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn check_mount_refuses_a_filesystem_that_is_not_vfat() {
+        for fstype in ["ext4", "hfsplus", "exfat"] {
+            let mounts = [mount("/run/media/x/IPOD", fstype, false)];
+            let e = check_mount(&mounts, Path::new("/run/media/x/IPOD")).unwrap_err();
+            assert!(
+                matches!(e, Error::NotWritable(ref m) if m.contains(fstype)),
+                "{fstype}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_mount_passes_a_path_that_is_under_no_mount() {
+        let mounts = [
+            mount("/mnt/other", "ext4", true),
+            mount("/mnt/third", "vfat", false),
+        ];
+        assert!(check_mount(&mounts, Path::new("/tmp/fake-ipod")).is_ok());
+        assert!(check_mount(&[], Path::new("/tmp/fake-ipod")).is_ok());
+    }
+
+    #[test]
+    fn check_mount_refuses_anything_under_a_read_only_mount() {
+        let mounts = [
+            mount("/", "ext4", false),
+            mount("/run/media/x/IPOD", "vfat", false),
+            mount("/run/media/x/IPOD/ro", "vfat", true),
+            mount("/mnt/rodisk", "ext4", true),
+        ];
+        let refused = |p: &str| matches!(check_mount(&mounts, Path::new(p)), Err(Error::NotWritable(ref m)) if m.contains("read-only"));
+        assert!(refused("/run/media/x/IPOD/ro"));
+        assert!(refused("/run/media/x/IPOD/ro/sub/deeper"));
+        assert!(refused("/mnt/rodisk/copy"));
+        // The writable vfat mount around the ro one is still fine.
+        assert!(check_mount(&mounts, Path::new("/run/media/x/IPOD")).is_ok());
+        assert!(check_mount(&mounts, Path::new("/run/media/x/IPOD/sub")).is_ok());
+    }
+
+    #[test]
+    fn check_mount_refuses_the_root_of_a_non_vfat_mount_but_not_a_folder_inside_it() {
+        let mounts = [
+            mount("/", "ext4", false),
+            mount("/mnt/disk", "ext4", false),
+            mount("/tmp", "tmpfs", false),
+        ];
+        for root in ["/mnt/disk", "/tmp"] {
+            let e = check_mount(&mounts, Path::new(root)).unwrap_err();
+            assert!(
+                matches!(e, Error::NotWritable(ref m) if m.contains("vfat")),
+                "{root}: {e}"
+            );
+        }
+        for inside in ["/mnt/disk/copy", "/tmp/fake-ipod", "/home/x/ipod-copy"] {
+            assert!(check_mount(&mounts, Path::new(inside)).is_ok(), "{inside}");
+        }
+        // A sibling that merely shares a name prefix is not inside the mount.
+        assert!(check_mount(&mounts, Path::new("/mnt/disk2")).is_ok());
+    }
+
+    #[test]
+    fn check_mount_uses_the_last_entry_for_a_path() {
+        // Something mounted over it later wins.
+        let p = "/run/media/x/IPOD";
+        let ro_then_rw = [mount(p, "vfat", true), mount(p, "vfat", false)];
+        assert!(check_mount(&ro_then_rw, Path::new(p)).is_ok());
+        let rw_then_ro = [mount(p, "vfat", false), mount(p, "vfat", true)];
+        assert!(check_mount(&rw_then_ro, Path::new(p)).is_err());
     }
 }

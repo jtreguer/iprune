@@ -10,6 +10,8 @@
      P <name> <dbid hex>,<dbid hex>,...        regular playlist, members in order
      S <name> <dbid hex>,...                   smart playlist
      C <name>                                  the Podcasts playlist (not a regular one)
+     R <smart name> <artist text>              adds the rule "artist contains <text>" to a
+                                               smart playlist already declared with S
 */
 #include <gpod/itdb.h>
 #include <stdio.h>
@@ -91,6 +93,14 @@ int main(int argc, char **argv) {
             Itdb_Playlist *pl = itdb_playlist_new(f[1], f[0][0] == 'S');
             itdb_playlist_add(db, pl, -1);
             if (n >= 3 && f[2][0]) members(db, pl, f[2]);
+        } else if (!strcmp(f[0], "R") && n >= 3) {
+            Itdb_Playlist *pl = itdb_playlist_by_name(db, f[1]);
+            if (!pl || !pl->is_spl) { fprintf(stderr, "no smart playlist %s\n", f[1]); return 2; }
+            Itdb_SPLRule *r = itdb_splr_add_new(pl, -1);
+            r->field = ITDB_SPLFIELD_ARTIST;
+            r->action = ITDB_SPLACTION_CONTAINS;
+            g_free(r->string);
+            r->string = g_strdup(f[2]);
         } else if (!strcmp(f[0], "C") && n >= 2) {
             Itdb_Playlist *pl = itdb_playlist_new(f[1], FALSE);
             itdb_playlist_set_podcasts(pl);

@@ -67,6 +67,8 @@ fn ipod_track(dbid: u64, size: u64, ms: u32, t: Tags) -> Track {
         ipod_path: None,
         recent_plays: 0,
         recent_skips: 0,
+        rating: 0,
+        last_played: 0,
     }
 }
 
@@ -215,11 +217,11 @@ fn an_unchanged_synced_track_gives_an_empty_plan() {
     assert!(p.is_empty(), "{p:?}");
     assert_eq!(p.expected.track_count, 2);
     assert_eq!(
-        p.expected.playlists,
-        vec![ExpectedPlaylist {
-            name: "Mix".into(),
-            members: vec![Member::Track(0xA1), Member::Track(u64::MAX - 1)],
-        }]
+        names_and_members(&p.expected.playlists),
+        vec![(
+            "Mix".to_owned(),
+            vec![Member::Track(0xA1), Member::Track(u64::MAX - 1)]
+        )]
     );
 }
 
@@ -274,11 +276,8 @@ fn an_unmapped_fairplay_file_is_skipped_not_copied() {
         }]
     );
     assert_eq!(
-        p.expected.playlists,
-        vec![ExpectedPlaylist {
-            name: "Store".into(),
-            members: vec![]
-        }]
+        names_and_members(&p.expected.playlists),
+        vec![("Store".to_owned(), vec![])]
     );
 }
 
@@ -1942,4 +1941,10 @@ fn a_tombstone_with_a_recorded_id_deletes_that_playlist_only() {
         }]
     );
     assert_eq!(p.unmanaged.playlists, vec!["Gone"]);
+}
+
+fn names_and_members(e: &[ExpectedPlaylist]) -> Vec<(String, Vec<Member>)> {
+    e.iter()
+        .map(|e| (e.name.clone(), e.members.clone()))
+        .collect()
 }

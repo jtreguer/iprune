@@ -10,9 +10,10 @@ is right rather than silently picking one.
 
 ## Status
 
-M0 to M3 done (bindings, read-only `gpod` wrapper, `iprune snapshot`;
+M0 to M4 done (bindings, read-only `gpod` wrapper, `iprune snapshot`;
 config, scan, SQLite index, `.m3u8` editing, `playlist` commands; `adopt`;
-planner and `sync --plan-only`). Work follows the milestones in `docs/technical.md` section 17:
+planner and `sync --plan-only`; playlist sync with statistics pull, backups,
+checks, verification, `backups` and `restore`). Work follows the milestones in `docs/technical.md` section 17:
 
 | # | Deliverable | Writes to iPod |
 |---|---|---|
@@ -60,7 +61,8 @@ crates/gpod/         safe wrapper; the only crate allowed to contain unsafe
 crates/iprune-core/  config, store, scan, playlist (.m3u8 format), playlists (operations),
                      device (mount detection), ipod (read a database), adopt (pure
                      matching), adoption (run, report, save), plan (pure planner),
-                     sync (planner input and plan text); later exec, verify, stats
+                     sync (planner input and plan text), exec (apply, restore),
+                     verify (checks around a write), stats, backup
 crates/iprune/       binary `iprune`: CLI
 crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6)
 crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c

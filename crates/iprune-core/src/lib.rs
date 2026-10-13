@@ -2,18 +2,22 @@
 
 pub mod adopt;
 pub mod adoption;
+pub mod backup;
 pub mod config;
 pub mod device;
 mod error;
+pub mod exec;
 pub mod ipod;
 pub mod paths;
 pub mod plan;
 pub mod playlist;
 pub mod playlists;
 pub mod scan;
+pub mod stats;
 pub mod store;
 pub mod sync;
 pub mod tags;
+pub mod verify;
 
 pub use error::{Error, Result};
 

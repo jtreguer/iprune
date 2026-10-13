@@ -6,10 +6,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use iprune_core::config::{Config, PathStyle, Paths};
 use iprune_core::store::Store;
-use iprune_core::{adoption, device, playlists, scan, sync};
+use iprune_core::{adoption, backup, device, exec, playlists, scan, sync};
 
 /// Exit code when the user answers no to a confirmation.
 const EXIT_DECLINED: u8 = 4;
+/// Exit code when a check before or after writing the iPod failed.
+const EXIT_VERIFICATION: u8 = 3;
 
 #[derive(Parser)]
 #[command(version, about = "Playlist manager and sync tool for the iPod Classic")]
@@ -51,8 +53,9 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Scan the library and plan a sync with the connected iPod. Only
-    /// planning is available for now: writing to the iPod comes in M4.
+    /// Scan the library, plan a sync with the connected iPod and apply it.
+    /// For now only playlist changes are applied; track copies, removals and
+    /// tag updates come with M5.
     Sync {
         /// Show the plan without applying it.
         #[arg(long)]
@@ -61,8 +64,24 @@ enum Command {
         #[arg(short, long)]
         verbose: bool,
         /// Print the plan as JSON instead of text.
-        #[arg(long, conflicts_with = "verbose")]
+        #[arg(long, conflicts_with = "verbose", requires = "plan_only")]
         json: bool,
+        /// Apply without asking for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Allow deleting more than a tenth of the managed playlists.
+        #[arg(long)]
+        allow_mass_removal: bool,
+    },
+    /// List the iPod database backups taken before each sync.
+    Backups,
+    /// Put a backup back on the connected iPod.
+    Restore {
+        /// The backup's stamp, as `iprune backups` lists it.
+        stamp: String,
+        /// Restore without asking for confirmation.
+        #[arg(long)]
+        yes: bool,
     },
     /// List and edit playlists.
     #[command(subcommand)]
@@ -354,13 +373,17 @@ fn adopt(file: Option<&Path>, accept_proposals: bool, force: bool) -> Result<()>
     Ok(())
 }
 
-fn run_sync(plan_only: bool, verbose: bool, json: bool) -> Result<()> {
-    if !plan_only {
-        bail!(
-            "only `iprune sync --plan-only` is available for now; writing to the iPod comes in M4"
-        );
-    }
+struct SyncArgs {
+    plan_only: bool,
+    verbose: bool,
+    json: bool,
+    yes: bool,
+    allow_mass_removal: bool,
+}
+
+fn run_sync(args: SyncArgs) -> Result<Outcome> {
     let (config, mut store) = load()?;
+    let paths = paths()?;
     let r = scan_with_progress(&config, &mut store)?;
     eprintln!(
         "library: {} unchanged, {} added, {} updated, {} moved, {} missing",
@@ -373,26 +396,141 @@ fn run_sync(plan_only: bool, verbose: bool, json: bool) -> Result<()> {
     let mp = find_mountpoint(&config)?;
     eprintln!("reading the iPod at {}", mp.display());
     let db = gpod::Database::open(&mp)?;
-    let prepared = sync::prepare(store.conn(), &config, &db)?;
+    let conn = store.conn();
+    let prepared = sync::prepare(conn, &config, &db)?;
     let plan_json = serde_json::to_string_pretty(&prepared.plan)?;
-    let plan_path = paths()?.data_dir.join("plan.json");
+    let plan_path = paths.data_dir.join("plan.json");
     std::fs::write(&plan_path, &plan_json)
         .with_context(|| format!("writing {}", plan_path.display()))?;
     let mut out = io::stdout().lock();
-    if json {
+    if args.json {
         writeln!(out, "{plan_json}")?;
     } else {
-        write!(out, "{}", sync::describe(&prepared, verbose))?;
+        write!(out, "{}", sync::describe(&prepared, args.verbose))?;
+    }
+    if args.plan_only {
+        if !prepared.plan.space.fits {
+            bail!("the plan needs more space than the iPod has free");
+        }
+        if !args.json {
+            writeln!(
+                out,
+                "plan saved to {}; nothing was written to the iPod",
+                plan_path.display()
+            )?;
+        }
+        return Ok(Outcome::Done);
+    }
+    let work = exec::playlist_work(&prepared.plan, &prepared.tracks_map, &prepared.ipod);
+    writeln!(
+        out,
+        "\nThis version applies playlist changes only: {}. Track copies, removals and tag updates come later.",
+        match work.ops.len() {
+            1 => "1 change".to_owned(),
+            n => format!("{n} changes"),
+        }
+    )?;
+    if work.left_out > 0 {
         writeln!(
             out,
-            "plan saved to {}; nothing was written to the iPod",
-            plan_path.display()
+            "{} playlist entries point to tracks not on the iPod yet and are left out for now.",
+            work.left_out
         )?;
     }
     if !prepared.plan.space.fits {
-        bail!("the plan needs more space than the iPod has free");
+        writeln!(
+            out,
+            "The track copies above would not fit on the iPod; playlist changes need no space."
+        )?;
+    }
+    if work.ops.is_empty() {
+        writeln!(out, "Nothing to apply.")?;
+        return Ok(Outcome::Done);
+    }
+    let opts = exec::Options {
+        allow_mass_removal: args.allow_mass_removal,
+    };
+    exec::check_removals(&work, prepared.playlists_map.len(), opts)?;
+    device::check_writable(&mp)?;
+    drop(out);
+    if !args.yes && !confirm("Apply these playlist changes to the iPod?")? {
+        return Ok(Outcome::Declined);
+    }
+    let done = exec::sync_playlists(conn, &config, &paths, &mp, db, &prepared, &work, opts)?;
+    let mut out = io::stdout().lock();
+    if done.recovered > 0 {
+        writeln!(
+            out,
+            "an earlier sync stopped before writing; its statistics pull for {} tracks was undone",
+            done.recovered
+        )?;
+    }
+    writeln!(
+        out,
+        "applied {} changes and verified the iPod database; statistics updated for {} tracks ({} new plays); backup {}",
+        done.applied,
+        done.pulled.tracks(),
+        done.pulled.plays(),
+        done.backup.stamp
+    )?;
+    for w in &done.warnings {
+        writeln!(out, "warning: {w}")?;
+    }
+    Ok(Outcome::Done)
+}
+
+fn run_backups() -> Result<()> {
+    let root = paths()?.data_dir.join("backups");
+    let mut out = io::stdout().lock();
+    let mut guids: Vec<String> = match std::fs::read_dir(&root) {
+        Ok(d) => d
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .collect(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", root.display())),
+    };
+    guids.sort();
+    if guids.is_empty() {
+        writeln!(out, "no backups yet")?;
+    }
+    for guid in guids {
+        writeln!(out, "iPod {guid}")?;
+        for b in backup::list(&root, &guid)? {
+            writeln!(out, "  {}", b.stamp)?;
+        }
     }
     Ok(())
+}
+
+fn run_restore(stamp: &str, yes: bool) -> Result<Outcome> {
+    let (config, store) = load()?;
+    let paths = paths()?;
+    let mp = find_mountpoint(&config)?;
+    // From the device files, not the database: the database may be damaged.
+    let guid = exec::backup_guid(&paths, device::firewire_guid(&mp).as_deref())?;
+    device::check_writable(&mp)?;
+    if !yes
+        && !confirm(&format!(
+            "Put backup {stamp} back on the iPod at {}, replacing its database?",
+            mp.display()
+        ))?
+    {
+        return Ok(Outcome::Declined);
+    }
+    let r = exec::restore(store.conn(), &paths, &mp, &guid, stamp)?;
+    println!(
+        "restored {}; mappings back to {} tracks and {} playlists",
+        r.files.join(" and "),
+        r.tracks,
+        r.playlists
+    );
+    if r.dropped_tracks + r.dropped_playlists > 0 {
+        println!(
+            "{} track and {} playlist mappings dropped: their file is gone",
+            r.dropped_tracks, r.dropped_playlists
+        );
+    }
+    Ok(Outcome::Done)
 }
 
 fn confirm(question: &str) -> Result<bool> {
@@ -490,7 +628,17 @@ fn main() -> ExitCode {
             plan_only,
             verbose,
             json,
-        } => run_sync(*plan_only, *verbose, *json).map(|()| Outcome::Done),
+            yes,
+            allow_mass_removal,
+        } => run_sync(SyncArgs {
+            plan_only: *plan_only,
+            verbose: *verbose,
+            json: *json,
+            yes: *yes,
+            allow_mass_removal: *allow_mass_removal,
+        }),
+        Command::Backups => run_backups().map(|()| Outcome::Done),
+        Command::Restore { stamp, yes } => run_restore(stamp, *yes),
         Command::Playlist(cmd) => playlist(cmd),
         Command::Snapshot { path } => snapshot(path).map(|()| Outcome::Done),
     };
@@ -505,7 +653,10 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("iprune: {e:#}");
-            ExitCode::from(1)
+            let verification = e
+                .downcast_ref::<iprune_core::Error>()
+                .is_some_and(iprune_core::Error::is_check_failure);
+            ExitCode::from(if verification { EXIT_VERIFICATION } else { 1 })
         }
     }
 }

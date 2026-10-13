@@ -370,3 +370,120 @@ fn adoption_never_sees_tombstones() {
     assert!(m.matched.is_empty(), "{:?}", m.matched);
     assert_eq!(m.unmatched_ipod, vec!["mix"]);
 }
+
+// ---- replace_playlist_mappings and set_last_sync (M4)
+
+fn mapped_ids(conn: &Connection, dev: i64) -> Vec<(i64, Option<u64>, String)> {
+    let mut v: Vec<_> = devices::playlist_mappings(conn, dev)
+        .unwrap()
+        .into_iter()
+        .map(|m| (m.playlist_id, m.ipod_id, m.ipod_name))
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn replace_playlist_mappings_replaces_the_devices_rows_and_drops_unmapped_tombstones() {
+    let (env, id, dev) = mapped_mix();
+    let conn = env.store.conn();
+    let other_id = env.playlist_id("other").unwrap();
+    std::fs::remove_file(env.playlist_file("mix")).unwrap();
+    playlists::sync_from_disk(conn, &env.cfg, false).unwrap();
+    assert_eq!(store::removed_playlists(conn).unwrap().len(), 1);
+
+    // The sync deleted Mix on the iPod and created Other.
+    devices::replace_playlist_mappings(conn, dev, &[pm(other_id, 0x88, "Other")]).unwrap();
+    assert_eq!(
+        mapped_ids(conn, dev),
+        vec![(other_id, Some(0x88), "Other".into())]
+    );
+    assert!(
+        store::removed_playlists(conn).unwrap().is_empty(),
+        "tombstone dropped"
+    );
+    assert_eq!(
+        count(
+            conn,
+            &format!("SELECT COUNT(*) FROM playlists WHERE id = {id}")
+        ),
+        0
+    );
+    assert_eq!(live_names(conn), vec!["other"], "live playlists stay");
+}
+
+#[test]
+fn replace_playlist_mappings_keeps_a_tombstone_that_is_still_mapped_and_other_devices() {
+    let (env, id, dev) = mapped_mix();
+    let conn = env.store.conn();
+    let other_id = env.playlist_id("other").unwrap();
+    let dev2 = devices::upsert_device(conn, "G2", None, None).unwrap();
+    devices::replace_mappings(conn, dev2, &[], &[pm(id, 0x99, "Mix")]).unwrap();
+    std::fs::remove_file(env.playlist_file("mix")).unwrap();
+    playlists::sync_from_disk(conn, &env.cfg, false).unwrap();
+
+    devices::replace_playlist_mappings(conn, dev, &[pm(other_id, 0x88, "Other")]).unwrap();
+    // Device 2 still has Mix on its iPod: the tombstone stays for its sync.
+    assert_eq!(
+        store::removed_playlists(conn).unwrap(),
+        vec![(id, "mix".to_string())]
+    );
+    assert_eq!(mapped_ids(conn, dev2), vec![(id, Some(0x99), "Mix".into())]);
+    assert_eq!(
+        mapped_ids(conn, dev),
+        vec![(other_id, Some(0x88), "Other".into())]
+    );
+}
+
+#[test]
+fn replace_playlist_mappings_leaves_track_mappings_alone() {
+    let (env, _, dev) = mapped_mix();
+    let conn = env.store.conn();
+    let t = env.tracks()[0].id;
+    let tm = devices::TrackMapping {
+        track_id: t,
+        dbid: 0xAB,
+        synced_tags_hash: [7; 32],
+        synced_size: 5,
+        synced_duration_ms: Some(10),
+    };
+    devices::replace_mappings(conn, dev, std::slice::from_ref(&tm), &[]).unwrap();
+    devices::replace_playlist_mappings(conn, dev, &[]).unwrap();
+    assert_eq!(devices::track_mappings(conn, dev).unwrap(), vec![tm]);
+    assert!(mapped_ids(conn, dev).is_empty());
+}
+
+#[test]
+fn set_last_sync_sets_only_that_device() {
+    let (env, _, dev) = mapped_mix();
+    let conn = env.store.conn();
+    let dev2 = devices::upsert_device(conn, "G2", None, None).unwrap();
+    let at = |d: i64| -> Option<i64> {
+        conn.query_row("SELECT last_sync_at FROM devices WHERE id = ?1", [d], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!((at(dev), at(dev2)), (None, None));
+    devices::set_last_sync(conn, dev, 1234).unwrap();
+    assert_eq!((at(dev), at(dev2)), (Some(1234), None));
+    devices::set_last_sync(conn, dev, 99).unwrap();
+    assert_eq!(at(dev), Some(99));
+}
+
+#[test]
+fn mappings_round_trip_through_json_with_full_range_dbids() {
+    let t = devices::TrackMapping {
+        track_id: 3,
+        dbid: u64::MAX - 1,
+        synced_tags_hash: [9; 32],
+        synced_size: 1 << 40,
+        synced_duration_ms: None,
+    };
+    let p = pm(4, u64::MAX, "Mix");
+    let back: devices::TrackMapping =
+        serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+    assert_eq!(back, t);
+    let back: PlaylistMapping = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+    assert_eq!(back, p);
+}

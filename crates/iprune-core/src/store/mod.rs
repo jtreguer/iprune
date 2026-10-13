@@ -16,6 +16,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_init.sql"),
     include_str!("migrations/0002_tag_state.sql"),
     include_str!("migrations/0003_playlist_tombstones.sql"),
+    include_str!("migrations/0004_pending_pulls.sql"),
 ];
 
 pub struct Store {

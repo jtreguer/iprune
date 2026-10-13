@@ -69,3 +69,20 @@ impl FakeIpod {
         self.dir.path().join("iPod_Control/iTunes/iTunesDB")
     }
 }
+
+/// Builds an iTunesDB at `db` from a `make_ipod.c` manifest (see that file for
+/// the format) using libgpod.
+pub fn make_ipod_db(workdir: &Path, db: &Path, manifest: &str) {
+    let make = workdir.join("make_ipod");
+    if !make.exists() {
+        compile_c("make_ipod.c", &make);
+    }
+    let file = workdir.join("manifest.tsv");
+    fs::write(&file, manifest).unwrap();
+    let out = Command::new(&make).arg(db).arg(&file).output().unwrap();
+    assert!(
+        out.status.success(),
+        "make_ipod failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

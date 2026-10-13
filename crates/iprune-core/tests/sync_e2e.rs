@@ -672,6 +672,8 @@ fn bare(space: SpaceCheck) -> Prepared {
         },
         ipod: Default::default(),
         guid: "G".into(),
+        tracks_map: vec![],
+        playlists_map: vec![],
         library: HashMap::new(),
     }
 }

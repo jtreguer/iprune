@@ -286,6 +286,9 @@ pub struct Expected {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExpectedPlaylist {
+    pub playlist_id: i64,
+    /// The iPod playlist, `None` when the plan creates it.
+    pub ipod_id: Option<u64>,
     pub name: String,
     pub members: Vec<Member>,
 }
@@ -655,14 +658,14 @@ pub fn plan(input: &PlanInput) -> Plan {
                 });
             }
         }
-        let name = match target.get(&p.id) {
+        let (ipod_id, name) = match target.get(&p.id) {
             None => {
                 plan.playlists.push(PlaylistOp::Create {
                     playlist_id: p.id,
                     name: p.name.clone(),
                     members: members.clone(),
                 });
-                p.name.clone()
+                (None, p.name.clone())
             }
             Some(found) => {
                 let name = ipod_name(&found.name, &p.name);
@@ -684,12 +687,15 @@ pub fn plan(input: &PlanInput) -> Plan {
                         members: members.clone(),
                     });
                 }
-                name
+                (Some(found.id), name)
             }
         };
-        plan.expected
-            .playlists
-            .push(ExpectedPlaylist { name, members });
+        plan.expected.playlists.push(ExpectedPlaylist {
+            playlist_id: p.id,
+            ipod_id,
+            name,
+            members,
+        });
     }
     for ip in input
         .device

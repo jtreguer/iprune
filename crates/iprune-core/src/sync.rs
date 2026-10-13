@@ -21,6 +21,9 @@ pub struct Prepared {
     pub plan: Plan,
     pub ipod: Contents,
     pub guid: String,
+    /// The device's mappings the plan was made from.
+    pub tracks_map: Vec<devices::TrackMapping>,
+    pub playlists_map: Vec<devices::PlaylistMapping>,
     /// Every indexed track, by id, for describing the plan.
     pub library: HashMap<i64, TrackRow>,
 }
@@ -107,6 +110,8 @@ pub fn prepare(conn: &Connection, cfg: &Config, db: &gpod::Database) -> Result<P
         plan,
         ipod,
         guid,
+        tracks_map,
+        playlists_map,
         library: library.into_iter().map(|t| (t.id, t)).collect(),
     })
 }

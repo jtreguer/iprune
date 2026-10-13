@@ -7,7 +7,7 @@ use crate::adopt::{IpodPlaylist, IpodTrack};
 use crate::tags::Tags;
 
 /// One iPod track as iprune sees it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
     pub adopt: IpodTrack,
     pub tags: Tags,
@@ -15,6 +15,10 @@ pub struct Track {
     /// Plays and skips since the last database write, from `Play Counts`.
     pub recent_plays: u32,
     pub recent_skips: u32,
+    /// 0 to 100, in steps of 20 per star; 0 when unrated.
+    pub rating: u32,
+    /// Unix time of the last play, 0 when never played.
+    pub last_played: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -26,6 +30,8 @@ pub struct Contents {
     pub tracks: Vec<Track>,
     /// Regular playlists, in iPod order.
     pub playlists: Vec<IpodPlaylist>,
+    /// The master playlist's members, in order.
+    pub master_members: Vec<u64>,
     /// Names of the smart playlists, in iPod order. Never edited.
     pub smart_playlists: Vec<String>,
 }
@@ -70,9 +76,14 @@ pub fn read(db: &gpod::Database) -> Contents {
     let mut in_playlists: HashMap<u64, usize> = HashMap::new();
     let mut playlists = Vec::new();
     let mut smart_playlists = Vec::new();
+    let mut master_members = Vec::new();
     for pl in db.playlists() {
         // The master and Podcasts playlists belong to the iPod itself.
-        if pl.is_master() || pl.is_podcasts() {
+        if pl.is_master() {
+            master_members = pl.members().map(|t| t.dbid()).collect();
+            continue;
+        }
+        if pl.is_podcasts() {
             continue;
         }
         if pl.is_smart() {
@@ -109,6 +120,8 @@ pub fn read(db: &gpod::Database) -> Contents {
                 ipod_path: t.ipod_path().map(|p| p.into_owned()),
                 recent_plays: t.recent_playcount(),
                 recent_skips: t.recent_skipcount(),
+                rating: t.rating(),
+                last_played: t.time_played(),
             }
         })
         .collect();
@@ -141,6 +154,7 @@ pub fn read(db: &gpod::Database) -> Contents {
         model,
         tracks,
         playlists,
+        master_members,
         smart_playlists,
     }
 }

@@ -518,64 +518,118 @@ would otherwise be copied again.
 
 ### 11.2 Executor
 
+`exec.rs`. In M4 it applies the playlist operations only (`playlist_work`):
+members the plan copies are left out until M5 copies tracks, members it
+replaces keep their current dbid, and a member update that leaves the iPod
+list unchanged is dropped. `iprune sync` prints the plan, says what this
+version applies, and asks for confirmation (`--yes` skips it; declining
+exits with code 4).
+
 Order of operations:
 
-1. Pull statistics: for each mapped track add `recent_playcount` and
-   `recent_skipcount` to `stats`, copy `rating` and `time_played`. Commit to
-   SQLite. This happens first because libgpod resets the recent counts on the
-   next write.
-2. Back up `iTunesDB`, `ArtworkDB` and `Play Counts` to the backup folder,
-   with the plan and a snapshot.
-3. `itdb_start_sync`.
-4. Remove tracks: drop from all playlists, `itdb_track_remove`, delete the
-   file.
-5. Copy and replace tracks: build a `NewTrack` from library tags,
-   `add_track`, `itdb_cp_track_to_ipod`. Show progress in bytes. Copy runs sequentially; the USB link
-   is the limit, so parallel copies would not help.
-6. Update tags on existing tracks. Fields empty in the library leave the iPod
-   value alone.
-7. Apply playlist operations with `set_playlist_members`.
-8. Run the pre-write checks (section 11.3). On failure, stop without writing.
-9. `itdb_write`.
-10. `itdb_stop_sync`.
-11. Verify (section 11.4).
-12. Commit mappings to SQLite, write the manifest to the iPod, write
-    `stats.csv`.
+1. Refuse a mountpoint on a read-only mount, or one that is itself a
+   mounted filesystem other than vfat (a real iPod is mounted at its root; a
+   folder inside another filesystem, such as a copy or a test, passes the
+   format check). Symlinks and `..` are resolved first. Refuse deleting more than five
+   managed playlists when that is more than a tenth of them, unless
+   `--allow-mass-removal` is given: an emptied playlists folder is likelier
+   than a decision.
+2. Pull statistics: for each mapped track add `recent_playcount` and
+   `recent_skipcount` to `stats`, copy `rating` and keep the latest
+   `time_played`. Commit to SQLite. This happens first because libgpod resets
+   the recent counts on the next write. The pull is recorded in
+   `pending_pulls` with the hash of `Play Counts` (migration 0004). If
+   anything fails before the write, the pull is undone, since the iPod still
+   holds the same counts. A sync that stops between the pull and the end of
+   the write (killed, or a write that failed part way) leaves the record,
+   and the next sync settles it before pulling again. libgpod renames `Play
+   Counts` to `Play Counts.bak` only once a write succeeds, so: a `.bak`
+   equal to the file pulled from means the write happened and the pull
+   stands; a `Play Counts` still present (the same, or grown with new plays)
+   means it did not, and the pull is undone; neither means a write removed
+   it, and the pull stands. A record that cannot be read is dropped with a
+   warning. Plays of tracks iprune
+   does not manage are not pulled, and the write resets them.
+3. Back up `iTunesDB`, `ArtworkDB`, `Play Counts` and `OTGPlaylistInfo`
+   (each copy compared with the original) to
+   `backups/<guid>/<YYYYMMDD-HHMMSS>/`, with `plan.json`, `work.json` (the
+   operations applied), `snapshot.txt` (before) and `mappings.json` (the
+   device's mappings). The folder is filled under a hidden name and renamed
+   when complete.
+4. `itdb_start_sync`.
+5. Remove tracks: drop from all playlists, `itdb_track_remove`, delete the
+   file. (M5)
+6. Copy and replace tracks: build a `NewTrack` from library tags,
+   `add_track`, `itdb_cp_track_to_ipod`. Show progress in bytes. Copy runs
+   sequentially; the USB link is the limit, so parallel copies would not
+   help. (M5)
+7. Update tags on existing tracks. Fields empty in the library leave the iPod
+   value alone. (M5)
+8. Apply playlist operations: deletes, renames, creates, then member updates
+   with `set_playlist_members`.
+9. Run the pre-write checks (section 11.3). On failure, stop without writing
+   and exit with code 3.
+10. Take the snapshot of the changed database, then `itdb_write`. libgpod
+    writes several files; if it fails, the iPod's `iTunesDB` and `ArtworkDB`
+    are compared with the backup. Unchanged: the pull is undone and the error
+    reported. Changed: the error names the backup to restore (exit code 3),
+    and the pull stays pending for the next sync to settle as above.
+11. `itdb_stop_sync`.
+12. Verify (section 11.4).
+13. Record the playlist mappings (with the ids of created playlists), drop
+    the tombstones whose iPod playlist was deleted and set `last_sync_at`.
+    Then export `stats.csv`, write the manifest to the iPod and keep the
+    newest `keep_backups` backups (at least one); a failure in these last
+    three is a warning, since the sync itself is done.
 
-Checkpoints: during a long copy the database is written every 500 tracks or 10
-minutes, after running the pre-write checks. An interrupted sync then loses at
-most one checkpoint of copied files, and those files are found by
-`iprune doctor`.
+Checkpoints (M5): during a long copy the database is written every 500
+tracks or 10 minutes, after running the pre-write checks. An interrupted
+sync then loses at most one checkpoint of copied files, and those files are
+found by `iprune doctor`.
 
 Ctrl+C during the copy finishes the current file, writes a checkpoint and
 exits.
 
 ### 11.3 Pre-write checks
 
-All on the in-memory database:
+`verify::pre_write`, on the in-memory database after the changes:
 
-- Track count equals `expected.track_count`.
-- Every regular playlist managed by iprune has exactly the expected dbids in
-  the expected order.
-- No managed playlist contains a repeated dbid unless the source file does.
-- Every playlist member is in the master playlist.
-- Unmanaged tracks and playlists are unchanged.
-- Every track has an `ipod_path` and the file exists.
+- Tracks are exactly as before (M4 changes no track), apart from the count
+  of playlists each is in.
+- The master playlist's members are unchanged.
+- The number of regular playlists is the count before, plus those created,
+  minus those deleted, and no playlist appears that is neither managed nor
+  there before.
+- Every managed playlist, found by its iPod id, has the expected name and
+  exactly the expected dbids in the expected order, repeats included.
+- Every playlist member is a track of the database.
+- Unmanaged playlists are unchanged (same id, name and members), and the
+  deleted ones are gone.
+- The smart playlists and the iPod's name are unchanged.
+- Checking that each track's file exists comes with M5, which copies files.
 
 ### 11.4 Verification
 
-Close the database, parse it again from the iPod, produce a snapshot in the
-same text format as the C `snapshot` tool, and compare it with the expected
-state. Volatile parts (artwork `mhii` ids, which change on every artwork write)
-are excluded. Any difference is printed and the command exits non-zero; the
-backup stays in place for `iprune restore`.
+After `itdb_write`, close the database, parse it again from the iPod,
+produce a snapshot in the same text format as the C `snapshot` tool, and
+compare it with the snapshot of the in-memory database taken just before
+the write. A database that cannot be read back counts as a difference. The artwork link (`mhii`) is excluded, since libgpod renumbers it
+on every artwork write. Any difference is printed (up to 20 lines) and the
+command exits with code 3; the backup stays in place for `iprune restore`
+and the mappings are not updated.
 
 ### 11.5 Restore
 
-`iprune restore <timestamp>` copies the backed up `iTunesDB` and `ArtworkDB`
-onto the iPod, then rolls the SQLite mappings back to the matching
-`plan.json` state. Files added after the backup become orphans until
-`doctor --fix` deletes them.
+`iprune restore <stamp>` (confirmation, or `--yes`) identifies the iPod from
+`SysInfoExtended` or `SysInfo`, not from its database, which may be the
+damaged part; with no readable GUID it uses the only iPod that has
+backups. It puts the backed up
+`iTunesDB` and `ArtworkDB` back on the iPod, each through a temporary file
+and a rename, then returns the device's mappings to the backup's
+`mappings.json`. Mappings whose library track or playlist row no longer
+exists are dropped. `Play Counts` is never restored: its plays were pulled
+already and would count twice. Files added after the backup become orphans
+until `doctor --fix` deletes them. `iprune backups` lists the backups.
 
 ## 12. Doctor
 
@@ -595,11 +649,11 @@ onto the iPod, then rolls the SQLite mappings back to the matching
 iprune init
 iprune scan
 iprune adopt [--file <iTunesDB>] [--accept-proposals]
-iprune sync [--plan-only] [--verbose] [--json] [--yes]
+iprune sync [--plan-only] [--verbose] [--json] [--yes] [--allow-mass-removal]
 iprune playlist list|show|new|rm|rename|add|remove|move ...
 iprune device info
 iprune backups
-iprune restore <timestamp>
+iprune restore <stamp> [--yes]
 iprune doctor [--fix]
 iprune snapshot <mountpoint|iTunesDB>
 iprune eject
@@ -695,7 +749,7 @@ can be checked against the backup with the existing C tools.
 | libgpod is unmaintained since 2015 | it is stable and still packaged; the wrapper keeps it behind one crate so a pure Rust writer could replace it later |
 | Struct layout mismatch with the installed headers | bindgen at build time against the system headers; M0 test against the real database |
 | Large database write is slow (22 MB `iTunesDB`) | measured in M0; checkpoints sized accordingly |
-| libgpod does not understand some iTunes smart playlist rules ("Unknown action type 1" on write) and may rewrite them | check in M4 whether a write changes the 7 smart playlists, by comparing the raw `mhyp` records before and after |
+| libgpod does not understand some iTunes smart playlist rules ("Unknown action type 1" on write) and may rewrite them | checked in M4 on a copy of the real `iTunesDB` (2026-10-13): parsed and written back unchanged, the 12 smart playlists' header and rule records (`mhod` 50 and 51) are byte-identical and the snapshot is identical. The only bytes that change are the album and artist list ids (`mhia`, `mhii`), regenerated on every write, and a few `mhbd` header fields. Parse 33 ms, write 255 ms |
 | Artwork database corruption | iprune never touches artwork; `ArtworkDB` backed up with every sync |
 | Losing play counts | pulled and committed before any write, exported to CSV |
 | FairPlay files (one in the library, "Bailemos") may not play on an iPod that is not authorised for that Apple account | the planner skips unmapped ones and leaves mapped ones in place; M5 decides whether copying them is worth offering |

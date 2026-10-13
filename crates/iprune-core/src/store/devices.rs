@@ -40,7 +40,7 @@ pub fn mapped_track_count(conn: &Connection, device_id: i64) -> Result<usize> {
 
 /// One mapped track: the library id, the iPod's dbid, the iPod's tag hash
 /// and size, and the library file's duration at the last sync.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TrackMapping {
     pub track_id: i64,
     pub dbid: u64,
@@ -51,7 +51,7 @@ pub struct TrackMapping {
 
 /// One mapped playlist. `ipod_id` is `None` for mappings saved before ids
 /// were recorded; the name is then the only way to find the iPod playlist.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlaylistMapping {
     pub playlist_id: i64,
     pub ipod_id: Option<u64>,
@@ -104,6 +104,44 @@ pub fn replace_mappings(
         "DELETE FROM playlists WHERE removed_at IS NOT NULL \
          AND id NOT IN (SELECT playlist_id FROM device_playlists)",
         [],
+    )?;
+    Ok(())
+}
+
+/// Replaces the device's playlist mappings, then drops tombstones no
+/// device maps any more: their iPod playlists are gone.
+pub fn replace_playlist_mappings(
+    conn: &Connection,
+    device_id: i64,
+    playlists: &[PlaylistMapping],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM device_playlists WHERE device_id = ?1",
+        [device_id],
+    )?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO device_playlists (device_id, playlist_id, ipod_name, ipod_id) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for m in playlists {
+        stmt.execute(params![
+            device_id,
+            m.playlist_id,
+            m.ipod_name,
+            m.ipod_id.map(|id| id as i64)
+        ])?;
+    }
+    conn.execute(
+        "DELETE FROM playlists WHERE removed_at IS NOT NULL \
+         AND id NOT IN (SELECT playlist_id FROM device_playlists)",
+        [],
+    )?;
+    Ok(())
+}
+
+pub fn set_last_sync(conn: &Connection, device_id: i64, at: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE devices SET last_sync_at = ?2 WHERE id = ?1",
+        params![device_id, at],
     )?;
     Ok(())
 }

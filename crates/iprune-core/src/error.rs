@@ -43,8 +43,50 @@ pub enum Error {
     NotAdopted(String),
     #[error("{0}; nothing planned")]
     BadScope(String),
+    #[error(transparent)]
+    Gpod(#[from] gpod::Error),
+    #[error("the backup copy {} differs from the iPod file", .0.display())]
+    BackupMismatch(std::path::PathBuf),
+    #[error("{0}")]
+    NotWritable(String),
+    #[error(
+        "the plan deletes {deletes} of {managed} managed playlists; if that is intended, run again with --allow-mass-removal"
+    )]
+    MassRemoval { deletes: usize, managed: usize },
+    #[error("the checks before writing failed, nothing was written to the iPod:\n  {}", .0.join("\n  "))]
+    PreWriteCheck(Vec<String>),
+    #[error(
+        "the iPod database was written but does not read back as expected:\n  {}\nrun `iprune restore {stamp}` to put the previous database back",
+        problems.join("\n  ")
+    )]
+    Verification {
+        problems: Vec<String>,
+        stamp: String,
+    },
+    #[error(
+        "writing the iPod database failed part way ({cause}); the iPod may be partly written: run `iprune restore {stamp}`"
+    )]
+    WriteIncomplete { cause: String, stamp: String },
+    #[error("{cause}; undoing the statistics pull also failed: {undo}")]
+    UndoFailed { cause: Box<Error>, undo: Box<Error> },
+    #[error("no backup {0:?}; `iprune backups` lists them")]
+    NoSuchBackup(String),
     #[error("position {position} is out of range (playlist has {len} entries)")]
     BadPosition { position: usize, len: usize },
+}
+
+impl Error {
+    /// A check before or after writing the iPod failed (exit code 3), or a
+    /// write stopped part way.
+    pub fn is_check_failure(&self) -> bool {
+        match self {
+            Error::PreWriteCheck(_)
+            | Error::Verification { .. }
+            | Error::WriteIncomplete { .. } => true,
+            Error::UndoFailed { cause, .. } => cause.is_check_failure(),
+            _ => false,
+        }
+    }
 }
 
 pub(crate) trait IoContext<T> {

@@ -196,29 +196,6 @@ fn adopted() -> Sandbox {
 }
 
 #[test]
-fn sync_without_plan_only_is_refused_and_touches_nothing() {
-    let sb = adopted();
-    let (base_before, ipod_before) = (sb.tree(&sb.base()), sb.tree(&sb.ipod));
-    let o = sb.run(&["sync"]);
-    assert_code(&o, 1);
-    assert!(err(&o).contains("--plan-only"), "{}", err(&o));
-    assert!(out(&o).is_empty(), "{}", out(&o));
-    assert!(!sb.plan_json().exists());
-    assert_eq!(sb.tree(&sb.ipod), ipod_before, "the iPod is untouched");
-    assert_eq!(sb.tree(&sb.base()), base_before, "nothing at all changed");
-}
-
-#[test]
-fn sync_without_plan_only_is_refused_before_it_reads_any_config() {
-    // No config exists: a refusal must not depend on one, nor create one.
-    let sb = Sandbox::new();
-    let o = sb.run(&["sync"]);
-    assert_code(&o, 1);
-    assert!(err(&o).contains("--plan-only"), "{}", err(&o));
-    assert!(sb.tree(&sb.base()).is_empty());
-}
-
-#[test]
 fn plan_only_prints_the_summary_saves_the_plan_and_writes_nothing_else() {
     let sb = adopted();
     let ipod_before = sb.tree(&sb.ipod);
@@ -381,4 +358,278 @@ fn a_bad_scope_is_refused_with_no_plan_saved() {
     assert_code(&o, 1);
     assert!(err(&o).contains("No such list"), "{}", err(&o));
     assert!(!sb.plan_json().exists());
+}
+
+// ---- applying (M4)
+
+const GUID_DIR: &str = "0x000A27001234ABCD";
+
+impl Sandbox {
+    fn backups_dir(&self) -> PathBuf {
+        self.base().join("data/iprune/backups")
+    }
+
+    fn itunesdb(&self) -> Vec<u8> {
+        fs::read(self.ipod.join("iPod_Control/iTunes/iTunesDB")).unwrap()
+    }
+
+    /// The members of an iPod playlist, by dbid, read with libgpod.
+    fn ipod_playlist(&self, name: &str) -> Option<Vec<u64>> {
+        let db = gpod::Database::open(&self.ipod).unwrap();
+        db.playlists()
+            .find(|p| p.name().as_deref() == Some(name))
+            .map(|p| p.members().map(|t| t.dbid()).collect())
+    }
+
+    fn stamps(&self) -> Vec<String> {
+        let dir = self.backups_dir().join(GUID_DIR);
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .map(|d| {
+                d.map(|e| e.unwrap().file_name().into_string().unwrap())
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// Rewrites Road.m3u8 to list `two` then `one`.
+    fn reverse_road(&self) {
+        fs::write(
+            self.lists.join("Road.m3u8"),
+            format!(
+                "{}\n{}\n",
+                self.music.join("two.m4a").display(),
+                self.music.join("one.mp3").display()
+            ),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn sync_with_yes_applies_the_playlist_changes_to_the_fake_ipod() {
+    let sb = adopted();
+    sb.reverse_road();
+    let db_before = sb.itunesdb();
+    let o = sb.ok(&["sync", "--yes"]);
+    let text = out(&o);
+    assert!(text.contains("applied 1 "), "{text}");
+    assert!(text.contains("verified"), "{text}");
+    assert_eq!(sb.ipod_playlist("Road"), Some(vec![2, u64::MAX - 1]));
+    assert_ne!(sb.itunesdb(), db_before);
+    // The backup holds the database as it was.
+    let stamps = sb.stamps();
+    assert_eq!(stamps.len(), 1, "{stamps:?}");
+    assert!(text.contains(&stamps[0]), "{text}");
+    assert_eq!(
+        fs::read(
+            sb.backups_dir()
+                .join(GUID_DIR)
+                .join(&stamps[0])
+                .join("iTunesDB")
+        )
+        .unwrap(),
+        db_before
+    );
+    assert!(sb.base().join("data/iprune/stats.csv").is_file());
+    assert!(sb.ipod.join("iPod_Control/iprune/manifest.json").is_file());
+    // The next sync has nothing to do.
+    let again = sb.ok(&["sync", "--yes"]);
+    assert!(out(&again).contains("Nothing to apply"), "{}", out(&again));
+    assert_eq!(sb.stamps().len(), 1, "no second backup for an empty plan");
+}
+
+#[test]
+fn sync_without_yes_and_without_a_terminal_fails_and_writes_nothing() {
+    let sb = adopted();
+    sb.reverse_road();
+    let ipod_before = sb.tree(&sb.ipod);
+    let o = sb.run(&["sync"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("--yes"), "{}", err(&o));
+    assert!(
+        out(&o).contains("1 changed"),
+        "the plan is shown first: {}",
+        out(&o)
+    );
+    assert_eq!(sb.tree(&sb.ipod), ipod_before, "the iPod is untouched");
+    assert!(
+        !sb.backups_dir().exists(),
+        "no backup, so nothing was started"
+    );
+    assert_eq!(sb.ipod_playlist("Road"), Some(vec![u64::MAX - 1, 2]));
+}
+
+#[test]
+fn json_without_plan_only_is_a_usage_error_and_does_nothing() {
+    let sb = adopted();
+    sb.reverse_road();
+    let ipod_before = sb.tree(&sb.ipod);
+    for args in [&["sync", "--json"][..], &["sync", "--json", "--yes"]] {
+        let o = sb.run(args);
+        assert_code(&o, 2);
+        assert!(out(&o).is_empty(), "{}", out(&o));
+    }
+    assert!(!sb.plan_json().exists());
+    assert_eq!(sb.tree(&sb.ipod), ipod_before);
+}
+
+#[test]
+fn a_sync_with_no_playlist_change_says_so_and_takes_no_backup() {
+    let sb = adopted();
+    let ipod_before = sb.tree(&sb.ipod);
+    let o = sb.ok(&["sync", "--yes"]);
+    assert!(out(&o).contains("Nothing to apply"), "{}", out(&o));
+    assert_eq!(sb.tree(&sb.ipod), ipod_before);
+    assert!(!sb.backups_dir().exists());
+}
+
+#[test]
+fn entries_for_tracks_not_on_the_ipod_are_reported_left_out_and_nothing_is_written() {
+    let sb = adopted();
+    fs::copy(fixture(Kind::Mp3, 4), sb.music.join("four.mp3")).unwrap();
+    fs::write(
+        sb.lists.join("Road.m3u8"),
+        format!(
+            "{}\n{}\n{}\n",
+            sb.music.join("one.mp3").display(),
+            sb.music.join("two.m4a").display(),
+            sb.music.join("four.mp3").display()
+        ),
+    )
+    .unwrap();
+    let ipod_before = sb.tree(&sb.ipod);
+    let o = sb.ok(&["sync", "--yes"]);
+    let text = out(&o);
+    assert!(text.contains("left out"), "{text}");
+    assert!(text.contains("1 playlist entries"), "{text}");
+    assert_eq!(sb.tree(&sb.ipod), ipod_before, "the copy waits for M5");
+    assert!(!sb.backups_dir().exists());
+}
+
+/// Eight managed playlists besides Road, each with a file.
+fn many() -> Sandbox {
+    let sb = Sandbox::new();
+    sb.library(&[
+        ("one.mp3", Kind::Mp3, 1),
+        ("two.m4a", Kind::Aac, 1),
+        ("three.wav", Kind::Wav, 3),
+    ]);
+    let tracks = [
+        sb.spec("one.mp3", u64::MAX - 1, "Title1", "Artist1"),
+        sb.spec("two.m4a", 2, "Title1", "Artist1"),
+        sb.spec("three.wav", 3, "Title3", "Artist3"),
+    ];
+    let names = ["P1", "P2", "P3", "P4", "P5", "P6", "P7"];
+    let mut lists = vec![ipod_playlist("Road", &[u64::MAX - 1, 2])];
+    for n in names {
+        lists.push(ipod_playlist(n, &[3]));
+    }
+    fake_ipod(&sb.ipod, Some(GUID_SYSINFO), &tracks, &lists);
+    let entry = |f: &str| format!("{}\n", sb.music.join(f).display());
+    fs::write(
+        sb.lists.join("Road.m3u8"),
+        entry("one.mp3") + &entry("two.m4a"),
+    )
+    .unwrap();
+    for n in names {
+        fs::write(sb.lists.join(format!("{n}.m3u8")), entry("three.wav")).unwrap();
+    }
+    sb.ok(&["adopt"]);
+    sb
+}
+
+#[test]
+fn deleting_most_playlists_is_refused_without_allow_mass_removal() {
+    let sb = many();
+    for n in ["P1", "P2", "P3", "P4", "P5", "P6", "P7"] {
+        fs::remove_file(sb.lists.join(format!("{n}.m3u8"))).unwrap();
+    }
+    let ipod_before = sb.tree(&sb.ipod);
+    let o = sb.run(&["sync", "--yes"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("--allow-mass-removal"), "{}", err(&o));
+    assert_eq!(sb.tree(&sb.ipod), ipod_before);
+    assert!(!sb.backups_dir().exists());
+
+    sb.ok(&["sync", "--yes", "--allow-mass-removal"]);
+    for n in ["P1", "P4", "P7"] {
+        assert_eq!(sb.ipod_playlist(n), None, "{n}");
+    }
+    assert_eq!(sb.ipod_playlist("Road"), Some(vec![u64::MAX - 1, 2]));
+}
+
+#[test]
+fn backups_lists_the_backups_of_each_ipod() {
+    let sb = adopted();
+    let none = sb.ok(&["backups"]);
+    assert!(out(&none).contains("no backups"), "{}", out(&none));
+    sb.reverse_road();
+    sb.ok(&["sync", "--yes"]);
+    let o = sb.ok(&["backups"]);
+    let stamps = sb.stamps();
+    assert_eq!(stamps.len(), 1);
+    let text = out(&o);
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    assert!(lines.iter().any(|l| l.contains(GUID_DIR)), "{lines:?}");
+    assert!(lines.iter().any(|l| *l == stamps[0]), "{lines:?}");
+}
+
+#[test]
+fn restore_with_yes_puts_the_database_and_the_mappings_back() {
+    let sb = adopted();
+    let db_before = sb.itunesdb();
+    sb.reverse_road();
+    sb.ok(&["sync", "--yes"]);
+    let stamp = sb.stamps().remove(0);
+    assert_ne!(sb.itunesdb(), db_before);
+
+    let o = sb.ok(&["restore", &stamp, "--yes"]);
+    assert!(out(&o).contains("restored iTunesDB"), "{}", out(&o));
+    assert_eq!(sb.itunesdb(), db_before);
+    assert_eq!(sb.ipod_playlist("Road"), Some(vec![u64::MAX - 1, 2]));
+    // The mappings are back too: the file still says two, one, so the plan
+    // sets the members again, against the restored iPod list.
+    let plan = sb.ok(&["sync", "--plan-only", "--json"]);
+    let plan: serde_json::Value = serde_json::from_str(&out(&plan)).unwrap();
+    let ops = plan["playlists"].as_array().unwrap();
+    assert_eq!(ops.len(), 1, "{plan}");
+    assert_eq!(ops[0]["op"], "set_members");
+    assert_eq!(ops[0]["name"], "Road");
+}
+
+#[test]
+fn restore_without_yes_and_without_a_terminal_changes_nothing() {
+    let sb = adopted();
+    sb.reverse_road();
+    sb.ok(&["sync", "--yes"]);
+    let stamp = sb.stamps().remove(0);
+    let ipod_after_sync = sb.tree(&sb.ipod);
+    let o = sb.run(&["restore", &stamp]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("--yes"), "{}", err(&o));
+    assert_eq!(sb.tree(&sb.ipod), ipod_after_sync);
+}
+
+#[test]
+fn restoring_an_unknown_stamp_fails_and_changes_nothing() {
+    let sb = adopted();
+    sb.reverse_road();
+    sb.ok(&["sync", "--yes"]);
+    let ipod_after_sync = sb.tree(&sb.ipod);
+    let o = sb.run(&["restore", "19990101-000000", "--yes"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("19990101-000000"), "{}", err(&o));
+    assert_eq!(sb.tree(&sb.ipod), ipod_after_sync);
+}
+
+#[test]
+fn restore_with_no_backups_at_all_fails_cleanly() {
+    let sb = adopted();
+    let ipod_before = sb.tree(&sb.ipod);
+    let o = sb.run(&["restore", "20260101-000000", "--yes"]);
+    assert_code(&o, 1);
+    assert!(!err(&o).contains("panicked"), "{}", err(&o));
+    assert_eq!(sb.tree(&sb.ipod), ipod_before);
 }

@@ -7,6 +7,7 @@ mod list;
 mod playlist;
 pub mod snapshot;
 mod track;
+mod write;
 
 pub use db::{Database, DeviceInfo};
 pub use error::{Error, Result};
