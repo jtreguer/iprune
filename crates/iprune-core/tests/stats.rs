@@ -492,3 +492,43 @@ fn play_counts_hashes_the_live_file_and_the_renamed_one_separately() {
         pc(None, Some(*blake3::hash(b"abd").as_bytes()))
     );
 }
+
+#[test]
+fn all_is_empty_without_stats() {
+    let env = Env::new();
+    assert!(stats::all(env.store.conn()).unwrap().is_empty());
+}
+
+#[test]
+fn all_returns_each_tracks_totals_by_id_and_leaves_out_tracks_without_a_row() {
+    let mut env = Env::new();
+    for i in 1..=3 {
+        env.add(&format!("t{i}.mp3"), Kind::Mp3, i);
+    }
+    env.scan();
+    let ids: Vec<i64> = env.tracks().iter().map(|t| t.id).collect();
+    assert_eq!(ids.len(), 3);
+    let conn = env.store.conn();
+    put(conn, (ids[0], 12, 3, Some(80), Some(1_700_000_000)));
+    // Never rated, never played: NULL stays None, and is not the same as 0.
+    put(conn, (ids[1], 0, 0, None, None));
+
+    let got = stats::all(conn).unwrap();
+    assert_eq!(got.len(), 2);
+    assert_eq!(
+        got[&ids[0]],
+        stats::TrackStats {
+            plays: 12,
+            skips: 3,
+            rating: Some(80),
+            last_played: Some(1_700_000_000),
+        }
+    );
+    assert_eq!(got[&ids[1]], stats::TrackStats::default());
+    assert!(!got.contains_key(&ids[2]));
+
+    // A rating of 0 is a rating, not a missing one.
+    conn.execute("UPDATE stats SET rating = 0 WHERE track_id = ?1", [ids[1]])
+        .unwrap();
+    assert_eq!(stats::all(conn).unwrap()[&ids[1]].rating, Some(0));
+}

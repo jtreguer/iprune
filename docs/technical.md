@@ -671,15 +671,16 @@ light and dark with the `gtk-theme` (Adwaita or Adwaita-dark) and
 `color-scheme` settings, which plain GTK4 follows. The window needs none of
 libadwaita's widgets.
 
-- **Grid.** `gtk::ColumnView` over a `gio::ListStore` of a `TrackObject`
-  GObject subclass, wrapped in a `gtk::FilterListModel` (search) and a
-  `gtk::SortListModel` fed by the column sorters. List widgets are recycled,
+- **Grid.** `gtk::ColumnView` over a `gio::ListStore` of
+  `glib::BoxedAnyObject`s holding plain `view_model::Row`s, wrapped in a
+  `gtk::FilterListModel` (search) and a `gtk::SortListModel` fed by the
+  column sorters (`gtk::CustomSorter` calling `Column::compare`). List widgets are recycled,
   so widgets exist only for the visible rows; the ~9,700 track objects are
   plain data that sorting and filtering go through. Column visibility, width
   and order are saved per view in `~/.local/state/iprune/ui.toml`.
-- **Sidebar.** `gtk::ListView` with sections for Library, Playlists and
-  Device (section headers need GTK 4.12). Playlists are drop targets for
-  tracks.
+- **Sidebar.** A `gtk::ListBox` (about 340 rows) with headers for Library
+  and Playlists, and the iPod's state below it. Playlists are drop targets
+  for tracks.
 - **Drag and drop.** Rows carry library track ids (`gdk::ContentProvider`
   with an application-specific type). A drop on a sidebar playlist calls
   `playlists::add`; a drop inside a playlist grid calls `add` with the drop
@@ -700,6 +701,12 @@ libadwaita's widgets.
   functions with unit tests. Widget code stays thin.
 - **Playlists folder.** A `gio::FileMonitor` reloads files changed by other
   programs.
+
+Built in steps: (1) the read-only window: sidebar, grid over the library or a
+playlist (in file order, unresolved entries dimmed), every column sortable
+with iTunes-style ties (artist, album, disc, track, name), a column menu,
+search, a status line with totals, and the iPod's state; (2) editing and
+the saved column layout; (3) the sync plan dialog and Apply; then M5.
 
 ## 15. Omarchy packaging
 

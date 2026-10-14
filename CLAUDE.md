@@ -13,7 +13,8 @@ is right rather than silently picking one.
 M0 to M4 done (bindings, read-only `gpod` wrapper, `iprune snapshot`;
 config, scan, SQLite index, `.m3u8` editing, `playlist` commands; `adopt`;
 planner and `sync --plan-only`; playlist sync with statistics pull, backups,
-checks, verification, `backups` and `restore`). Work follows the milestones in `docs/technical.md` section 17:
+checks, verification, `backups` and `restore`). M6 started: the read-only
+window (`iprune-gui`). Work follows the milestones in `docs/technical.md` section 17:
 
 | # | Deliverable | Writes to iPod |
 |---|---|---|
@@ -64,7 +65,8 @@ crates/iprune-core/  config, store, scan, playlist (.m3u8 format), playlists (op
                      sync (planner input and plan text), exec (apply, restore),
                      verify (checks around a write), stats, backup
 crates/iprune/       binary `iprune`: CLI
-crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6)
+crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6); view_model
+                     (rows, columns, sort, search) is plain and tested, data loads, main is GTK
 crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c
 ```
 

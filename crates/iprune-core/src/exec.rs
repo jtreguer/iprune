@@ -504,13 +504,7 @@ pub struct Restored {
 /// prefix. Without a GUID, the only iPod with backups, if there is one.
 pub fn backup_guid(paths: &Paths, guid: Option<&str>) -> Result<String> {
     let root = paths.data_dir.join("backups");
-    let norm = |s: &str| {
-        let s = s.trim();
-        s.strip_prefix("0x")
-            .or_else(|| s.strip_prefix("0X"))
-            .unwrap_or(s)
-            .to_ascii_uppercase()
-    };
+    let norm = device::normalize_guid;
     let names: Vec<String> = match std::fs::read_dir(&root) {
         Ok(d) => d
             .filter_map(|e| e.ok()?.file_name().into_string().ok())

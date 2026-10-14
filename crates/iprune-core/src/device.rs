@@ -96,6 +96,16 @@ fn check_mount(mounts: &[Mount], mountpoint: &Path) -> Result<()> {
     }
 }
 
+/// A FireWire GUID as upper-case hex without a `0x` prefix, so GUIDs from
+/// libgpod, SysInfo and SysInfoExtended compare equal.
+pub fn normalize_guid(guid: &str) -> String {
+    let g = guid.trim();
+    g.strip_prefix("0x")
+        .or_else(|| g.strip_prefix("0X"))
+        .unwrap_or(g)
+        .to_ascii_uppercase()
+}
+
 /// The FireWire GUID of the iPod at `mountpoint`, read from
 /// `SysInfoExtended` or `SysInfo` without parsing the database, so it works
 /// when the database is damaged. Upper-case hex without `0x`.

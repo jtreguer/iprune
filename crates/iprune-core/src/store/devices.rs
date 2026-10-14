@@ -15,6 +15,33 @@ pub fn device_id(conn: &Connection, guid: &str) -> Result<Option<i64>> {
         .optional()?)
 }
 
+/// A known iPod.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRow {
+    pub id: i64,
+    pub firewire_guid: String,
+    pub name: Option<String>,
+    pub model: Option<String>,
+    pub last_sync_at: Option<i64>,
+}
+
+pub fn devices(conn: &Connection) -> Result<Vec<DeviceRow>> {
+    let mut stmt = conn
+        .prepare("SELECT id, firewire_guid, name, model, last_sync_at FROM devices ORDER BY id")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(DeviceRow {
+                id: r.get(0)?,
+                firewire_guid: r.get(1)?,
+                name: r.get(2)?,
+                model: r.get(3)?,
+                last_sync_at: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
 pub fn upsert_device(
     conn: &Connection,
     guid: &str,

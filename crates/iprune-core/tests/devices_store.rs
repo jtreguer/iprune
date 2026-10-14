@@ -453,3 +453,65 @@ fn mountinfo_leaves_escapes_above_255_as_text_and_does_not_panic() {
         );
     }
 }
+
+#[test]
+fn devices_is_empty_on_a_new_index() {
+    let store = iprune_core::store::Store::open_in_memory().unwrap();
+    assert!(devices::devices(store.conn()).unwrap().is_empty());
+}
+
+#[test]
+fn devices_lists_every_device_in_id_order_with_its_fields() {
+    let store = iprune_core::store::Store::open_in_memory().unwrap();
+    let conn = store.conn();
+    let b = devices::upsert_device(conn, "BBBB", Some("Second"), Some("MC297")).unwrap();
+    let a = devices::upsert_device(conn, "AAAA", None, None).unwrap();
+    conn.execute(
+        "UPDATE devices SET last_sync_at = 1700000000 WHERE id = ?1",
+        [b],
+    )
+    .unwrap();
+
+    let got = devices::devices(conn).unwrap();
+    assert_eq!(
+        got,
+        vec![
+            devices::DeviceRow {
+                id: b,
+                firewire_guid: "BBBB".into(),
+                name: Some("Second".into()),
+                model: Some("MC297".into()),
+                last_sync_at: Some(1_700_000_000),
+            },
+            devices::DeviceRow {
+                id: a,
+                firewire_guid: "AAAA".into(),
+                name: None,
+                model: None,
+                last_sync_at: None,
+            },
+        ]
+    );
+
+    // The same GUID again is the same device, renamed.
+    devices::upsert_device(conn, "AAAA", Some("Renamed"), None).unwrap();
+    let got = devices::devices(conn).unwrap();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[1].name.as_deref(), Some("Renamed"));
+}
+
+#[test]
+fn normalize_guid_trims_strips_the_prefix_and_upper_cases() {
+    use iprune_core::device::normalize_guid;
+    for (raw, want) in [
+        ("000a27001234abcd", "000A27001234ABCD"),
+        ("0x000a27001234abcd", "000A27001234ABCD"),
+        ("0X000A27001234ABCD", "000A27001234ABCD"),
+        ("  0x000a27001234abcd\n", "000A27001234ABCD"),
+        ("", ""),
+    ] {
+        assert_eq!(normalize_guid(raw), want, "{raw:?}");
+    }
+    // Only a leading prefix goes.
+    assert_eq!(normalize_guid("ab0xcd"), "AB0XCD");
+}

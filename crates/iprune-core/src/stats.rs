@@ -278,3 +278,32 @@ pub fn export_csv(conn: &Connection, path: &Path) -> Result<usize> {
     write_atomic(path, &out, mode)?;
     Ok(n)
 }
+
+/// One track's totals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrackStats {
+    pub plays: u32,
+    pub skips: u32,
+    /// 0 to 100, `None` when unrated.
+    pub rating: Option<u32>,
+    pub last_played: Option<i64>,
+}
+
+/// Every track's statistics, by track id.
+pub fn all(conn: &Connection) -> Result<HashMap<i64, TrackStats>> {
+    let mut stmt = conn.prepare("SELECT track_id, plays, skips, rating, last_played FROM stats")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                TrackStats {
+                    plays: r.get(1)?,
+                    skips: r.get(2)?,
+                    rating: r.get(3)?,
+                    last_played: r.get(4)?,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
