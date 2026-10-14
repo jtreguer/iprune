@@ -14,7 +14,8 @@ M0 to M4 done (bindings, read-only `gpod` wrapper, `iprune snapshot`;
 config, scan, SQLite index, `.m3u8` editing, `playlist` commands; `adopt`;
 planner and `sync --plan-only`; playlist sync with statistics pull, backups,
 checks, verification, `backups` and `restore`). M6 under way: the window
-(`iprune-gui`) shows the library and playlists and edits playlists. Work follows the milestones in `docs/technical.md` section 17:
+(`iprune-gui`) shows the library and playlists, edits playlists and syncs
+playlists to the iPod. Work follows the milestones in `docs/technical.md` section 17:
 
 | # | Deliverable | Writes to iPod |
 |---|---|---|

@@ -298,26 +298,7 @@ fn run_scan() -> Result<()> {
 }
 
 fn find_mountpoint(config: &Config) -> Result<PathBuf> {
-    if !config.device.mountpoint.as_os_str().is_empty() {
-        return Ok(config.device.mountpoint.clone());
-    }
-    let found = device::find_ipods()?;
-    match found.as_slice() {
-        [] => bail!(
-            "no mounted iPod found; connect and mount it, or set device.mountpoint in the config"
-        ),
-        [one] => Ok(one.mountpoint.clone()),
-        many => {
-            let list: Vec<String> = many
-                .iter()
-                .map(|m| m.mountpoint.display().to_string())
-                .collect();
-            bail!(
-                "several iPods are mounted ({}); set device.mountpoint in the config",
-                list.join(", ")
-            )
-        }
-    }
+    Ok(device::mountpoint(config)?)
 }
 
 fn adopt(file: Option<&Path>, accept_proposals: bool, force: bool) -> Result<()> {

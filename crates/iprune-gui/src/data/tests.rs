@@ -17,14 +17,23 @@ use super::*;
 
 const GUID: &str = "000A27001234ABCD";
 
+/// Paths the tests never use: the sync worker is not run here.
+fn unused_paths() -> iprune_core::config::Paths {
+    iprune_core::config::Paths {
+        config_file: PathBuf::from("/nonexistent/iprune/config.toml"),
+        data_dir: PathBuf::from("/nonexistent/iprune"),
+    }
+}
+
 fn data_with_mount(mount: &Path) -> Data {
     let mut config = Config::default();
     config.device.mountpoint = mount.to_owned();
     assert!(!config.device.mountpoint.as_os_str().is_empty());
     Data {
         config,
+        paths: unused_paths(),
         store: Store::open_in_memory().unwrap(),
-        stats: HashMap::new(),
+        stats: std::cell::RefCell::new(HashMap::new()),
         warning: None,
     }
 }
@@ -306,8 +315,9 @@ fn sandbox(n: usize) -> Sandbox {
         _tmp: tmp,
         data: Data {
             config,
+            paths: unused_paths(),
             store,
-            stats: HashMap::new(),
+            stats: std::cell::RefCell::new(HashMap::new()),
             warning: None,
         },
         lists,
@@ -547,4 +557,31 @@ fn reload_playlists_picks_up_outside_edits_and_deletions_and_writes_no_file() {
 
     // a second reload with nothing changed loads nothing
     assert_eq!(sb.data.reload_playlists().unwrap().loaded, 0);
+}
+
+#[test]
+fn reload_stats_picks_up_rows_written_after_open() {
+    let sb = sandbox(2);
+    let plays =
+        |sb: &Sandbox| -> Vec<u32> { sb.data.library().unwrap().iter().map(|r| r.plays).collect() };
+    assert_eq!(plays(&sb), vec![0, 0]);
+    let id = store::all_tracks(sb.data.store.conn()).unwrap()[1].id;
+    sb.data
+        .store
+        .conn()
+        .execute(
+            "INSERT INTO stats (track_id, plays, skips) VALUES (?1, 7, 1)",
+            [id],
+        )
+        .unwrap();
+    // Not read until asked.
+    assert_eq!(plays(&sb), vec![0, 0]);
+    sb.data.reload_stats().unwrap();
+    let rows = sb.data.library().unwrap();
+    let got: Vec<(i64, u32)> = rows
+        .iter()
+        .map(|r| (r.track_id.unwrap_or(-1), r.plays))
+        .collect();
+    assert_eq!(rows.iter().map(|r| r.plays).sum::<u32>(), 7, "{got:?}");
+    assert_eq!(rows.iter().filter(|r| r.plays == 7).count(), 1);
 }

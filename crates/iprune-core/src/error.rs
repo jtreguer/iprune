@@ -41,6 +41,10 @@ pub enum Error {
         "the iPod {0} has not been adopted; run `iprune adopt` first, or every track would be copied again"
     )]
     NotAdopted(String),
+    #[error("no mounted iPod found; connect and mount it, or set device.mountpoint in the config")]
+    NoIpod,
+    #[error("several iPods are mounted ({0}); set device.mountpoint in the config")]
+    SeveralIpods(String),
     #[error("{0}; nothing planned")]
     BadScope(String),
     #[error(transparent)]

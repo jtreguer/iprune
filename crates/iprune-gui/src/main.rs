@@ -3,6 +3,7 @@
 //! and is written to the `.m3u8` file at once.
 
 mod data;
+mod sync_job;
 mod view_model;
 
 use std::cell::{Cell, OnceCell, RefCell};
@@ -85,6 +86,18 @@ struct Ui {
     /// The grid's right-click menu and the actions only a playlist enables.
     row_menu: gtk::PopoverMenu,
     playlist_actions: RefCell<Vec<gio::SimpleAction>>,
+    /// The sidebar's iPod panel and the action that syncs it.
+    device_box: gtk::Box,
+    sync_action: RefCell<Option<gio::SimpleAction>>,
+    /// True while a sync writes to the iPod: the window cannot close.
+    writing: Cell<bool>,
+    /// True while a sync dialog is open or its plan is still being made:
+    /// only one sync at a time.
+    syncing: Cell<bool>,
+    /// True while the plan's worker runs (it scans and writes the index).
+    planning: Cell<bool>,
+    /// Kept so its mount signals keep coming.
+    volumes: RefCell<Option<gio::VolumeMonitor>>,
     /// Set when the playlists folder cannot be watched; kept in the status.
     unwatched: Cell<bool>,
 }
@@ -773,6 +786,292 @@ impl Ui {
         self.status.set_text(&text);
     }
 
+    /// Shows the iPod's state in the sidebar and enables Sync for an
+    /// adopted iPod that is mounted.
+    fn refresh_device(&self) {
+        while let Some(child) = self.device_box.first_child() {
+            self.device_box.remove(&child);
+        }
+        let device = self.data.device().ok().flatten();
+        let can_sync = device.as_ref().is_some_and(|d| d.connected && d.adopted);
+        if let Some(a) = &*self.sync_action.borrow() {
+            a.set_enabled(can_sync && !self.syncing.get());
+        }
+        let Some(d) = device else {
+            return;
+        };
+        let heading = gtk::Label::new(Some("Device"));
+        heading.set_xalign(0.0);
+        heading.add_css_class("heading");
+        heading.add_css_class("dim-label");
+        heading.set_margin_top(12);
+        heading.set_margin_start(8);
+        let label = gtk::Label::new(Some(&device_text(&d)));
+        label.set_xalign(0.0);
+        label.set_margin_start(16);
+        label.set_margin_top(4);
+        label.set_margin_bottom(12);
+        if !d.connected {
+            label.add_css_class("dim-label");
+        }
+        self.device_box.append(&heading);
+        self.device_box.append(&label);
+    }
+
+    /// Plans a sync on a worker thread and shows the plan in a dialog, from
+    /// which it can be applied.
+    fn open_sync(self: &Rc<Self>) {
+        // One sync at a time, planning included: a second one would read
+        // the iPod while the first writes it.
+        if self.syncing.replace(true) {
+            return;
+        }
+        let dialog = gtk::Window::builder()
+            .title("Sync")
+            .transient_for(&self.window)
+            .modal(true)
+            .default_width(760)
+            .default_height(600)
+            .build();
+        {
+            let ui = Rc::downgrade(self);
+            // A close request (the window manager's close key too) is
+            // refused while the iPod is written.
+            dialog.connect_close_request(move |_| match ui.upgrade() {
+                Some(ui) if ui.writing.get() => glib::Propagation::Stop,
+                _ => glib::Propagation::Proceed,
+            });
+            let ui = Rc::downgrade(self);
+            // Closed during planning, the sync is over when the worker is.
+            dialog.connect_destroy(move |_| {
+                if let Some(ui) = ui.upgrade()
+                    && !ui.planning.get()
+                {
+                    ui.syncing.set(false);
+                    ui.refresh_device();
+                }
+            });
+        }
+        if let Some(a) = &*self.sync_action.borrow() {
+            a.set_enabled(false);
+        }
+        self.planning.set(true);
+        let stack = gtk::Stack::new();
+        dialog.set_child(Some(&stack));
+        working_page(&stack, "Scanning the library and reading the iPod…");
+        dialog.present();
+
+        let config = self.data.config().clone();
+        let paths = self.data.paths().clone();
+        let ui = Rc::downgrade(self);
+        let dialog_weak = dialog.downgrade();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || sync_job::plan(&config, &paths)).await;
+            let Some(ui) = ui.upgrade() else { return };
+            ui.planning.set(false);
+            let Some(dialog) = dialog_weak.upgrade() else {
+                // The dialog was closed while planning: the sync ends now.
+                ui.syncing.set(false);
+                ui.refresh_device();
+                return;
+            };
+            // The scan may have changed the index: show the library as it is.
+            ui.refresh();
+            match joined(result) {
+                Ok(planned) => ui.plan_page(&dialog, &stack, planned),
+                Err(e) => result_page(
+                    &dialog,
+                    &stack,
+                    "The sync could not be planned",
+                    &format!("{e:#}\n\nNothing was written to the iPod."),
+                ),
+            }
+        });
+    }
+
+    fn plan_page(
+        self: &Rc<Self>,
+        dialog: &gtk::Window,
+        stack: &gtk::Stack,
+        planned: sync_job::Planned,
+    ) {
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        page.set_margin_top(16);
+        page.set_margin_bottom(16);
+        page.set_margin_start(16);
+        page.set_margin_end(16);
+
+        let heading = gtk::Label::new(Some(&format!("Sync with {}", planned.ipod_name)));
+        heading.add_css_class("title-2");
+        heading.set_xalign(0.0);
+        page.append(&heading);
+        let scan = gtk::Label::new(Some(&planned.scan));
+        scan.add_css_class("dim-label");
+        scan.set_xalign(0.0);
+        page.append(&scan);
+        let summary = gtk::Label::new(Some(planned.summary.trim_end()));
+        summary.add_css_class("monospace");
+        summary.set_xalign(0.0);
+        summary.set_selectable(true);
+        page.append(&summary);
+
+        let mut note = format!(
+            "This version applies playlist changes only: {}. Track copies, removals and tag \
+             updates are listed but come with a later version.",
+            match planned.ops {
+                0 => "nothing to apply".to_owned(),
+                1 => "1 change".to_owned(),
+                n => format!("{n} changes"),
+            }
+        );
+        match planned.left_out {
+            0 => {}
+            1 => note.push_str(
+                " 1 playlist entry points to a track not on the iPod yet and is left out for now.",
+            ),
+            n => note.push_str(&format!(
+                " {n} playlist entries point to tracks not on the iPod yet and are left out for now."
+            )),
+        }
+        if !planned.fits {
+            note.push_str(
+                " The track copies above would not fit on the iPod; playlist changes need no space.",
+            );
+        }
+        let note = gtk::Label::new(Some(&note));
+        note.set_wrap(true);
+        note.set_xalign(0.0);
+        page.append(&note);
+
+        let allow = gtk::CheckButton::with_label("Delete these playlists on the iPod anyway");
+        if let Some(why) = &planned.mass_removal {
+            let warn = gtk::Label::new(Some(why));
+            warn.set_wrap(true);
+            warn.set_xalign(0.0);
+            warn.add_css_class("error");
+            page.append(&warn);
+            page.append(&allow);
+        }
+
+        let details = gtk::TextView::new();
+        details.set_editable(false);
+        details.set_cursor_visible(false);
+        details.set_monospace(true);
+        details.buffer().set_text(planned.details.trim_end());
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&details)
+            .vexpand(true)
+            .min_content_height(240)
+            .build();
+        let expander = gtk::Expander::new(Some("All changes"));
+        expander.set_child(Some(&scroll));
+        expander.set_vexpand(true);
+        page.append(&expander);
+
+        // Alt+A and Alt+C reach the buttons from the keyboard.
+        let cancel = gtk::Button::with_mnemonic("_Cancel");
+        let apply = gtk::Button::with_mnemonic("_Apply");
+        apply.add_css_class("suggested-action");
+        let (ops, mass) = (planned.ops, planned.mass_removal.is_some());
+        let ready = move |allowed: bool| ops > 0 && (!mass || allowed);
+        apply.set_sensitive(ready(allow.is_active()));
+        {
+            let apply = apply.clone();
+            allow.connect_toggled(move |a| apply.set_sensitive(ready(a.is_active())));
+        }
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        buttons.set_halign(gtk::Align::End);
+        buttons.append(&cancel);
+        buttons.append(&apply);
+        page.append(&buttons);
+        {
+            let dialog = dialog.clone();
+            cancel.connect_clicked(move |_| dialog.close());
+        }
+        {
+            let ui = Rc::downgrade(self);
+            let (dialog, stack, allow) = (dialog.clone(), stack.clone(), allow.clone());
+            let work = planned.work.clone();
+            apply.connect_clicked(move |_| {
+                if let Some(ui) = ui.upgrade() {
+                    ui.apply_sync(&dialog, &stack, work.clone(), allow.is_active());
+                }
+            });
+        }
+        stack.add_named(&page, Some("plan"));
+        stack.set_visible_child(&page);
+    }
+
+    fn apply_sync(
+        self: &Rc<Self>,
+        dialog: &gtk::Window,
+        stack: &gtk::Stack,
+        work: iprune_core::exec::Work,
+        allow: bool,
+    ) {
+        // Set before anything else: a second Apply does nothing.
+        if self.writing.replace(true) {
+            return;
+        }
+        working_page(stack, "Writing to the iPod… Do not disconnect it.");
+        // Neither this dialog nor the window may close while the iPod is
+        // written (see their close-request handlers); the application stays
+        // up until the worker is done.
+        dialog.set_deletable(false);
+        let hold = self.window.application().map(|a| a.hold());
+        let config = self.data.config().clone();
+        let paths = self.data.paths().clone();
+        let ui = Rc::downgrade(self);
+        let (dialog, stack) = (dialog.clone(), stack.clone());
+        glib::spawn_future_local(async move {
+            let result =
+                gio::spawn_blocking(move || sync_job::apply(&config, &paths, &work, allow)).await;
+            drop(hold);
+            dialog.set_deletable(true);
+            let Some(ui) = ui.upgrade() else { return };
+            ui.writing.set(false);
+            match joined(result) {
+                Ok(done) => {
+                    let mut text = match done.applied {
+                        0 => "Nothing needed applying.".to_owned(),
+                        n => format!(
+                            "Applied {n} playlist changes to the iPod and verified them by reading the database back."
+                        ),
+                    };
+                    if done.recovered > 0 {
+                        text.push_str(&format!(
+                            "\nAn earlier sync stopped before writing; its statistics for {} tracks were undone first.",
+                            done.recovered
+                        ));
+                    }
+                    if done.applied > 0 {
+                        text.push_str(&format!(
+                            "\nStatistics updated for {} tracks ({} new plays).",
+                            done.stats_tracks, done.plays
+                        ));
+                    }
+                    if let Some(stamp) = &done.stamp {
+                        text.push_str(&format!(
+                            "\nBackup {stamp}: `iprune restore {stamp}` puts the previous database back."
+                        ));
+                    }
+                    for w in &done.warnings {
+                        text.push_str(&format!("\nWarning: {w}"));
+                    }
+                    result_page(&dialog, &stack, "Sync done", &text);
+                }
+                Err(e) => result_page(&dialog, &stack, "The sync stopped", &format!("{e:#}")),
+            }
+            // Statistics, mappings and the last sync may have changed,
+            // whatever the outcome.
+            if let Err(e) = ui.data.reload_stats() {
+                ui.status.set_text(&format!("{e:#}"));
+            }
+            ui.refresh_device();
+            ui.refresh();
+        });
+    }
+
     /// Rebuilds the sidebar's playlists and selects the current source, or
     /// the library when it is gone.
     fn fill_sidebar(self: &Rc<Self>) {
@@ -937,6 +1236,52 @@ impl Ui {
     }
 }
 
+/// A worker's result, with a panic turned into an error.
+fn joined<T>(r: Result<anyhow::Result<T>, Box<dyn std::any::Any + Send>>) -> anyhow::Result<T> {
+    r.unwrap_or_else(|_| Err(anyhow::anyhow!("the sync worker crashed")))
+}
+
+fn working_page(stack: &gtk::Stack, text: &str) {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    page.set_valign(gtk::Align::Center);
+    page.set_halign(gtk::Align::Center);
+    let spinner = gtk::Spinner::new();
+    spinner.set_size_request(32, 32);
+    spinner.start();
+    page.append(&spinner);
+    page.append(&gtk::Label::new(Some(text)));
+    stack.add_child(&page);
+    stack.set_visible_child(&page);
+}
+
+fn result_page(dialog: &gtk::Window, stack: &gtk::Stack, title: &str, text: &str) {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    page.set_margin_top(16);
+    page.set_margin_bottom(16);
+    page.set_margin_start(16);
+    page.set_margin_end(16);
+    let heading = gtk::Label::new(Some(title));
+    heading.add_css_class("title-2");
+    heading.set_xalign(0.0);
+    let body = gtk::Label::new(Some(text));
+    body.set_wrap(true);
+    body.set_xalign(0.0);
+    body.set_yalign(0.0);
+    body.set_selectable(true);
+    body.set_vexpand(true);
+    let close = gtk::Button::with_label("Close");
+    close.set_halign(gtk::Align::End);
+    {
+        let dialog = dialog.clone();
+        close.connect_clicked(move |_| dialog.close());
+    }
+    page.append(&heading);
+    page.append(&body);
+    page.append(&close);
+    stack.add_child(&page);
+    stack.set_visible_child(&page);
+}
+
 fn action(
     window: &gtk::ApplicationWindow,
     name: &str,
@@ -1079,24 +1424,10 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     new_button.set_margin_bottom(4);
 
     let device_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    if let Ok(Some(d)) = data.device() {
-        let label = gtk::Label::new(Some(&device_text(&d)));
-        label.set_xalign(0.0);
-        label.set_margin_start(16);
-        label.set_margin_top(4);
-        label.set_margin_bottom(12);
-        if !d.connected {
-            label.add_css_class("dim-label");
-        }
-        let heading = gtk::Label::new(Some("Device"));
-        heading.set_xalign(0.0);
-        heading.add_css_class("heading");
-        heading.add_css_class("dim-label");
-        heading.set_margin_top(12);
-        heading.set_margin_start(8);
-        device_box.append(&heading);
-        device_box.append(&label);
-    }
+    let sync_button = gtk::Button::with_label("Sync");
+    sync_button.set_tooltip_text(Some("Show the sync plan for the connected iPod"));
+    sync_button.set_action_name(Some("win.sync"));
+    header.pack_start(&sync_button);
 
     let side = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let side_scroll = gtk::ScrolledWindow::builder()
@@ -1150,6 +1481,12 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         shown_mtime: Cell::new(None),
         row_menu,
         playlist_actions: RefCell::new(Vec::new()),
+        device_box: device_box.clone(),
+        sync_action: RefCell::new(None),
+        writing: Cell::new(false),
+        syncing: Cell::new(false),
+        planning: Cell::new(false),
+        volumes: RefCell::new(None),
         unwatched: Cell::new(false),
     });
     slot.set(Rc::downgrade(&ui)).expect("set once");
@@ -1180,6 +1517,25 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         }
     });
     *ui.playlist_actions.borrow_mut() = vec![remove.clone(), up.clone(), down.clone()];
+    let sync = action(window, "sync", &ui, |ui| ui.open_sync());
+    *ui.sync_action.borrow_mut() = Some(sync);
+    ui.refresh_device();
+    // An iPod plugged in or out updates the panel and the Sync button.
+    let volumes = gio::VolumeMonitor::get();
+    for signal in ["mount-added", "mount-removed"] {
+        let weak = Rc::downgrade(&ui);
+        volumes.connect_local(signal, false, move |_| {
+            let weak = weak.clone();
+            // The mount may not be readable yet when the signal comes.
+            glib::timeout_add_local_once(Duration::from_millis(800), move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.refresh_device();
+                }
+            });
+            None
+        });
+    }
+    *ui.volumes.borrow_mut() = Some(volumes);
 
     // Grid keys: Delete removes from the playlist, Ctrl+Up and Ctrl+Down
     // move. Local to the grid, so the search field keeps its own keys.
@@ -1286,6 +1642,11 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         let weak = Rc::downgrade(&ui);
         window.connect_close_request(move |_| {
             if let Some(ui) = weak.upgrade() {
+                if ui.writing.get() {
+                    // Closing now would end the process in the middle of
+                    // writing the iPod database.
+                    return glib::Propagation::Stop;
+                }
                 ui.save_layouts();
             }
             glib::Propagation::Proceed

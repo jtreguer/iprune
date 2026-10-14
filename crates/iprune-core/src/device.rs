@@ -134,6 +134,29 @@ pub fn firewire_guid(mountpoint: &Path) -> Option<String> {
         .and_then(clean)
 }
 
+/// The iPod to use: `device.mountpoint` from the config when set, else the
+/// only mounted iPod.
+pub fn mountpoint(cfg: &crate::config::Config) -> Result<std::path::PathBuf> {
+    if !cfg.device.mountpoint.as_os_str().is_empty() {
+        return Ok(cfg.device.mountpoint.clone());
+    }
+    pick(&find_ipods()?)
+}
+
+/// The one iPod among the mounted ones.
+fn pick(found: &[Mount]) -> Result<std::path::PathBuf> {
+    match found {
+        [] => Err(Error::NoIpod),
+        [one] => Ok(one.mountpoint.clone()),
+        many => Err(Error::SeveralIpods(
+            many.iter()
+                .map(|m| m.mountpoint.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )),
+    }
+}
+
 /// Mounted filesystems that hold an iPod database.
 pub fn find_ipods() -> Result<Vec<Mount>> {
     let path = Path::new("/proc/self/mountinfo");
@@ -164,6 +187,35 @@ garbage line
         );
         assert_eq!((m[1].fstype.as_str(), m[1].read_only), ("vfat", false));
         assert!(m[2].read_only);
+    }
+
+    #[test]
+    fn mountpoint_uses_the_configured_path_without_looking_for_ipods() {
+        let mut cfg = crate::config::Config::default();
+        cfg.device.mountpoint = PathBuf::from("/nonexistent/chosen");
+        assert_eq!(mountpoint(&cfg).unwrap(), Path::new("/nonexistent/chosen"));
+    }
+
+    #[test]
+    fn pick_takes_the_only_ipod() {
+        let one = [mount("/run/media/x/IPOD", "vfat", false)];
+        assert_eq!(pick(&one).unwrap(), Path::new("/run/media/x/IPOD"));
+    }
+
+    #[test]
+    fn pick_refuses_none_and_several() {
+        let e = pick(&[]).unwrap_err();
+        assert!(matches!(e, Error::NoIpod), "{e}");
+        assert!(e.to_string().contains("no mounted iPod found"), "{e}");
+        let two = [
+            mount("/run/media/x/A", "vfat", false),
+            mount("/run/media/x/B", "vfat", false),
+        ];
+        let e = pick(&two).unwrap_err();
+        assert!(
+            matches!(e, Error::SeveralIpods(ref l) if l == "/run/media/x/A, /run/media/x/B"),
+            "{e}"
+        );
     }
 
     #[test]

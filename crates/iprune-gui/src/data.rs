@@ -14,8 +14,9 @@ use crate::view_model::{self, Row};
 
 pub struct Data {
     config: Config,
+    paths: Paths,
     store: Store,
-    stats: HashMap<i64, TrackStats>,
+    stats: std::cell::RefCell<HashMap<i64, TrackStats>>,
     /// Set when the playlists folder could not be read at start; the index
     /// still has the playlists as last read.
     pub warning: Option<String>,
@@ -56,15 +57,16 @@ impl Data {
         let stats = stats::all(store.conn())?;
         Ok(Data {
             config,
+            paths,
             store,
-            stats,
+            stats: std::cell::RefCell::new(stats),
             warning,
         })
     }
 
     pub fn library(&self) -> Result<Vec<Row>> {
         let tracks = store::all_tracks(self.store.conn())?;
-        Ok(view_model::library_rows(&tracks, &self.stats))
+        Ok(view_model::library_rows(&tracks, &self.stats.borrow()))
     }
 
     /// Playlist names, as the files are named.
@@ -77,13 +79,28 @@ impl Data {
 
     pub fn playlist(&self, name: &str) -> Result<Vec<Row>> {
         let items = playlists::show(self.store.conn(), &self.config, name)?;
-        Ok(view_model::playlist_rows(&items, &self.stats))
+        Ok(view_model::playlist_rows(&items, &self.stats.borrow()))
     }
 
     /// The playlist file's modification time, if it can be read.
     pub fn playlist_mtime(&self, name: &str) -> Option<i64> {
         let file = playlists::file_for(&self.config, name).ok()?;
         iprune_core::playlist::mtime_ns(&file).ok()
+    }
+
+    /// Reads the play statistics again, after a sync pulled new ones.
+    pub fn reload_stats(&self) -> Result<()> {
+        *self.stats.borrow_mut() = stats::all(self.store.conn())?;
+        Ok(())
+    }
+
+    /// For the sync worker, which opens its own connection to the index.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub fn paths(&self) -> &Paths {
+        &self.paths
     }
 
     pub fn playlists_dir(&self) -> &std::path::Path {

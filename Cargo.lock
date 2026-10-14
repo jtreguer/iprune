@@ -904,6 +904,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "directories",
+ "gpod",
  "gtk4",
  "iprune-core",
  "serde",

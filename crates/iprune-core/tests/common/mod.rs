@@ -56,7 +56,7 @@ static GENERATE: Mutex<()> = Mutex::new(());
 /// A cached audio file of `kind`. Each `variant` has a different tone, title
 /// ("Title<variant>") and artist ("Artist<variant>"), so its bytes differ.
 pub fn fixture(kind: Kind, variant: u32) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("audio-fixtures");
+    let dir = target_tmp().join("audio-fixtures");
     let name = format!("{kind:?}-{variant}.{}", kind.ext());
     let path = dir.join(&name);
     let _guard = GENERATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -301,7 +301,7 @@ fn make_ipod_tool() -> PathBuf {
         assert!(flags.status.success(), "pkg-config libgpod-1.0");
         let flags = String::from_utf8(flags.stdout).unwrap();
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../gpod/tests/c/make_ipod.c");
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("c-tools");
+        let dir = target_tmp().join("c-tools");
         fs::create_dir_all(&dir).unwrap();
         // Several test binaries may build it at once: private name, then rename.
         let tmp = dir.join(format!(".make_ipod-{}", std::process::id()));
@@ -411,4 +411,15 @@ pub fn fake_ipod(
         fs::write(ctl.join("Device/SysInfo"), s).unwrap();
     }
     dir.to_owned()
+}
+
+/// Where fixtures and tools are built. Cargo sets `CARGO_TARGET_TMPDIR` for
+/// integration tests; a unit-test binary that includes this file (the GUI
+/// crate's) uses the workspace's `target/tmp` instead: removed by `cargo
+/// clean`, and not shared with other users as `/tmp` would be.
+fn target_tmp() -> &'static Path {
+    Path::new(
+        option_env!("CARGO_TARGET_TMPDIR")
+            .unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp")),
+    )
 }

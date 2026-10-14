@@ -716,8 +716,22 @@ confirmation). A `gio::FileMonitor` on the playlists folder reloads changes
 made by other programs, the CLI included, by comparing the file on screen
 with its modification time when it was read. The column order, widths and
 visibility are saved in `~/.local/state/iprune/ui.toml`, one layout for the
-library and one for playlists; (3) the sync plan dialog and Apply; then
-M5. `iprune-gui` is a single-instance application: starting it again opens
+library and one for playlists; (3) the Sync button, enabled when an
+adopted iPod is mounted (the panel follows `gio::VolumeMonitor`): a worker
+thread (`sync_job`, no GTK) scans the library, reads the iPod and plans; the
+dialog shows the summary, every change in an expander, and what this
+version applies; Apply reads the index and the iPod again on a worker,
+refuses if the playlist changes it would apply are no longer the ones
+shown (a change in free space or in the planned copies does not count),
+and runs the M4 playlist sync. It compares against the index, without
+reading the playlists folder again: a file edited after the plan but not
+yet read is left for the next sync, and the window reads such edits
+within half a second anyway. While it writes, neither the dialog nor the window can close and the
+application is held, so the process cannot end mid-write. The result shows
+the backup stamp, or the error with the restore command. libgpod objects
+never cross threads: each worker opens its own database and its own
+connection to the index (SQLite waits up to 10 s for the other's writes).
+Then M5. `iprune-gui` is a single-instance application: starting it again opens
 a window in the running one.
 
 ## 15. Omarchy packaging

@@ -37,6 +37,9 @@ impl Store {
 
     fn init(mut conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "foreign_keys", true)?;
+        // The window and its sync worker each hold a connection: wait for
+        // the other's write instead of failing at once.
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "wal")?;
         let version =
             conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? as usize;
