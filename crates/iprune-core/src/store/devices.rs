@@ -165,6 +165,37 @@ pub fn replace_playlist_mappings(
     Ok(())
 }
 
+/// Records synced tracks (inserted, or updated by library track) and drops
+/// the mappings of removed iPod tracks.
+pub fn apply_track_changes(
+    conn: &Connection,
+    device_id: i64,
+    upserts: &[TrackMapping],
+    removed_dbids: &[u64],
+) -> Result<()> {
+    let mut stmt = conn.prepare("DELETE FROM device_tracks WHERE device_id = ?1 AND dbid = ?2")?;
+    for d in removed_dbids {
+        stmt.execute(params![device_id, *d as i64])?;
+    }
+    let mut stmt = conn.prepare(
+        "INSERT INTO device_tracks (device_id, track_id, dbid, synced_tags_hash, synced_size, synced_duration_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(device_id, track_id) DO UPDATE SET \
+         dbid = excluded.dbid, synced_tags_hash = excluded.synced_tags_hash, \
+         synced_size = excluded.synced_size, synced_duration_ms = excluded.synced_duration_ms",
+    )?;
+    for m in upserts {
+        stmt.execute(params![
+            device_id,
+            m.track_id,
+            m.dbid as i64,
+            &m.synced_tags_hash[..],
+            m.synced_size as i64,
+            m.synced_duration_ms
+        ])?;
+    }
+    Ok(())
+}
+
 pub fn set_last_sync(conn: &Connection, device_id: i64, at: i64) -> Result<()> {
     conn.execute(
         "UPDATE devices SET last_sync_at = ?2 WHERE id = ?1",

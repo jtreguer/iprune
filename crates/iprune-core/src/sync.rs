@@ -26,6 +26,8 @@ pub struct Prepared {
     pub playlists_map: Vec<devices::PlaylistMapping>,
     /// Every indexed track, by id, for describing the plan.
     pub library: HashMap<i64, TrackRow>,
+    /// Mappings taken back from tracks a crashed sync left on the iPod.
+    pub recovered: usize,
 }
 
 /// Size and free space of the filesystem holding `path`.
@@ -51,7 +53,16 @@ pub fn prepare(conn: &Connection, cfg: &Config, db: &gpod::Database) -> Result<P
     let library = store::all_tracks(conn)?;
     let playlists = devices::library_playlists(conn)?;
     let removed = store::removed_playlists(conn)?;
-    let tracks_map = devices::track_mappings(conn, device)?;
+    let mut tracks_map = devices::track_mappings(conn, device)?;
+    // Tracks a crashed sync copied but did not record are taken back.
+    let lost = crate::transfer::lost_mappings(&guid, &library, &ipod, &tracks_map);
+    let recovered = lost.len();
+    if !lost.is_empty() {
+        crate::store::savepoint(conn, || {
+            devices::apply_track_changes(conn, device, &lost, &[])
+        })?;
+        tracks_map = devices::track_mappings(conn, device)?;
+    }
     let playlists_map = devices::playlist_mappings(conn, device)?;
     let space = db.mountpoint().map(|m| space(&m)).transpose()?;
     let scope = match cfg.sync.scope {
@@ -112,6 +123,7 @@ pub fn prepare(conn: &Connection, cfg: &Config, db: &gpod::Database) -> Result<P
         guid,
         tracks_map,
         playlists_map,
+        recovered,
         library: library.into_iter().map(|t| (t.id, t)).collect(),
     })
 }
@@ -364,6 +376,10 @@ pub fn describe(p: &Prepared, verbose: bool) -> String {
             .iter()
             .map(|t| match t.reason {
                 SkipReason::FairPlay => format!("{} (FairPlay protected)", t.path.display()),
+                SkipReason::SampleRate => format!(
+                    "{} (sampled above 48 kHz, which the iPod cannot play)",
+                    t.path.display()
+                ),
             })
             .collect(),
     );

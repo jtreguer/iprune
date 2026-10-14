@@ -7,9 +7,11 @@ mod list;
 mod playlist;
 pub mod snapshot;
 mod track;
+mod tracks;
 mod write;
 
 pub use db::{Database, DeviceInfo};
 pub use error::{Error, Result};
 pub use playlist::PlaylistRef;
 pub use track::TrackRef;
+pub use tracks::{AudioFields, TrackFields};

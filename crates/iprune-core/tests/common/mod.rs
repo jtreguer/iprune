@@ -56,8 +56,17 @@ static GENERATE: Mutex<()> = Mutex::new(());
 /// A cached audio file of `kind`. Each `variant` has a different tone, title
 /// ("Title<variant>") and artist ("Artist<variant>"), so its bytes differ.
 pub fn fixture(kind: Kind, variant: u32) -> PathBuf {
+    fixture_secs(kind, variant, 1)
+}
+
+/// [`fixture`] lasting `secs` seconds, for tests that need a different
+/// duration (the planner copies audio again when it changes by over a second).
+pub fn fixture_secs(kind: Kind, variant: u32, secs: u32) -> PathBuf {
     let dir = target_tmp().join("audio-fixtures");
-    let name = format!("{kind:?}-{variant}.{}", kind.ext());
+    let name = match secs {
+        1 => format!("{kind:?}-{variant}.{}", kind.ext()),
+        n => format!("{kind:?}-{variant}-{n}s.{}", kind.ext()),
+    };
     let path = dir.join(&name);
     let _guard = GENERATE.lock().unwrap_or_else(|e| e.into_inner());
     if path.exists() {
@@ -67,7 +76,10 @@ pub fn fixture(kind: Kind, variant: u32) -> PathBuf {
     let tmp = dir.join(format!(".{}-{name}", std::process::id()));
     let out = Command::new("ffmpeg")
         .args(["-loglevel", "error", "-y", "-f", "lavfi", "-i"])
-        .arg(format!("sine=frequency={}:duration=1", 300 + variant * 37))
+        .arg(format!(
+            "sine=frequency={}:duration={secs}",
+            300 + variant * 37
+        ))
         .arg("-metadata")
         .arg(format!("title=Title{variant}"))
         .arg("-metadata")
@@ -400,7 +412,10 @@ pub fn fake_ipod(
 ) -> PathBuf {
     let ctl = dir.join("iPod_Control");
     fs::create_dir_all(ctl.join("Device")).unwrap();
-    fs::create_dir_all(ctl.join("Music")).unwrap();
+    // The F00 to F49 folders of a real iPod, which libgpod copies files into.
+    for n in 0..50 {
+        fs::create_dir_all(ctl.join(format!("Music/F{n:02}"))).unwrap();
+    }
     write_itunesdb(
         &ctl.join("iTunes/iTunesDB"),
         "iPod de Test",

@@ -86,3 +86,26 @@ pub fn make_ipod_db(workdir: &Path, db: &Path, manifest: &str) {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+impl FakeIpod {
+    /// A fake iPod whose iTunesDB is described by a `make_ipod.c` manifest.
+    /// `iPod_Control/Music` holds the folders F00 to F49 of a real iPod, which
+    /// libgpod needs to copy a file ("No 'F..' directories found" otherwise).
+    pub fn from_manifest(manifest: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = dir.path().join("iPod_Control");
+        fs::create_dir_all(ctl.join("iTunes")).unwrap();
+        fs::create_dir_all(ctl.join("Device")).unwrap();
+        for n in 0..50 {
+            fs::create_dir_all(ctl.join(format!("Music/F{n:02}"))).unwrap();
+        }
+        let work = tempfile::tempdir().unwrap();
+        make_ipod_db(work.path(), &ctl.join("iTunes/iTunesDB"), manifest);
+        fs::write(
+            ctl.join("Device/SysInfo"),
+            "FirewireGuid: 0x000A27001234ABCD\n",
+        )
+        .unwrap();
+        FakeIpod { dir }
+    }
+}

@@ -57,6 +57,25 @@ pub enum Error {
         "the plan deletes {deletes} of {managed} managed playlists; if that is intended, run again with --allow-mass-removal"
     )]
     MassRemoval { deletes: usize, managed: usize },
+    #[error(
+        "the plan removes {removes} of {managed} tracks managed on the iPod; if that is intended, run again with --allow-mass-removal"
+    )]
+    MassTrackRemoval { removes: usize, managed: usize },
+    #[error(
+        "{files} files on the iPod are not in its database, which holds {tracks} tracks: that many more likely means a damaged database (see `iprune backups` and `iprune restore`) than leftovers. Nothing deleted; run again with --allow-mass-removal if you are sure"
+    )]
+    MassOrphans { files: usize, tracks: usize },
+    #[error(
+        "{entries} of the {tracks} tracks in the iPod database have no file: that many more likely means the iPod's music folder is not readable than lost files. Nothing removed; run again with --allow-mass-removal if you are sure"
+    )]
+    MassMissing { entries: usize, tracks: usize },
+    #[error(
+        "the checks before the final write failed, so it was not made; the iPod holds the last checkpoint, written and verified:\n  {}",
+        .0.join("\n  ")
+    )]
+    CheckAfterCheckpoint(Vec<String>),
+    #[error("the tracks to copy do not fit on the iPod; nothing was changed")]
+    NoSpace,
     #[error("the checks before writing failed, nothing was written to the iPod:\n  {}", .0.join("\n  "))]
     PreWriteCheck(Vec<String>),
     #[error(
@@ -85,6 +104,7 @@ impl Error {
     pub fn is_check_failure(&self) -> bool {
         match self {
             Error::PreWriteCheck(_)
+            | Error::CheckAfterCheckpoint(_)
             | Error::Verification { .. }
             | Error::WriteIncomplete { .. } => true,
             Error::UndoFailed { cause, .. } => cause.is_check_failure(),

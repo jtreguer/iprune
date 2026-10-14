@@ -833,6 +833,7 @@ impl Ui {
             .default_width(760)
             .default_height(600)
             .build();
+        let gone = Rc::new(Cell::new(false));
         {
             let ui = Rc::downgrade(self);
             // A close request (the window manager's close key too) is
@@ -842,8 +843,10 @@ impl Ui {
                 _ => glib::Propagation::Proceed,
             });
             let ui = Rc::downgrade(self);
+            let gone = gone.clone();
             // Closed during planning, the sync is over when the worker is.
             dialog.connect_destroy(move |_| {
+                gone.set(true);
                 if let Some(ui) = ui.upgrade()
                     && !ui.planning.get()
                 {
@@ -869,11 +872,15 @@ impl Ui {
             let result = gio::spawn_blocking(move || sync_job::plan(&config, &paths)).await;
             let Some(ui) = ui.upgrade() else { return };
             ui.planning.set(false);
-            let Some(dialog) = dialog_weak.upgrade() else {
-                // The dialog was closed while planning: the sync ends now.
-                ui.syncing.set(false);
-                ui.refresh_device();
-                return;
+            // Destroyed while planning (a reference may outlive the window,
+            // so the flag is checked too): the sync ends now.
+            let dialog = match dialog_weak.upgrade() {
+                Some(d) if !gone.get() => d,
+                _ => {
+                    ui.syncing.set(false);
+                    ui.refresh_device();
+                    return;
+                }
             };
             // The scan may have changed the index: show the library as it is.
             ui.refresh();
@@ -915,35 +922,16 @@ impl Ui {
         summary.set_selectable(true);
         page.append(&summary);
 
-        let mut note = format!(
-            "This version applies playlist changes only: {}. Track copies, removals and tag \
-             updates are listed but come with a later version.",
-            match planned.ops {
-                0 => "nothing to apply".to_owned(),
-                1 => "1 change".to_owned(),
-                n => format!("{n} changes"),
-            }
-        );
-        match planned.left_out {
-            0 => {}
-            1 => note.push_str(
-                " 1 playlist entry points to a track not on the iPod yet and is left out for now.",
-            ),
-            n => note.push_str(&format!(
-                " {n} playlist entries point to tracks not on the iPod yet and are left out for now."
-            )),
-        }
+        let mut note = planned.to_apply.clone();
         if !planned.fits {
-            note.push_str(
-                " The track copies above would not fit on the iPod; playlist changes need no space.",
-            );
+            note.push_str(" The tracks to copy do not fit on the iPod: Apply is not possible.");
         }
         let note = gtk::Label::new(Some(&note));
         note.set_wrap(true);
         note.set_xalign(0.0);
         page.append(&note);
 
-        let allow = gtk::CheckButton::with_label("Delete these playlists on the iPod anyway");
+        let allow = gtk::CheckButton::with_label("Remove them from the iPod anyway");
         if let Some(why) = &planned.mass_removal {
             let warn = gtk::Label::new(Some(why));
             warn.set_wrap(true);
@@ -972,8 +960,12 @@ impl Ui {
         let cancel = gtk::Button::with_mnemonic("_Cancel");
         let apply = gtk::Button::with_mnemonic("_Apply");
         apply.add_css_class("suggested-action");
-        let (ops, mass) = (planned.ops, planned.mass_removal.is_some());
-        let ready = move |allowed: bool| ops > 0 && (!mass || allowed);
+        let (some, fits, mass) = (
+            !planned.work.is_empty(),
+            planned.fits,
+            planned.mass_removal.is_some(),
+        );
+        let ready = move |allowed: bool| some && fits && (!mass || allowed);
         apply.set_sensitive(ready(allow.is_active()));
         {
             let apply = apply.clone();
@@ -1006,48 +998,78 @@ impl Ui {
         self: &Rc<Self>,
         dialog: &gtk::Window,
         stack: &gtk::Stack,
-        work: iprune_core::exec::Work,
+        work: iprune_core::exec::FullWork,
         allow: bool,
     ) {
         // Set before anything else: a second Apply does nothing.
         if self.writing.replace(true) {
             return;
         }
-        working_page(stack, "Writing to the iPod… Do not disconnect it.");
         // Neither this dialog nor the window may close while the iPod is
         // written (see their close-request handlers); the application stays
         // up until the worker is done.
         dialog.set_deletable(false);
         let hold = self.window.application().map(|a| a.hold());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let progress_page =
+            ProgressPage::new(stack, cancel.clone(), !work.tracks.copies.is_empty());
+        let (tx, rx) = async_channel::unbounded::<iprune_core::exec::Progress>();
+        {
+            let page = progress_page.clone();
+            glib::spawn_future_local(async move {
+                while let Ok(p) = rx.recv().await {
+                    page.show(&p);
+                }
+            });
+        }
         let config = self.data.config().clone();
         let paths = self.data.paths().clone();
         let ui = Rc::downgrade(self);
         let (dialog, stack) = (dialog.clone(), stack.clone());
         glib::spawn_future_local(async move {
-            let result =
-                gio::spawn_blocking(move || sync_job::apply(&config, &paths, &work, allow)).await;
+            let result = gio::spawn_blocking(move || {
+                let progress = |p: iprune_core::exec::Progress| {
+                    let _ = tx.send_blocking(p);
+                };
+                sync_job::apply(&config, &paths, &work, allow, &progress, &cancel)
+            })
+            .await;
             drop(hold);
             dialog.set_deletable(true);
             let Some(ui) = ui.upgrade() else { return };
             ui.writing.set(false);
             match joined(result) {
                 Ok(done) => {
-                    let mut text = match done.applied {
-                        0 => "Nothing needed applying.".to_owned(),
-                        n => format!(
-                            "Applied {n} playlist changes to the iPod and verified them by reading the database back."
+                    let (title, mut text) = match &done.stopped {
+                        None => ("Sync done", String::new()),
+                        Some(why) => (
+                            "The sync stopped early",
+                            format!(
+                                "It stopped ({why}). What was done before is written and verified; the next sync continues.\n"
+                            ),
                         ),
                     };
+                    if done.stamp.is_none() {
+                        text.push_str("Nothing needed applying.");
+                    } else {
+                        text.push_str(&format!(
+                            "Copied {} tracks ({}), copied {} again, removed {}, updated the tags of {} and made {} playlist changes, then verified the iPod database by reading it back.",
+                            done.copied,
+                            iprune_core::sync::bytes(done.bytes),
+                            done.recopied,
+                            done.removed,
+                            done.retagged,
+                            done.applied
+                        ));
+                        text.push_str(&format!(
+                            "\nStatistics updated for {} tracks ({} new plays).",
+                            done.stats_tracks, done.plays
+                        ));
+                    }
                     if done.recovered > 0 {
                         text.push_str(&format!(
                             "\nAn earlier sync stopped before writing; its statistics for {} tracks were undone first.",
                             done.recovered
-                        ));
-                    }
-                    if done.applied > 0 {
-                        text.push_str(&format!(
-                            "\nStatistics updated for {} tracks ({} new plays).",
-                            done.stats_tracks, done.plays
                         ));
                     }
                     if let Some(stamp) = &done.stamp {
@@ -1055,10 +1077,13 @@ impl Ui {
                             "\nBackup {stamp}: `iprune restore {stamp}` puts the previous database back."
                         ));
                     }
+                    for (path, why) in &done.skipped {
+                        text.push_str(&format!("\nNot copied, {why}: {}", path.display()));
+                    }
                     for w in &done.warnings {
                         text.push_str(&format!("\nWarning: {w}"));
                     }
-                    result_page(&dialog, &stack, "Sync done", &text);
+                    result_page(&dialog, &stack, title, &text);
                 }
                 Err(e) => result_page(&dialog, &stack, "The sync stopped", &format!("{e:#}")),
             }
@@ -1280,6 +1305,103 @@ fn result_page(dialog: &gtk::Window, stack: &gtk::Stack, title: &str, text: &str
     page.append(&close);
     stack.add_child(&page);
     stack.set_visible_child(&page);
+}
+
+/// The dialog page shown while a sync writes: what it is doing, a bar for
+/// the copies, and a button that stops after the current file.
+#[derive(Clone)]
+struct ProgressPage {
+    label: gtk::Label,
+    bar: gtk::ProgressBar,
+    stop: gtk::Button,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ProgressPage {
+    /// `copies`: whether there is anything Stop can stop.
+    fn new(
+        stack: &gtk::Stack,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        copies: bool,
+    ) -> Self {
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        page.set_valign(gtk::Align::Center);
+        page.set_margin_start(32);
+        page.set_margin_end(32);
+        let heading = gtk::Label::new(Some("Syncing… Do not disconnect the iPod."));
+        heading.add_css_class("title-3");
+        let label = gtk::Label::new(Some("Starting…"));
+        label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        let bar = gtk::ProgressBar::new();
+        let stop = gtk::Button::with_mnemonic("_Stop after this file");
+        stop.set_halign(gtk::Align::Center);
+        {
+            let label = label.clone();
+            let cancel = cancel.clone();
+            stop.connect_clicked(move |b| {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                b.set_sensitive(false);
+                label.set_text("Stopping after the current file…");
+            });
+        }
+        page.append(&heading);
+        page.append(&label);
+        page.append(&bar);
+        stop.set_visible(copies);
+        bar.set_visible(copies);
+        page.append(&stop);
+        stack.add_child(&page);
+        stack.set_visible_child(&page);
+        ProgressPage {
+            label,
+            bar,
+            stop,
+            cancel,
+        }
+    }
+
+    fn show(&self, p: &iprune_core::exec::Progress) {
+        use iprune_core::exec::Progress;
+        match p {
+            Progress::Removing { done, total } => {
+                self.label
+                    .set_text(&format!("Removing tracks: {done} of {total}"));
+            }
+            Progress::Copying {
+                done,
+                total,
+                bytes,
+                bytes_total,
+                name,
+            } => {
+                // Stop is back once a checkpoint's write is done, unless
+                // it was pressed.
+                let cancelled = self.cancel.load(std::sync::atomic::Ordering::Relaxed);
+                self.stop
+                    .set_sensitive(sync_job::stop_enabled(p, cancelled).unwrap_or(false));
+                if cancelled {
+                    self.label.set_text("Stopping after the current file…");
+                    return;
+                }
+                let shown = (*done + 1).min(*total);
+                self.label.set_text(&format!(
+                    "Copying {shown} of {total} ({} of {}): {name}",
+                    iprune_core::sync::bytes(*bytes),
+                    iprune_core::sync::bytes(*bytes_total)
+                ));
+                if *bytes_total > 0 {
+                    self.bar.set_fraction(*bytes as f64 / *bytes_total as f64);
+                }
+            }
+            Progress::Writing => {
+                // Not while a write is under way.
+                self.stop
+                    .set_sensitive(sync_job::stop_enabled(p, false).unwrap_or(false));
+                self.label.set_text("Writing the iPod database…");
+            }
+            Progress::Verifying => self.label.set_text("Reading it back to verify…"),
+        }
+    }
 }
 
 fn action(

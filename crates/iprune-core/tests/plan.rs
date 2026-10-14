@@ -591,6 +591,46 @@ fn a_real_change_sends_the_trimmed_nfc_library_value() {
     assert_eq!(got[0].ipod.as_deref(), Some("Old"));
 }
 
+// Prevents a multi-value tag (ID3v2.4 joins values with NUL) from reaching
+// the iPod's C string cut at the first value.
+#[test]
+fn a_nul_separated_library_value_is_sent_as_its_parts_joined_with_a_slash() {
+    let table = [
+        ("two values", "A\0B", "A/B"),
+        ("trailing NUL", "Title\0", "Title"),
+        ("leading NUL", "\0Title", "Title"),
+        ("empty part between", "A\0\0B", "A/B"),
+        ("parts trimmed", " A  \0  B ", "A/B"),
+        ("three values", "A\0B\0C", "A/B/C"),
+    ];
+    for (name, raw, want) in table {
+        let got = pairs(&all_text(raw), &Tags::default());
+        assert_eq!(got.len(), 6, "{name}: {got:?}");
+        assert!(
+            got.iter()
+                .all(|(_, ipod, lib)| ipod.is_none() && lib == want)
+        );
+        // And it is no change once the iPod holds the joined value.
+        assert_eq!(pairs(&all_text(raw), &all_text(want)), vec![], "{name}");
+    }
+}
+
+// Prevents "\0" from counting as a value that clears the iPod's.
+#[test]
+fn a_library_value_of_only_nuls_is_empty_and_never_clears_the_ipod() {
+    for raw in ["\0", "\0\0", " \0 "] {
+        assert_eq!(pairs(&all_text(raw), &all_text("Kept")), vec![], "{raw:?}");
+        assert_eq!(pairs(&all_text(raw), &Tags::default()), vec![], "{raw:?}");
+    }
+}
+
+#[test]
+fn a_nul_separated_ipod_value_is_compared_joined_too() {
+    assert_eq!(pairs(&all_text("A/B"), &all_text("A\0B")), vec![]);
+    let got = pairs(&all_text("A/C"), &all_text("A\0B"));
+    assert_eq!(got.len(), 6, "{got:?}");
+}
+
 // An iPod value with padding still differs from another text.
 #[test]
 fn a_padded_ipod_value_against_a_different_library_value_is_a_change() {
@@ -1947,4 +1987,76 @@ fn names_and_members(e: &[ExpectedPlaylist]) -> Vec<(String, Vec<Member>)> {
     e.iter()
         .map(|e| (e.name.clone(), e.members.clone()))
         .collect()
+}
+
+// ---- sample rate
+
+fn at_rate(w: &mut World, id: i64, rate: Option<u32>) {
+    w.lib_mut(id).info.samplerate = rate;
+}
+
+#[test]
+fn a_new_file_above_48_khz_is_skipped_with_its_own_reason() {
+    for (rate, copied) in [
+        (None, true),
+        (Some(44_100), true),
+        (Some(48_000), true),
+        (Some(48_001), false),
+        (Some(96_000), false),
+    ] {
+        let mut w = World::default();
+        w.fresh(1);
+        at_rate(&mut w, 1, rate);
+        w.playlist(10, "Hi", &ids(&[1]), None);
+        let p = w.plan();
+        assert_eq!(p.copy.len(), usize::from(copied), "{rate:?}: {p:?}");
+        if copied {
+            assert!(p.skipped.is_empty(), "{rate:?}");
+        } else {
+            assert_eq!(p.skipped.len(), 1, "{rate:?}");
+            assert_eq!(p.skipped[0].reason, SkipReason::SampleRate);
+            assert_eq!(
+                p.entries_skipped,
+                vec![EntrySkipped {
+                    playlist: "Hi".into(),
+                    position: 1,
+                    reason: EntryReason::TrackSkipped,
+                }]
+            );
+            assert_eq!(p.expected.track_count, 0);
+        }
+    }
+}
+
+#[test]
+fn a_synced_file_whose_audio_became_too_fast_is_left_as_it_is() {
+    let change = |w: &mut World, rate| {
+        let t = w.lib_mut(1);
+        t.size += 10;
+        t.info.duration_ms = Some(MS + 5_000);
+        at_rate(w, 1, rate);
+    };
+    let mut w = World::default();
+    w.synced(1, 0xA1);
+    change(&mut w, Some(48_000));
+    assert_eq!(w.plan().replace.len(), 1, "48 kHz is replaced as usual");
+
+    let mut w = World::default();
+    w.synced(1, 0xA1);
+    change(&mut w, Some(96_000));
+    let p = w.plan();
+    assert!(p.replace.is_empty() && p.copy.is_empty(), "{p:?}");
+    assert!(p.remove.is_empty(), "the old audio stays on the iPod");
+}
+
+#[test]
+fn a_stale_mapping_of_a_too_fast_file_is_skipped_not_copied() {
+    let mut w = World::default();
+    w.synced(1, 0xA1);
+    at_rate(&mut w, 1, Some(96_000));
+    w.device.tracks.clear();
+    let p = w.plan();
+    assert!(p.copy.is_empty());
+    assert_eq!(p.skipped.len(), 1);
+    assert_eq!(p.skipped[0].reason, SkipReason::SampleRate);
 }

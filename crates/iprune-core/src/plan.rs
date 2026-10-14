@@ -215,6 +215,15 @@ pub struct Unmanaged {
 pub enum SkipReason {
     /// An iTunes Store purchase the iPod may not be authorised to play.
     FairPlay,
+    /// Sampled above 48 kHz, which the iPod Classic cannot play.
+    SampleRate,
+}
+
+/// The highest sample rate an iPod Classic plays.
+const MAX_SAMPLE_RATE: u32 = 48_000;
+
+fn too_fast(t: &TrackRow) -> bool {
+    t.info.samplerate.is_some_and(|r| r > MAX_SAMPLE_RATE)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -305,9 +314,21 @@ impl Plan {
 }
 
 /// A tag value without surrounding spaces (ID3v1 pads with them) and in NFC,
-/// so the same text stored two ways compares equal. `None` when empty.
-fn clean(s: &Option<String>) -> Option<String> {
-    let s = s.as_deref()?.trim();
+/// so the same text stored two ways compares equal. Values separated by NUL
+/// (ID3v2.4), which the iPod's C strings cannot hold, are joined with "/".
+/// `None` when empty.
+pub(crate) fn clean(s: &Option<String>) -> Option<String> {
+    let s = s.as_deref()?;
+    let s = if s.contains('\0') {
+        let parts: Vec<&str> = s
+            .split('\0')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        std::borrow::Cow::Owned(parts.join("/"))
+    } else {
+        std::borrow::Cow::Borrowed(s.trim())
+    };
     (!s.is_empty()).then(|| s.nfc().collect())
 }
 
@@ -447,11 +468,14 @@ pub fn plan(input: &PlanInput) -> Plan {
             });
         }
         match mapping.filter(|m| on_ipod.contains_key(&m.dbid)) {
-            None if t.drm => {
+            None if t.drm || too_fast(t) => {
                 plan.skipped.push(Skipped {
                     track_id: id,
                     path: t.path.clone(),
-                    reason: SkipReason::FairPlay,
+                    reason: match t.drm {
+                        true => SkipReason::FairPlay,
+                        false => SkipReason::SampleRate,
+                    },
                 });
                 continue;
             }
@@ -466,7 +490,7 @@ pub fn plan(input: &PlanInput) -> Plan {
             Some(m) => {
                 let it = on_ipod[&m.dbid];
                 // A protected file already on the iPod stays as it is.
-                if !t.drm && audio_changed(t, m) {
+                if !t.drm && !too_fast(t) && audio_changed(t, m) {
                     plan.replace.push(ReplaceOp {
                         track_id: id,
                         old_dbid: m.dbid,

@@ -366,3 +366,317 @@ fn more_deletions_than_playlists_reports_a_problem_instead_of_panicking() {
     let p = verify::pre_write(&before(), &before(), &managed(), &[1, 2, 3, 4, 5], 0);
     assert!(!p.is_empty());
 }
+
+// ---- verify::check: tracks removed, added, copied again and retagged
+
+use iprune_core::verify::Expect;
+use std::collections::{HashMap, HashSet};
+
+/// Tracks 1..=3, all in the master playlist; Road (100) [1, 2, 2], Mix (200)
+/// [3], and Keep (300) [1, 3], which iprune does not manage.
+fn full_before() -> Contents {
+    let mut b = before();
+    b.master_members = vec![1, 2, 3];
+    b.playlists[2] = pl(300, "Keep", &[1, 3]);
+    b
+}
+
+fn expect() -> Expect {
+    Expect {
+        managed: managed(),
+        ..Expect::default()
+    }
+}
+
+fn run(after: &Contents, e: &Expect) -> Vec<String> {
+    verify::check(&full_before(), after, e, None)
+}
+
+#[test]
+fn check_with_nothing_expected_passes_an_unchanged_database() {
+    assert_eq!(run(&full_before(), &expect()), Vec::<String>::new());
+}
+
+#[test]
+fn a_removed_track_must_leave_the_tracks_the_master_and_unmanaged_playlists() {
+    // Track 3 goes. Mix is managed and says it is empty afterwards.
+    let e = Expect {
+        removed: HashSet::from([3]),
+        managed: vec![ep(100, "Road", &[1, 2, 2]), ep(200, "Mix", &[])],
+        ..Expect::default()
+    };
+    let mut after = full_before();
+    after.tracks.pop();
+    after.master_members = vec![1, 2];
+    after.playlists[1].members = vec![];
+    after.playlists[2].members = vec![1];
+    assert_eq!(run(&after, &e), Vec::<String>::new());
+
+    // Still in the tracks.
+    let mut bad = after.clone();
+    bad.tracks.push(track(3));
+    has(run(&bad, &e), "the tracks changed (3 before, 3 now)");
+    // Still in the master playlist.
+    let mut bad = after.clone();
+    bad.master_members = vec![1, 2, 3];
+    has(run(&bad, &e), "master playlist's members");
+    // Still in an unmanaged playlist (which would also dangle).
+    let mut bad = after.clone();
+    bad.playlists[2].members = vec![1, 3];
+    has(run(&bad, &e), "unmanaged playlist \"Keep\" changed");
+    // An unmanaged playlist that lost something else as well.
+    let mut bad = after.clone();
+    bad.playlists[2].members = vec![];
+    has(run(&bad, &e), "unmanaged playlist \"Keep\" changed");
+}
+
+#[test]
+fn a_track_that_vanishes_without_being_expected_to_is_a_problem() {
+    let mut after = full_before();
+    after.tracks.remove(1);
+    after.master_members = vec![1, 3];
+    after.playlists[0].members = vec![1];
+    let p = run(&after, &expect());
+    has(p.clone(), "the tracks changed (3 before, 2 now)");
+    has(p, "master playlist's members");
+}
+
+#[test]
+fn removing_a_track_lets_no_other_track_change() {
+    let e = Expect {
+        removed: HashSet::from([3]),
+        managed: vec![ep(100, "Road", &[1, 2, 2]), ep(200, "Mix", &[])],
+        ..Expect::default()
+    };
+    let mut after = full_before();
+    after.tracks.pop();
+    after.master_members = vec![1, 2];
+    after.playlists[1].members = vec![];
+    after.playlists[2].members = vec![1];
+    after.tracks[0].adopt.size += 1;
+    only(run(&after, &e), "track 0000000000000001 differs");
+}
+
+#[test]
+fn an_added_track_goes_at_the_end_of_the_tracks_and_the_master_playlist() {
+    let e = Expect {
+        added: vec![7, 8],
+        managed: vec![ep(100, "Road", &[1, 2, 2, 7]), ep(200, "Mix", &[3])],
+        ..expect()
+    };
+    let mut after = full_before();
+    after.tracks.extend([track(7), track(8)]);
+    after.master_members = vec![1, 2, 3, 7, 8];
+    after.playlists[0].members = vec![1, 2, 2, 7];
+    assert_eq!(run(&after, &e), Vec::<String>::new());
+
+    // Not at the end of the master playlist, or not in the same order.
+    for wrong in [
+        vec![7, 8, 1, 2, 3],
+        vec![1, 2, 3, 8, 7],
+        vec![1, 2, 3, 7],
+        vec![1, 2, 3],
+    ] {
+        let mut bad = after.clone();
+        bad.master_members = wrong.clone();
+        has(run(&bad, &e), "master playlist's members");
+    }
+    // One of them missing from the tracks.
+    let mut bad = after.clone();
+    bad.tracks.pop();
+    has(run(&bad, &e), "the tracks changed (3 before, 4 now)");
+    // An extra track nobody asked for.
+    let mut bad = after.clone();
+    bad.tracks.push(track(9));
+    has(run(&bad, &e), "1 unexpected");
+    // Added tracks are in no unmanaged playlist.
+    let mut bad = after.clone();
+    bad.playlists[2].members = vec![1, 3, 7];
+    has(run(&bad, &e), "unmanaged playlist \"Keep\" changed");
+}
+
+#[test]
+fn an_added_track_without_a_file_is_a_problem_whether_or_files_are_checked() {
+    let e = Expect {
+        added: vec![7],
+        managed: managed(),
+        ..Expect::default()
+    };
+    let mut after = full_before();
+    let mut t = track(7);
+    t.ipod_path = None;
+    after.tracks.push(t);
+    after.master_members.push(7);
+    only(run(&after, &e), "track 0000000000000007 has no file");
+}
+
+#[test]
+fn the_file_of_an_added_or_recopied_track_must_exist_when_files_are_checked() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("iPod_Control/Music/F00")).unwrap();
+    let e = Expect {
+        added: vec![7],
+        recopied: HashSet::from([2]),
+        managed: managed(),
+        ..Expect::default()
+    };
+    let mut after = full_before();
+    after.tracks.push(track(7));
+    after.master_members.push(7);
+    after.tracks[1].ipod_path = Some(":iPod_Control:Music:F00:B.mp3".into());
+    let files = |root: &std::path::Path| verify::check(&full_before(), &after, &e, Some(root));
+
+    // Both files missing: both are named.
+    let p = files(root.path());
+    assert_eq!(p.len(), 2, "{p:?}");
+    has(p.clone(), "the file of track 0000000000000007 is missing");
+    has(p, "the file of track 0000000000000002 is missing");
+    // Not looking at files, nothing to complain about.
+    assert!(run(&after, &e).is_empty());
+    // One present.
+    std::fs::write(root.path().join("iPod_Control/Music/F00/A.mp3"), b"x").unwrap();
+    only(files(root.path()), "track 0000000000000002");
+    // Both present.
+    std::fs::write(root.path().join("iPod_Control/Music/F00/B.mp3"), b"x").unwrap();
+    assert_eq!(files(root.path()), Vec::<String>::new());
+    // A directory is not a file.
+    std::fs::remove_file(root.path().join("iPod_Control/Music/F00/B.mp3")).unwrap();
+    std::fs::create_dir(root.path().join("iPod_Control/Music/F00/B.mp3")).unwrap();
+    only(files(root.path()), "track 0000000000000002");
+}
+
+#[test]
+fn a_path_that_leaves_the_ipod_never_counts_as_a_file() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = root.path().join("outside.mp3");
+    std::fs::write(&outside, b"x").unwrap();
+    let mount = root.path().join("ipod");
+    std::fs::create_dir(&mount).unwrap();
+    let e = Expect {
+        added: vec![7],
+        managed: managed(),
+        ..Expect::default()
+    };
+    let mut after = full_before();
+    let mut t = track(7);
+    t.ipod_path = Some(":..:outside.mp3".into());
+    after.tracks.push(t);
+    after.master_members.push(7);
+    let p = verify::check(&full_before(), &after, &e, Some(&mount));
+    has(p, "the file of track 0000000000000007 is missing");
+}
+
+#[test]
+fn a_recopied_track_may_change_its_file_and_size_but_not_lose_it() {
+    let e = Expect {
+        recopied: HashSet::from([2]),
+        managed: managed(),
+        ..Expect::default()
+    };
+    let mut after = full_before();
+    after.tracks[1].adopt.size = 5000;
+    after.tracks[1].adopt.duration_ms = 9000;
+    after.tracks[1].ipod_path = Some(":iPod_Control:Music:F09:NEW.mp3".into());
+    assert_eq!(run(&after, &e), Vec::<String>::new());
+    // The same change without saying so is refused.
+    only(run(&after, &expect()), "track 0000000000000002 differs");
+    // A recopied track without a file, reported once.
+    after.tracks[1].ipod_path = None;
+    only(run(&after, &e), "track 0000000000000002 has no file");
+    // A recopied track still on its old file: the file deleted after the
+    // write would be its new audio.
+    after.tracks[1].ipod_path = full_before().tracks[1].ipod_path.clone();
+    only(
+        run(&after, &e),
+        "recopied track 0000000000000002 still uses its old file",
+    );
+    // Another track changing alongside is still caught.
+    let mut after = full_before();
+    after.tracks[1].adopt.size = 5000;
+    after.tracks[1].ipod_path = Some(":iPod_Control:Music:F09:NEW.mp3".into());
+    after.tracks[2].adopt.size = 5000;
+    only(run(&after, &e), "track 0000000000000003 differs");
+}
+
+fn retag_expect(id: u64, tags: Tags) -> Expect {
+    Expect {
+        retagged: HashMap::from([(id, tags)]),
+        managed: managed(),
+        ..Expect::default()
+    }
+}
+
+#[test]
+fn a_retagged_track_must_have_exactly_the_tags_set_and_nothing_else_changed() {
+    let want = Tags {
+        title: Some("New".into()),
+        year: Some(2001),
+        ..Tags::default()
+    };
+    let e = retag_expect(2, want.clone());
+    let mut after = full_before();
+    after.tracks[1].tags = want.clone();
+    after.tracks[1].adopt.title = want.title.clone();
+    assert_eq!(run(&after, &e), Vec::<String>::new());
+
+    // Tags not the ones set: the old ones, or one field off.
+    let mut bad = after.clone();
+    bad.tracks[1].tags = Tags::default();
+    only(
+        run(&bad, &e),
+        "track 0000000000000002 does not have the tags set",
+    );
+    let mut bad = after.clone();
+    bad.tracks[1].tags.year = Some(2002);
+    only(run(&bad, &e), "does not have the tags set");
+    // The right tags, but the file or the size moved too.
+    let mut bad = after.clone();
+    bad.tracks[1].adopt.size += 1;
+    only(
+        run(&bad, &e),
+        "track 0000000000000002 changed more than its tags",
+    );
+    let mut bad = after.clone();
+    bad.tracks[1].ipod_path = Some(":iPod_Control:Music:F00:OTHER.mp3".into());
+    only(run(&bad, &e), "changed more than its tags");
+    // Another track's tags changing is not allowed by this retag.
+    let mut bad = after.clone();
+    bad.tracks[0].tags.artist = Some("Sneaky".into());
+    only(run(&bad, &e), "track 0000000000000001 differs");
+}
+
+#[test]
+fn a_track_not_listed_as_retagged_may_not_change_its_tags() {
+    let mut after = full_before();
+    after.tracks[1].tags.title = Some("New".into());
+    only(run(&after, &expect()), "track 0000000000000002 differs");
+}
+
+#[test]
+fn playlists_created_deleted_and_track_changes_are_checked_together() {
+    // Remove track 3 (in Mix and Keep), delete Mix, create Fresh with the
+    // new track 7, all at once.
+    let e = Expect {
+        removed: HashSet::from([3]),
+        added: vec![7],
+        deleted: vec![200],
+        created: 1,
+        managed: vec![ep(100, "Road", &[1, 2, 2]), ep(400, "Fresh", &[7, 1])],
+        ..Expect::default()
+    };
+    let mut after = full_before();
+    after.tracks = vec![track(1), track(2), track(7)];
+    after.master_members = vec![1, 2, 7];
+    after.playlists = vec![
+        pl(100, "Road", &[1, 2, 2]),
+        pl(300, "Keep", &[1]),
+        pl(400, "Fresh", &[7, 1]),
+    ];
+    assert_eq!(run(&after, &e), Vec::<String>::new());
+    // Mix not deleted.
+    let mut bad = after.clone();
+    bad.playlists.push(pl(200, "Mix", &[]));
+    let p = run(&bad, &e);
+    has(p.clone(), "playlist 00000000000000c8 was not deleted");
+    has(p, "regular playlists, expected 3");
+}

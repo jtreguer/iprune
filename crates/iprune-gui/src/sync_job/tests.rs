@@ -10,6 +10,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{Env, IpodSpec, Kind, PlaylistSpec, fake_ipod, ipod_playlist};
 use iprune_core::config::Paths;
@@ -191,7 +192,10 @@ const SEVEN: [&str; 7] = ["P1", "P2", "P3", "P4", "P5", "P6", "P7"];
 fn plan_of_an_unchanged_library_has_nothing_to_apply() {
     let w = World::new(&[]);
     let p = w.plan();
-    assert_eq!((p.ops, p.left_out), (0, 0));
+    assert_eq!(
+        (p.work.playlists.ops.len(), p.work.playlists.left_out),
+        (0, 0)
+    );
     assert!(p.mass_removal.is_none());
     assert_eq!(p.ipod_name, "iPod de Test");
     assert!(p.scan.contains("3 unchanged, 0 added"), "{}", p.scan);
@@ -213,8 +217,8 @@ fn plan_counts_each_kind_of_playlist_change_and_lists_them() {
     w.write_list("Fresh", &[D3, D1]);
     let tree = w.tree();
     let p = w.plan();
-    assert_eq!(p.ops, 4);
-    assert_eq!(p.left_out, 0);
+    assert_eq!(p.work.playlists.ops.len(), 4);
+    assert_eq!(p.work.playlists.left_out, 0);
     assert!(p.mass_removal.is_none());
     assert!(
         p.summary
@@ -237,7 +241,7 @@ fn plan_counts_each_kind_of_playlist_change_and_lists_them() {
 }
 
 #[test]
-fn plan_leaves_out_entries_for_tracks_not_yet_on_the_ipod() {
+fn plan_copies_a_new_file_and_puts_it_in_its_playlist() {
     let w = World::new(&[]);
     let four = w.env.add("four.mp3", Kind::Mp3, 4);
     w.env.write_playlist(
@@ -245,9 +249,15 @@ fn plan_leaves_out_entries_for_tracks_not_yet_on_the_ipod() {
         &format!("{}\n{}\n", w.file_of(D1).display(), four.display()),
     );
     let p = w.plan();
-    // Road becomes [D1]: that is a change, and the new track is held back.
-    assert_eq!((p.ops, p.left_out), (1, 1));
+    // Road gets the new track, which this plan copies first.
+    assert_eq!(
+        (p.work.playlists.ops.len(), p.work.playlists.left_out),
+        (1, 0)
+    );
     assert_eq!(p.plan.copy.len(), 1);
+    assert_eq!(p.work.tracks.copies.len(), 1);
+    assert!(p.fits);
+    assert!(p.to_apply.contains("copies 1 track"), "{}", p.to_apply);
     assert!(p.scan.contains("1 added"), "{}", p.scan);
 }
 
@@ -258,14 +268,14 @@ fn plan_sets_mass_removal_only_for_many_deleted_playlists() {
         playlists::delete(w.env.store.conn(), &w.env.cfg, n).unwrap();
     }
     let p = w.plan();
-    assert_eq!(p.ops, 5);
+    assert_eq!(p.work.playlists.ops.len(), 5);
     assert!(p.mass_removal.is_none(), "5 deletions are not many");
 
     for n in &SEVEN[5..] {
         playlists::delete(w.env.store.conn(), &w.env.cfg, n).unwrap();
     }
     let p = w.plan();
-    assert_eq!(p.ops, 7);
+    assert_eq!(p.work.playlists.ops.len(), 7);
     let m = p.mass_removal.expect("7 of 9 mapped playlists");
     assert!(m.contains('7') && m.contains('9'), "{m}");
 }
@@ -279,7 +289,7 @@ fn plan_sees_playlist_files_deleted_from_disk() {
         fs::remove_file(w.env.playlist_file(n)).unwrap();
     }
     let p = w.plan();
-    assert_eq!(p.ops, 7);
+    assert_eq!(p.work.playlists.ops.len(), 7);
     assert!(p.mass_removal.is_some());
 }
 
@@ -308,7 +318,15 @@ fn apply_changes_the_ipod_and_reads_back() {
     assert!(w.snapshot().contains("Podcasts"));
 
     let p = w.plan();
-    let done = apply(&w.env.cfg, &w.paths, &p.work, false).unwrap();
+    let done = apply(
+        &w.env.cfg,
+        &w.paths,
+        &p.work,
+        false,
+        &|_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
 
     assert_eq!(done.applied, 4);
     assert!(done.warnings.is_empty(), "{:?}", done.warnings);
@@ -330,15 +348,32 @@ fn after_apply_the_next_plan_is_empty_and_applies_nothing() {
     w.write_list("Road", &[D2, D1]);
     let p = w.plan();
     assert_eq!(
-        apply(&w.env.cfg, &w.paths, &p.work, false).unwrap().applied,
+        apply(
+            &w.env.cfg,
+            &w.paths,
+            &p.work,
+            false,
+            &|_| {},
+            &AtomicBool::new(false)
+        )
+        .unwrap()
+        .applied,
         1
     );
 
     let again = w.plan();
-    assert_eq!(again.ops, 0);
+    assert_eq!(again.work.playlists.ops.len(), 0);
     assert!(again.plan.playlists.is_empty());
     let tree = w.tree();
-    let done = apply(&w.env.cfg, &w.paths, &again.work, false).unwrap();
+    let done = apply(
+        &w.env.cfg,
+        &w.paths,
+        &again.work,
+        false,
+        &|_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert_eq!(done.applied, 0);
     assert_eq!(w.tree(), tree);
     assert_eq!(w.backups().len(), 1, "only the first apply backed up");
@@ -354,7 +389,15 @@ fn apply_refuses_a_plan_that_no_longer_matches_and_writes_nothing() {
     w.write_list("Road", &[D3]);
     w.reload();
     let tree = w.tree();
-    let e = apply(&w.env.cfg, &w.paths, &p.work, false).unwrap_err();
+    let e = apply(
+        &w.env.cfg,
+        &w.paths,
+        &p.work,
+        false,
+        &|_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
     assert!(format!("{e:#}").contains("changed since the plan"), "{e:#}");
     assert_eq!(w.tree(), tree, "the iPod is byte-identical");
     assert!(w.backups().is_empty(), "no backup either");
@@ -364,7 +407,16 @@ fn apply_refuses_a_plan_that_no_longer_matches_and_writes_nothing() {
     // A fresh plan goes through.
     let p = w.plan();
     assert_eq!(
-        apply(&w.env.cfg, &w.paths, &p.work, false).unwrap().applied,
+        apply(
+            &w.env.cfg,
+            &w.paths,
+            &p.work,
+            false,
+            &|_| {},
+            &AtomicBool::new(false)
+        )
+        .unwrap()
+        .applied,
         1
     );
     assert_eq!(w.members("Road"), Some(vec![D3]));
@@ -387,7 +439,15 @@ fn apply_refuses_when_the_ipod_changed_since_the_plan() {
     db.write().unwrap();
     drop(db);
     let tree = w.tree();
-    let e = apply(&w.env.cfg, &w.paths, &p.work, false).unwrap_err();
+    let e = apply(
+        &w.env.cfg,
+        &w.paths,
+        &p.work,
+        false,
+        &|_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
     assert!(format!("{e:#}").contains("changed since the plan"), "{e:#}");
     assert_eq!(w.tree(), tree);
     assert!(w.backups().is_empty());
@@ -398,7 +458,15 @@ fn apply_with_no_changes_writes_nothing_and_takes_no_backup() {
     let w = World::new(&[]);
     let p = w.plan();
     let tree = w.tree();
-    let done = apply(&w.env.cfg, &w.paths, &p.work, false).unwrap();
+    let done = apply(
+        &w.env.cfg,
+        &w.paths,
+        &p.work,
+        false,
+        &|_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert_eq!(
         (done.applied, done.stats_tracks, done.plays, done.recovered),
         (0, 0, 0, 0)
@@ -419,7 +487,15 @@ fn apply_refuses_a_mass_removal_without_the_flag_and_allows_it_with() {
     assert!(p.mass_removal.is_some());
     let tree = w.tree();
 
-    let e = apply(&w.env.cfg, &w.paths, &p.work, false).unwrap_err();
+    let e = apply(
+        &w.env.cfg,
+        &w.paths,
+        &p.work,
+        false,
+        &|_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
     assert!(format!("{e:#}").contains('7'), "{e:#}");
     assert_eq!(w.tree(), tree, "the iPod is byte-identical");
     assert!(w.backups().is_empty());
@@ -427,7 +503,15 @@ fn apply_refuses_a_mass_removal_without_the_flag_and_allows_it_with() {
         assert!(w.members(n).is_some(), "{n} still on the iPod");
     }
 
-    let done = apply(&w.env.cfg, &w.paths, &p.work, true).unwrap();
+    let done = apply(
+        &w.env.cfg,
+        &w.paths,
+        &p.work,
+        true,
+        &|_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert_eq!(done.applied, 7);
     for n in SEVEN {
         assert_eq!(w.members(n), None, "{n}");
@@ -463,7 +547,15 @@ fn apply_pulls_play_counts_before_writing() {
     fs::write(w.root.join("iPod_Control/iTunes/Play Counts"), b).unwrap();
     w.write_list("Road", &[D2]);
     let p = w.plan();
-    let done = apply(&w.env.cfg, &w.paths, &p.work, false).unwrap();
+    let done = apply(
+        &w.env.cfg,
+        &w.paths,
+        &p.work,
+        false,
+        &|_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert_eq!((done.stats_tracks, done.plays), (1, 3));
 }
 
@@ -479,7 +571,15 @@ fn apply_ignores_a_change_in_free_space_since_the_plan() {
         vec![7u8; 8 << 20],
     )
     .unwrap();
-    let done = apply(&w.env.cfg, &w.paths, &p.work, false).unwrap();
+    let done = apply(
+        &w.env.cfg,
+        &w.paths,
+        &p.work,
+        false,
+        &|_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert_eq!(done.applied, 1);
     assert_eq!(w.members("Road"), Some(vec![D2, D1]));
 }
@@ -495,12 +595,20 @@ fn apply_refuses_after_a_playlist_edit_reaches_the_index() {
     let w = World::new(&[]);
     w.write_list("Mix", &[D3, D1]);
     let p = w.plan();
-    assert_eq!(p.ops, 1);
+    assert_eq!(p.work.playlists.ops.len(), 1);
     // The file is edited again and the window re-reads the folder.
     w.write_list("Mix", &[D1]);
     w.reload();
     let tree = w.tree();
-    let e = apply(&w.env.cfg, &w.paths, &p.work, false).unwrap_err();
+    let e = apply(
+        &w.env.cfg,
+        &w.paths,
+        &p.work,
+        false,
+        &|_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
     assert!(format!("{e:#}").contains("changed since the plan"), "{e:#}");
     assert_eq!(w.tree(), tree);
     assert!(w.backups().is_empty());
@@ -515,9 +623,181 @@ fn apply_applies_the_shown_plan_when_a_file_is_edited_but_not_yet_read() {
     w.write_list("Mix", &[D3, D1]);
     let p = w.plan();
     w.write_list("Mix", &[D1]);
-    let done = apply(&w.env.cfg, &w.paths, &p.work, false).unwrap();
+    let done = apply(
+        &w.env.cfg,
+        &w.paths,
+        &p.work,
+        false,
+        &|_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert_eq!(done.applied, 1);
     assert_eq!(w.members("Mix"), Some(vec![D3, D1]), "what the user saw");
     // The next plan picks the edit up.
-    assert_eq!(w.plan().ops, 1);
+    assert_eq!(w.plan().work.playlists.ops.len(), 1);
+}
+
+// ---- tracks
+
+fn no_cancel() -> AtomicBool {
+    AtomicBool::new(false)
+}
+
+#[test]
+fn apply_copies_new_files_reports_progress_and_the_next_plan_is_empty() {
+    let w = World::new(&[]);
+    let four = w.env.add("four.mp3", Kind::Mp3, 4);
+    w.env.write_playlist(
+        "Road",
+        &format!("{}\n{}\n", w.file_of(D1).display(), four.display()),
+    );
+    let p = w.plan();
+    assert_eq!(p.work.tracks.copies.len(), 1);
+    let dbid = p.work.tracks.copies[0].dbid;
+    let seen = std::cell::RefCell::new(Vec::new());
+    let done = apply(
+        &w.env.cfg,
+        &w.paths,
+        &p.work,
+        false,
+        &|e| seen.borrow_mut().push(e),
+        &no_cancel(),
+    )
+    .unwrap();
+    assert_eq!(
+        (done.copied, done.recopied, done.removed, done.retagged),
+        (1, 0, 0, 0)
+    );
+    assert_eq!(done.bytes, fs::metadata(&four).unwrap().len());
+    assert_eq!(done.stopped, None);
+    assert!(done.skipped.is_empty() && done.warnings.is_empty());
+    assert_eq!(w.members("Road"), Some(vec![D1, dbid]));
+    assert!(
+        seen.borrow()
+            .iter()
+            .any(|e| matches!(e, Progress::Copying { total: 1, .. }))
+    );
+    assert!(
+        seen.borrow()
+            .iter()
+            .any(|e| matches!(e, Progress::Verifying))
+    );
+
+    let again = w.plan();
+    assert!(again.work.is_empty(), "{:?}", again.work);
+    assert_eq!(again.to_apply, "Nothing to apply.");
+}
+
+#[test]
+fn apply_reports_a_file_that_vanished_after_the_plan_as_skipped() {
+    let w = World::new(&[]);
+    let four = w.env.add("four.mp3", Kind::Mp3, 4);
+    w.env.write_playlist(
+        "Road",
+        &format!("{}\n{}\n", w.file_of(D1).display(), four.display()),
+    );
+    let p = w.plan();
+    fs::remove_file(&four).unwrap();
+    // The window re-reads the index before applying, not the music folder,
+    // so the same work is rebuilt and the file is found missing at its turn.
+    let done = apply(&w.env.cfg, &w.paths, &p.work, false, &|_| {}, &no_cancel()).unwrap();
+    assert_eq!(done.copied, 0);
+    assert_eq!(done.skipped.len(), 1);
+    assert_eq!(done.skipped[0].0, four);
+    assert_eq!(done.stopped, None);
+    assert_eq!(
+        w.members("Road"),
+        Some(vec![D1]),
+        "the skipped file is left out of the playlist"
+    );
+}
+
+#[test]
+fn apply_stops_when_asked_and_says_so() {
+    let w = World::new(&[]);
+    let news: Vec<PathBuf> = (0..3)
+        .map(|k| w.env.add(&format!("n{k}.mp3"), Kind::Mp3, 40 + k))
+        .collect();
+    let text: String = news.iter().map(|f| format!("{}\n", f.display())).collect();
+    w.env.write_playlist("Fresh", &text);
+    let p = w.plan();
+    assert_eq!(p.work.tracks.copies.len(), 3);
+    let cancel = AtomicBool::new(false);
+    let progress = |e: Progress| {
+        if matches!(e, Progress::Copying { done: 1, .. }) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    };
+    let done = apply(&w.env.cfg, &w.paths, &p.work, false, &progress, &cancel).unwrap();
+    assert!(done.stopped.is_some());
+    assert_eq!(done.copied, 2);
+    assert_eq!(done.applied, 0);
+    assert_eq!(w.members("Fresh"), None, "playlists wait for the next sync");
+    // The next plan has the third copy and the playlist.
+    let rest = w.plan();
+    assert_eq!(rest.work.tracks.copies.len(), 1);
+    assert_eq!(rest.work.playlists.ops.len(), 1);
+}
+
+#[test]
+fn to_apply_names_each_kind_of_work() {
+    use iprune_core::transfer::TrackWork;
+    assert_eq!(to_apply(&FullWork::default()), "Nothing to apply.");
+    let w = World::new(&[]);
+    let four = w.env.add("four.mp3", Kind::Mp3, 4);
+    w.env
+        .write_playlist("Road", &format!("{}\n", four.display()));
+    let p = w.plan();
+    let line = to_apply(&p.work);
+    assert!(line.contains("copies 1 track "), "{line}");
+    assert!(line.contains("removes 0 tracks"), "{line}");
+    let only_playlists = FullWork {
+        tracks: TrackWork::default(),
+        ..p.work.clone()
+    };
+    assert!(to_apply(&only_playlists).contains("copies 0 tracks"));
+}
+
+fn copying() -> Progress {
+    Progress::Copying {
+        done: 1,
+        total: 3,
+        bytes: 10,
+        bytes_total: 30,
+        name: "a.mp3".into(),
+    }
+}
+
+// Prevents Stop staying off for good after the first checkpoint write.
+#[test]
+fn stop_comes_back_at_the_next_copy_after_a_write() {
+    // What the button's sensitivity does over a run with a checkpoint.
+    let mut enabled = true;
+    for p in [copying(), Progress::Writing, copying()] {
+        if let Some(e) = stop_enabled(&p, false) {
+            enabled = e;
+        }
+        if matches!(p, Progress::Writing) {
+            assert!(!enabled, "off while the database is written");
+        }
+    }
+    assert!(enabled, "on again at the next copy");
+}
+
+#[test]
+fn stop_stays_off_at_a_copy_once_pressed_and_during_a_write() {
+    assert_eq!(stop_enabled(&copying(), true), Some(false));
+    assert_eq!(stop_enabled(&Progress::Writing, true), Some(false));
+    assert_eq!(stop_enabled(&Progress::Writing, false), Some(false));
+    assert_eq!(stop_enabled(&copying(), false), Some(true));
+}
+
+#[test]
+fn stop_is_untouched_by_removing_and_verifying() {
+    assert_eq!(stop_enabled(&Progress::Verifying, false), None);
+    assert_eq!(
+        stop_enabled(&Progress::Removing { done: 0, total: 1 }, true),
+        None
+    );
 }

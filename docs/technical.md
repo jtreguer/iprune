@@ -468,7 +468,8 @@ Rules, in the order the planner applies them:
    since some are wrong by a factor of two to six. Otherwise,
    when its tag hash differs from the synced one, the fields where the
    library has a value the iPod lacks or differs from are updated. Text is
-   compared and sent trimmed and in NFC. An empty library field, spaces only
+   compared and sent trimmed and in NFC; values separated by NUL (ID3v2.4)
+   are joined with "/", since the iPod's strings cannot hold one. An empty library field, spaces only
    included, never clears an iPod value; a missing compilation mark never clears the iPod's.
 4. A mapped iPod track whose library file is gone, or that left the scope, is
    removed. Unmapped iPod tracks are kept and reported, or removed when
@@ -518,12 +519,20 @@ would otherwise be copied again.
 
 ### 11.2 Executor
 
-`exec.rs`. In M4 it applies the playlist operations only (`playlist_work`):
-members the plan copies are left out until M5 copies tracks, members it
-replaces keep their current dbid, and a member update that leaves the iPod
-list unchanged is dropped. `iprune sync` prints the plan, says what this
-version applies, and asks for confirmation (`--yes` skips it; declining
-exits with code 4).
+`exec.rs` applies a `FullWork` (`full_work`): the track part from
+`transfer::track_work` (removals, copies, copies of new audio into an
+existing track, tag updates, with the fields to set) and the playlist part
+from `playlist_work_with`. A new track's dbid is derived from the iPod's
+GUID and the library track (blake3, the first one not already on the
+iPod), so the same plan always gives the same work, which is how Apply in
+the window checks that it applies what was shown. Playlist members the plan
+copies take that dbid; a member update that leaves the iPod list unchanged
+is dropped. New audio for a track already on the iPod (a replace) is
+copied into the same iPod track: it keeps its dbid and its place in every
+playlist, unmanaged ones included. `iprune sync` prints the plan and what
+it applies, and asks for confirmation (`--yes` skips it; declining exits
+with code 4). `sync_playlists` (M4) is the same executor with no track
+part.
 
 Order of operations:
 
@@ -557,14 +566,27 @@ Order of operations:
    device's mappings). The folder is filled under a hidden name and renamed
    when complete.
 4. `itdb_start_sync`.
-5. Remove tracks: drop from all playlists, `itdb_track_remove`, delete the
-   file. (M5)
-6. Copy and replace tracks: build a `NewTrack` from library tags,
-   `add_track`, `itdb_cp_track_to_ipod`. Show progress in bytes. Copy runs
-   sequentially; the USB link is the limit, so parallel copies would not
-   help. (M5)
-7. Update tags on existing tracks. Fields empty in the library leave the iPod
-   value alone. (M5)
+5. Remove tracks: drop from all playlists, master and smart ones included,
+   then `itdb_track_remove`. The file is deleted only once a write is
+   verified, so a failed write never leaves the old database pointing at a
+   deleted file; a crash in between leaves an orphan for `iprune doctor`.
+   When the plan also copies, the removals are written, verified and their
+   files deleted before the first copy, so the space they free (which the
+   space check counts) really is free.
+6. Copy: a new track is built (`NewTrack`, freed if never added) with every
+   library tag, the title falling back to the file name, then `add_track`
+   and `itdb_cp_track_to_ipod`. A library file gone, unreadable or changed
+   since the scan is skipped and reported, left out of the playlists, and
+   copied by a later sync; a copy that fails with a readable file (the iPod
+   full or gone) takes its half-added track out and stops the sync as below.
+   A replace copies the new file into the existing track and sets its audio
+   facts and tags, keeping its date added; the old file is deleted after the
+   verified write. A file that is not marked as part of a compilation never
+   clears the iPod's mark. Copies run one at a time with progress in bytes;
+   the USB link is the limit. Files sampled above 48 kHz, which the iPod
+   Classic cannot play, are skipped by the planner like FairPlay files.
+7. Update tags on existing tracks: only the fields the plan lists, so an
+   empty library field never clears an iPod value.
 8. Apply playlist operations: deletes, renames, creates, then member updates
    with `set_playlist_members`.
 9. Run the pre-write checks (section 11.3). On failure, stop without writing
@@ -582,31 +604,54 @@ Order of operations:
     newest `keep_backups` backups (at least one); a failure in these last
     three is a warning, since the sync itself is done.
 
-Checkpoints (M5): during a long copy the database is written every 500
-tracks or 10 minutes, after running the pre-write checks. An interrupted
-sync then loses at most one checkpoint of copied files, and those files are
-found by `iprune doctor`.
+Mappings are recorded right after each verified write. If a crash comes
+in between, the next `prepare` takes them back: an unmapped library
+track whose own deterministic dbid (one of the first four `new_dbid`
+would try) is on the iPod, unmapped and the file's size, is that track.
+Its synced tag hash is left blank, so the next plan compares its iPod tags
+with the library's. A file edited after the crash has another content hash,
+so it is not taken back: it is copied again, and the earlier copy stays on
+the iPod as an unmanaged track, reported by the next sync.
 
-Ctrl+C during the copy finishes the current file, writes a checkpoint and
-exits.
+Checkpoints: during a long copy the database is written every 500 tracks
+or 10 minutes, after the checks of section 11.3 on what is done so far
+(removals and copies; playlists untouched, less the removed tracks), then
+verified, and the mappings of what it holds are recorded. An interrupted
+sync loses at most the copies since the last checkpoint, whose files
+`iprune doctor` finds.
+
+Ctrl+C (the CLI; a second one quits at once, except while the database is
+written and read back) or Stop (the window, shown
+only while there are copies) during the copies finishes the current file,
+writes what was done as a checkpoint and stops; a copy that fails on the
+iPod side does the same. If the checks before the final write fail after a
+checkpoint, that write is not made and the checkpoint stands. Playlists and tag
+updates are then left for the next sync, which plans them again. A plan
+whose copies do not fit is refused before anything is written, and so is
+one removing more than five managed tracks when that is more than a tenth
+of them, unless `--allow-mass-removal` is given.
 
 ### 11.3 Pre-write checks
 
-`verify::pre_write`, on the in-memory database after the changes:
+`verify::check`, on the in-memory database after the changes, against an
+`Expect` of what was meant to change:
 
-- Tracks are exactly as before (M4 changes no track), apart from the count
-  of playlists each is in.
-- The master playlist's members are unchanged.
+- The tracks are those before, less the removed, plus the added. Every
+  other track is exactly as before (apart from the count of playlists it
+  is in), except that a retagged track has exactly the tags set and the
+  same file and size, and a recopied one has a file.
+- Added and recopied tracks have a file on the iPod.
+- The master playlist's members are those before, less the removed, plus
+  the added at the end.
 - The number of regular playlists is the count before, plus those created,
   minus those deleted, and no playlist appears that is neither managed nor
   there before.
 - Every managed playlist, found by its iPod id, has the expected name and
   exactly the expected dbids in the expected order, repeats included.
 - Every playlist member is a track of the database.
-- Unmanaged playlists are unchanged (same id, name and members), and the
-  deleted ones are gone.
+- Unmanaged playlists are unchanged (same id, name and members) apart from
+  removed tracks, and the deleted ones are gone.
 - The smart playlists and the iPod's name are unchanged.
-- Checking that each track's file exists comes with M5, which copies files.
 
 ### 11.4 Verification
 
@@ -633,7 +678,8 @@ until `doctor --fix` deletes them. `iprune backups` lists the backups.
 
 ## 12. Doctor
 
-`iprune doctor [--fix]` reports, and with `--fix` repairs:
+`iprune doctor [--fix] [--yes] [--allow-mass-removal]` reports, and with
+`--fix` repairs (asking first):
 
 - files under `iPod_Control/Music` with no database entry (delete),
 - database entries whose file is missing (remove entry),
@@ -641,7 +687,18 @@ until `doctor --fix` deletes them. `iprune backups` lists the backups.
   (rebuild membership),
 - mappings pointing to dbids not on the iPod (drop mapping),
 - library tracks marked missing for more than 30 days and not on any device
-  (drop from index).
+  (drop from index: their statistics go, and playlist entries pointing to
+  them stay as unresolved lines).
+
+Database entries are removed through the sync's executor (statistics pull,
+backup, checks, write, verification), with the playlist mappings left as
+they are. Orphan files are deleted after that. More than five orphans that
+are over a tenth of the iPod's tracks more likely mean a damaged database
+than leftovers (restoring a backup is the better answer), and as many
+entries without a file more likely mean an unreadable music folder than lost
+files: both need `--allow-mass-removal`, and are refused before anything is
+repaired. A managed playlist holding a track more than once is
+rebuilt by the next sync; an unmanaged one is only reported.
 
 ## 13. CLI
 

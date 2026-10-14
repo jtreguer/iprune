@@ -10,12 +10,13 @@ is right rather than silently picking one.
 
 ## Status
 
-M0 to M4 done (bindings, read-only `gpod` wrapper, `iprune snapshot`;
+M0 to M5 done (bindings, read-only `gpod` wrapper, `iprune snapshot`;
 config, scan, SQLite index, `.m3u8` editing, `playlist` commands; `adopt`;
 planner and `sync --plan-only`; playlist sync with statistics pull, backups,
-checks, verification, `backups` and `restore`). M6 under way: the window
-(`iprune-gui`) shows the library and playlists, edits playlists and syncs
-playlists to the iPod. Work follows the milestones in `docs/technical.md` section 17:
+checks, verification, `backups` and `restore`; track copy, removal and
+retagging with checkpoints, `doctor`). M6 under way: the window
+(`iprune-gui`) shows the library and playlists, edits playlists and runs the
+full sync. Still to do in M6: Eject, the adoption review grid. Work follows the milestones in `docs/technical.md` section 17:
 
 | # | Deliverable | Writes to iPod |
 |---|---|---|
@@ -63,8 +64,9 @@ crates/gpod/         safe wrapper; the only crate allowed to contain unsafe
 crates/iprune-core/  config, store, scan, playlist (.m3u8 format), playlists (operations),
                      device (mount detection), ipod (read a database), adopt (pure
                      matching), adoption (run, report, save), plan (pure planner),
-                     sync (planner input and plan text), exec (apply, restore),
-                     verify (checks around a write), stats, backup
+                     sync (planner input and plan text), transfer (track work from
+                     the plan), exec (apply, restore), verify (checks around a
+                     write), stats, backup, doctor
 crates/iprune/       binary `iprune`: CLI
 crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6); view_model
                      (rows, columns, sort, search) is plain and tested, data loads, main is GTK

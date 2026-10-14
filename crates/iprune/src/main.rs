@@ -53,9 +53,8 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Scan the library, plan a sync with the connected iPod and apply it.
-    /// For now only playlist changes are applied; track copies, removals and
-    /// tag updates come with M5.
+    /// Scan the library, plan a sync with the connected iPod and apply it:
+    /// track copies, removals, tag updates and playlists.
     Sync {
         /// Show the plan without applying it.
         #[arg(long)]
@@ -71,6 +70,19 @@ enum Command {
         yes: bool,
         /// Allow deleting more than a tenth of the managed playlists.
         #[arg(long)]
+        allow_mass_removal: bool,
+    },
+    /// Find what a crash or an interrupted sync left behind on the iPod and
+    /// in the index; with --fix, repair it.
+    Doctor {
+        /// Repair what was found (asks first).
+        #[arg(long)]
+        fix: bool,
+        /// Repair without asking for confirmation.
+        #[arg(long, requires = "fix")]
+        yes: bool,
+        /// Allow removing many entries or files at once.
+        #[arg(long, requires = "fix")]
         allow_mass_removal: bool,
     },
     /// List the iPod database backups taken before each sync.
@@ -379,6 +391,12 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
     let db = gpod::Database::open(&mp)?;
     let conn = store.conn();
     let prepared = sync::prepare(conn, &config, &db)?;
+    if prepared.recovered > 0 {
+        eprintln!(
+            "took back the mappings of {} tracks an interrupted sync had copied",
+            prepared.recovered
+        );
+    }
     let plan_json = serde_json::to_string_pretty(&prepared.plan)?;
     let plan_path = paths.data_dir.join("plan.json");
     std::fs::write(&plan_path, &plan_json)
@@ -402,42 +420,89 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
         }
         return Ok(Outcome::Done);
     }
-    let work = exec::playlist_work(&prepared.plan, &prepared.tracks_map, &prepared.ipod);
-    writeln!(
-        out,
-        "\nThis version applies playlist changes only: {}. Track copies, removals and tag updates come later.",
-        match work.ops.len() {
-            1 => "1 change".to_owned(),
-            n => format!("{n} changes"),
-        }
-    )?;
-    if work.left_out > 0 {
-        writeln!(
-            out,
-            "{} playlist entries point to tracks not on the iPod yet and are left out for now.",
-            work.left_out
-        )?;
-    }
-    if !prepared.plan.space.fits {
-        writeln!(
-            out,
-            "The track copies above would not fit on the iPod; playlist changes need no space."
-        )?;
-    }
-    if work.ops.is_empty() {
-        writeln!(out, "Nothing to apply.")?;
+    let work = exec::full_work(&prepared);
+    if work.is_empty() {
+        writeln!(out, "\nNothing to apply.")?;
         return Ok(Outcome::Done);
     }
+    let t = &work.tracks;
+    writeln!(
+        out,
+        "\nTo apply: {} to copy ({}), {} to remove, {} to retag, {} playlist changes.",
+        plural(t.copies.len(), "track", "tracks"),
+        sync::bytes(t.copy_bytes()),
+        t.removes.len(),
+        t.retags.len(),
+        work.playlists.ops.len()
+    )?;
     let opts = exec::Options {
         allow_mass_removal: args.allow_mass_removal,
     };
-    exec::check_removals(&work, prepared.playlists_map.len(), opts)?;
+    exec::check_removals(&work.playlists, prepared.playlists_map.len(), opts)?;
+    exec::check_track_removals(&work.tracks, prepared.tracks_map.len(), opts)?;
+    if !work.tracks.copies.is_empty() && !prepared.plan.space.fits {
+        bail!("the tracks to copy do not fit on the iPod; nothing was changed");
+    }
     device::check_writable(&mp)?;
     drop(out);
-    if !args.yes && !confirm("Apply these playlist changes to the iPod?")? {
+    if !args.yes && !confirm("Apply this plan to the iPod?")? {
         return Ok(Outcome::Declined);
     }
-    let done = exec::sync_playlists(conn, &config, &paths, &mp, db, &prepared, &work, opts)?;
+    // Ctrl+C finishes the current file, writes what was done and stops.
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Set while the iPod database is written and read back.
+    let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (cancel, writing) = (cancel.clone(), writing.clone());
+        // A second Ctrl+C ends at once, except during a write: a hung copy
+        // leaves only an orphan file, which `iprune doctor` finds.
+        let _ = ctrlc::set_handler(move || {
+            use std::sync::atomic::Ordering::Relaxed;
+            if !cancel.swap(true, Relaxed) {
+                eprintln!("\nstopping after the current file (Ctrl+C again to quit now)…");
+            } else if writing.load(Relaxed) {
+                eprintln!("\nwriting the iPod database; it stops once written and verified…");
+            } else {
+                std::process::exit(130);
+            }
+        });
+    }
+    let tty = io::stderr().is_terminal();
+    let progress = |p: exec::Progress| {
+        writing.store(
+            matches!(p, exec::Progress::Writing | exec::Progress::Verifying),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if !tty {
+            return;
+        }
+        match p {
+            exec::Progress::Removing { done, total } => {
+                eprint!("\rremoving {done}/{total}          ")
+            }
+            exec::Progress::Copying {
+                done,
+                total,
+                bytes,
+                bytes_total,
+                name,
+            } => eprint!(
+                "\r\x1b[Kcopying {}/{total} ({} of {}) {name}",
+                done + 1,
+                sync::bytes(bytes),
+                sync::bytes(bytes_total)
+            ),
+            exec::Progress::Writing => eprint!("\r\x1b[Kwriting the iPod database…"),
+            exec::Progress::Verifying => eprint!("\r\x1b[Kreading it back to verify…"),
+        }
+    };
+    let done = exec::sync(
+        conn, &config, &paths, &mp, db, &prepared, &work, opts, &progress, &cancel,
+    );
+    if tty {
+        eprintln!();
+    }
+    let done = done?;
     let mut out = io::stdout().lock();
     if done.recovered > 0 {
         writeln!(
@@ -448,14 +513,143 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
     }
     writeln!(
         out,
-        "applied {} changes and verified the iPod database; statistics updated for {} tracks ({} new plays); backup {}",
-        done.applied,
+        "copied {} tracks ({}), copied {} again, removed {}, retagged {}, applied {} playlist changes; verified",
+        done.copied,
+        sync::bytes(done.bytes),
+        done.recopied,
+        done.removed,
+        done.retagged,
+        done.applied
+    )?;
+    writeln!(
+        out,
+        "statistics updated for {} tracks ({} new plays); backup {}",
         done.pulled.tracks(),
         done.pulled.plays(),
         done.backup.stamp
     )?;
+    for (path, why) in &done.skipped {
+        writeln!(out, "not copied, {why}: {}", path.display())?;
+    }
     for w in &done.warnings {
         writeln!(out, "warning: {w}")?;
+    }
+    if let Some(why) = done.stopped {
+        bail!(
+            "the sync stopped early ({why}); what was done is written and verified, and the next sync continues"
+        );
+    }
+    Ok(Outcome::Done)
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+fn run_doctor(fix: bool, yes: bool, allow_mass_removal: bool) -> Result<Outcome> {
+    use iprune_core::{doctor, ipod, store::devices};
+    let (config, store) = load()?;
+    let paths = paths()?;
+    let conn = store.conn();
+    let mp = find_mountpoint(&config)?;
+    eprintln!("reading the iPod at {}", mp.display());
+    let db = gpod::Database::open(&mp)?;
+    let contents = ipod::read(&db);
+    let device = match &contents.firewire_guid {
+        Some(g) => devices::device_id(conn, g)?,
+        None => None,
+    };
+    let report = doctor::examine(conn, &mp, &contents, device, iprune_core::now_unix())?;
+    let mut out = io::stdout().lock();
+    print_list(
+        &mut out,
+        "files on the iPod not in its database",
+        &report.orphan_files,
+        |p| p.display().to_string(),
+    )?;
+    print_list(
+        &mut out,
+        "database entries whose file is gone",
+        &report.missing_files,
+        |(d, what)| format!("{d:016x} {what}"),
+    )?;
+    print_list(
+        &mut out,
+        "playlists holding a track more than once",
+        &report.repeated,
+        |(n, managed)| match managed {
+            true => format!("{n} (the next sync rebuilds it from its file)"),
+            false => format!("{n} (not managed by iprune: left as it is)"),
+        },
+    )?;
+    print_list(
+        &mut out,
+        "mappings to tracks no longer on the iPod",
+        &report.stale_mappings,
+        |(id, d)| format!("track {id} -> {d:016x}"),
+    )?;
+    print_list(
+        &mut out,
+        "library tracks missing for over 30 days, on no device",
+        &report.forgotten,
+        |(_, p)| p.display().to_string(),
+    )?;
+    if report.is_clean() {
+        writeln!(out, "nothing to repair")?;
+        return Ok(Outcome::Done);
+    }
+    if !fix {
+        writeln!(out, "run `iprune doctor --fix` to repair")?;
+        return Ok(Outcome::Done);
+    }
+    drop(out);
+    device::check_writable(&mp)?;
+    doctor::check_orphans(&report, contents.tracks.len(), allow_mass_removal)?;
+    doctor::check_missing(&report, contents.tracks.len(), allow_mass_removal)?;
+    if !yes && !confirm("Repair these on the iPod and in the index?")? {
+        return Ok(Outcome::Declined);
+    }
+    // Database entries first, through the sync's backup, checks and
+    // verification; then the orphan files, then the index.
+    if !report.missing_files.is_empty() {
+        if device.is_none() {
+            bail!(
+                "the iPod has not been adopted: run `iprune adopt` before repairing its database"
+            );
+        }
+        let prepared = sync::prepare(conn, &config, &db)?;
+        let work = doctor::repair_work(&prepared, &report);
+        let opts = exec::Options { allow_mass_removal };
+        let done = exec::sync(
+            conn,
+            &config,
+            &paths,
+            &mp,
+            db,
+            &prepared,
+            &work,
+            opts,
+            &|_| {},
+            &std::sync::atomic::AtomicBool::new(false),
+        )?;
+        println!(
+            "removed {} database entries and verified the iPod database; backup {}",
+            done.removed, done.backup.stamp
+        );
+    } else {
+        drop(db);
+    }
+    let deleted = doctor::delete_orphans(&report, contents.tracks.len(), allow_mass_removal)?;
+    if deleted > 0 {
+        println!("deleted {deleted} orphan files");
+    }
+    doctor::fix_index(conn, device, &report)?;
+    if !report.stale_mappings.is_empty() || !report.forgotten.is_empty() {
+        println!(
+            "dropped {} stale mappings and {} long-missing tracks from the index",
+            report.stale_mappings.len(),
+            report.forgotten.len()
+        );
     }
     Ok(Outcome::Done)
 }
@@ -618,6 +812,11 @@ fn main() -> ExitCode {
             yes: *yes,
             allow_mass_removal: *allow_mass_removal,
         }),
+        Command::Doctor {
+            fix,
+            yes,
+            allow_mass_removal,
+        } => run_doctor(*fix, *yes, *allow_mass_removal),
         Command::Backups => run_backups().map(|()| Outcome::Done),
         Command::Restore { stamp, yes } => run_restore(stamp, *yes),
         Command::Playlist(cmd) => playlist(cmd),

@@ -675,6 +675,7 @@ fn bare(space: SpaceCheck) -> Prepared {
         tracks_map: vec![],
         playlists_map: vec![],
         library: HashMap::new(),
+        recovered: 0,
     }
 }
 

@@ -475,7 +475,7 @@ fn stats_csv_manifest_and_backup_are_written() {
     }
     let work: serde_json::Value =
         serde_json::from_slice(&fs::read(b.dir.join("work.json")).unwrap()).unwrap();
-    assert_eq!(work.as_array().unwrap().len(), 4);
+    assert_eq!(work["playlist_ops"].as_array().unwrap().len(), 4);
     assert_eq!(w.backups(), vec![b.clone()]);
     assert_ne!(
         fs::read(w.root.join("iPod_Control/iTunes/iTunesDB")).unwrap(),

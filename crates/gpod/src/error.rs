@@ -21,6 +21,8 @@ pub enum Error {
     NoSuchTrack(u64),
     #[error("writing the iPod database failed: {0}")]
     Write(String),
+    #[error("copying {} to the iPod failed: {message}", path.display())]
+    Copy { path: PathBuf, message: String },
 }
 
 /// Takes ownership of a `GError`, returns its message and frees it.
