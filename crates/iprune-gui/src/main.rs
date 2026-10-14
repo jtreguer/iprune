@@ -1,18 +1,43 @@
-//! The iprune window: a sidebar of sources and a grid of tracks.
+//! The iprune window: a sidebar of sources and a grid of tracks, with
+//! playlist editing. Every edit goes through `iprune-core`, as the CLI does,
+//! and is written to the `.m3u8` file at once.
 
 mod data;
 mod view_model;
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::rc::{Rc, Weak};
+use std::time::Duration;
 
 use gtk::prelude::*;
-use gtk::{gio, glib};
+use gtk::{gdk, gio, glib};
 
 use data::{Data, DeviceInfo};
-use view_model::{Column, Row};
+use view_model::{Column, Layout, Layouts, Row};
 
 const APP_ID: &str = "dev.iprune.Iprune";
+/// What a drag from the grid carries: a value of a private type, so no other
+/// widget (the search field) accepts it. The rows themselves stay in [`Ui`].
+struct DragMarker;
+
+fn drag_value() -> glib::Value {
+    glib::BoxedAnyObject::new(DragMarker).to_value()
+}
+
+fn is_drag(value: &glib::Value) -> bool {
+    value
+        .get::<glib::BoxedAnyObject>()
+        .is_ok_and(|b| b.try_borrow::<DragMarker>().is_ok())
+}
+
+fn drop_target() -> gtk::DropTarget {
+    gtk::DropTarget::new(
+        glib::BoxedAnyObject::static_type(),
+        gdk::DragAction::COPY | gdk::DragAction::MOVE,
+    )
+}
 
 /// What the grid is showing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,16 +46,47 @@ enum Source {
     Playlist(String),
 }
 
+/// Rows being dragged.
+#[derive(Debug, Clone)]
+struct Drag {
+    from: Source,
+    /// 1-based playlist positions, when dragged from a playlist.
+    positions: Vec<usize>,
+    /// The files of the rows that have one.
+    paths: Vec<PathBuf>,
+}
+
 struct Ui {
+    window: gtk::ApplicationWindow,
     data: Data,
     store: gio::ListStore,
     filter: gtk::CustomFilter,
-    query: Rc<RefCell<view_model::Query>>,
+    query: RefCell<view_model::Query>,
     view: gtk::ColumnView,
+    selection: gtk::MultiSelection,
     columns: Vec<(Column, gtk::ColumnViewColumn)>,
     status: gtk::Label,
     filtered: gtk::FilterListModel,
     title: gtk::Label,
+    sidebar: gtk::ListBox,
+    sources: RefCell<Vec<Option<Source>>>,
+    current: RefCell<Source>,
+    drag: RefCell<Option<Drag>>,
+    /// The playlist a sidebar context menu was opened on.
+    context_playlist: RefCell<Option<String>>,
+    layouts: RefCell<Layouts>,
+    /// Whether the columns now follow the playlist layout.
+    playlist_layout: Cell<bool>,
+    reload_pending: Cell<bool>,
+    monitor: RefCell<Option<gio::FileMonitor>>,
+    /// The modification time of the playlist file on screen when it was
+    /// read, to notice a change made by any other program, `iprune` included.
+    shown_mtime: Cell<Option<i64>>,
+    /// The grid's right-click menu and the actions only a playlist enables.
+    row_menu: gtk::PopoverMenu,
+    playlist_actions: RefCell<Vec<gio::SimpleAction>>,
+    /// Set when the playlists folder cannot be watched; kept in the status.
+    unwatched: Cell<bool>,
 }
 
 fn main() -> glib::ExitCode {
@@ -62,6 +118,18 @@ fn activate(app: &gtk::Application) {
     window.present();
 }
 
+fn layouts_file() -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "iprune")?;
+    Some(dirs.state_dir()?.join("ui.toml"))
+}
+
+fn load_layouts() -> Layouts {
+    layouts_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| Layouts::parse(&t))
+        .unwrap_or_default()
+}
+
 fn cell_label(numeric: bool) -> gtk::Label {
     let l = gtk::Label::new(None);
     l.set_xalign(if numeric { 1.0 } else { 0.0 });
@@ -83,11 +151,73 @@ fn date(unix: i64) -> String {
         .unwrap_or_default()
 }
 
-fn make_column(col: Column) -> gtk::ColumnViewColumn {
+type UiSlot = Rc<OnceCell<Weak<Ui>>>;
+
+fn ui_of(slot: &UiSlot) -> Option<Rc<Ui>> {
+    slot.get().and_then(Weak::upgrade)
+}
+
+fn make_column(col: Column, slot: UiSlot) -> gtk::ColumnViewColumn {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().expect("a list item");
-        item.set_child(Some(&cell_label(col.numeric())));
+        let label = cell_label(col.numeric());
+        let weak_item = item.downgrade();
+
+        // Rows are dragged from any cell: the selection if the row is in it,
+        // else the row alone.
+        let source = gtk::DragSource::new();
+        source.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE);
+        {
+            let slot = slot.clone();
+            let weak_item = weak_item.clone();
+            source.connect_prepare(move |_, _, _| {
+                let ui = ui_of(&slot)?;
+                let item = weak_item.upgrade()?;
+                ui.begin_drag(item.position());
+                Some(gdk::ContentProvider::for_value(&drag_value()))
+            });
+        }
+        label.add_controller(source);
+
+        // Dropping on a row of the same playlist reorders it.
+        let target = drop_target();
+        {
+            let slot = slot.clone();
+            let weak_item = weak_item.clone();
+            target.connect_drop(move |target, value, _, y| {
+                let (Some(ui), Some(item)) = (ui_of(&slot), weak_item.upgrade()) else {
+                    return false;
+                };
+                if !is_drag(value) {
+                    return false;
+                }
+                let Some(position) = item.item().and_then(|o| row_of(&o).position) else {
+                    return false;
+                };
+                let height = f64::from(target.widget().map_or(1, |w| w.height()));
+                ui.drop_on_row(view_model::drop_before(position, y, height))
+            });
+        }
+        label.add_controller(target);
+
+        // Right-click: the menu acts on the row clicked, selected first if
+        // it is not part of the selection.
+        let click = gtk::GestureClick::new();
+        click.set_button(gdk::BUTTON_SECONDARY);
+        {
+            let slot = slot.clone();
+            let label = label.downgrade();
+            click.connect_pressed(move |_, _, x, y| {
+                if let (Some(ui), Some(item), Some(label)) =
+                    (ui_of(&slot), weak_item.upgrade(), label.upgrade())
+                {
+                    ui.open_row_menu(item.position(), &label, x, y);
+                }
+            });
+        }
+        label.add_controller(click);
+        item.set_child(Some(&label));
     });
     factory.connect_bind(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().expect("a list item");
@@ -110,6 +240,7 @@ fn make_column(col: Column) -> gtk::ColumnViewColumn {
         }
     });
     let column = gtk::ColumnViewColumn::new(Some(col.title()), Some(factory));
+    column.set_id(Some(col.key()));
     column.set_resizable(true);
     column.set_fixed_width(col.width());
     column.set_visible(col.visible_by_default());
@@ -172,47 +303,457 @@ fn device_text(d: &DeviceInfo) -> String {
     lines.join("\n")
 }
 
+/// Asks for a playlist name in a small modal window and calls `done` with
+/// it, trimmed and not empty.
+fn ask_name(
+    parent: &gtk::ApplicationWindow,
+    title: &str,
+    prompt: &str,
+    initial: &str,
+    done: impl Fn(String) + 'static,
+) {
+    let dialog = gtk::Window::builder()
+        .title(title)
+        .transient_for(parent)
+        .modal(true)
+        .resizable(false)
+        .default_width(360)
+        .build();
+    let entry = gtk::Entry::new();
+    entry.set_text(initial);
+    entry.set_activates_default(true);
+    let ok = gtk::Button::with_label("OK");
+    ok.add_css_class("suggested-action");
+    let cancel = gtk::Button::with_label("Cancel");
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    buttons.append(&cancel);
+    buttons.append(&ok);
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    body.set_margin_top(16);
+    body.set_margin_bottom(16);
+    body.set_margin_start(16);
+    body.set_margin_end(16);
+    let label = gtk::Label::new(Some(prompt));
+    label.set_xalign(0.0);
+    body.append(&label);
+    body.append(&entry);
+    body.append(&buttons);
+    dialog.set_child(Some(&body));
+    dialog.set_default_widget(Some(&ok));
+    let done = Rc::new(done);
+    {
+        let (dialog, entry, done) = (dialog.clone(), entry.clone(), done.clone());
+        ok.connect_clicked(move |_| {
+            let name = entry.text().trim().to_owned();
+            if !name.is_empty() {
+                dialog.close();
+                done(name);
+            }
+        });
+    }
+    {
+        let dialog = dialog.clone();
+        cancel.connect_clicked(move |_| dialog.close());
+    }
+    dialog.present();
+    entry.grab_focus();
+}
+
 impl Ui {
-    fn show(&self, source: &Source) {
-        let rows = match source {
-            Source::Library => self.data.library(),
-            Source::Playlist(name) => self.data.playlist(name),
+    fn show_error(&self, what: &str, e: &anyhow::Error) {
+        gtk::AlertDialog::builder()
+            .message(what)
+            .detail(format!("{e:#}"))
+            .modal(true)
+            .build()
+            .show(Some(&self.window));
+    }
+
+    fn playlist_name(&self) -> Option<String> {
+        match &*self.current.borrow() {
+            Source::Playlist(name) => Some(name.clone()),
+            Source::Library => None,
+        }
+    }
+
+    /// The selected rows, in view order.
+    fn selected_rows(&self) -> Vec<Row> {
+        let bits = self.selection.selection();
+        let mut out = Vec::new();
+        for i in 0..bits.size() {
+            let pos = bits.nth(i as u32);
+            if let Some(obj) = self.selection.item(pos) {
+                out.push(row_of(&obj).clone());
+            }
+        }
+        out
+    }
+
+    fn selected_positions(&self) -> Vec<usize> {
+        self.selected_rows()
+            .iter()
+            .filter_map(|r| r.position)
+            .collect()
+    }
+
+    /// Selects the rows at these playlist positions and shows the first.
+    fn select_positions(&self, positions: &[usize]) {
+        self.selection.unselect_all();
+        let wanted: HashSet<usize> = positions.iter().copied().collect();
+        let mut first = None;
+        for i in 0..self.selection.n_items() {
+            let hit = self
+                .selection
+                .item(i)
+                .is_some_and(|o| row_of(&o).position.is_some_and(|p| wanted.contains(&p)));
+            if hit {
+                self.selection.select_item(i, false);
+                first.get_or_insert(i);
+            }
+        }
+        if let Some(i) = first {
+            self.view
+                .scroll_to(i, None, gtk::ListScrollFlags::NONE, None);
+        }
+    }
+
+    fn begin_drag(&self, view_position: u32) {
+        if !self.selection.is_selected(view_position) {
+            self.selection.select_item(view_position, true);
+        }
+        let rows = self.selected_rows();
+        *self.drag.borrow_mut() = Some(Drag {
+            from: self.current.borrow().clone(),
+            positions: rows.iter().filter_map(|r| r.position).collect(),
+            paths: rows
+                .iter()
+                .filter(|r| !r.unresolved)
+                .map(|r| r.path.clone())
+                .collect(),
+        });
+    }
+
+    fn sorted_by_position(&self) -> bool {
+        let Some(sorter) = self.view.sorter().and_downcast::<gtk::ColumnViewSorter>() else {
+            return false;
         };
-        let rows = match rows {
-            Ok(r) => r,
-            Err(e) => {
-                // Never leave the previous source's rows under the new title.
-                self.store.remove_all();
-                self.title.set_text(match source {
-                    Source::Library => "Music",
-                    Source::Playlist(name) => name,
+        let position = self.columns.iter().find(|(c, _)| *c == Column::Position);
+        sorter.primary_sort_column().as_ref() == position.map(|(_, c)| c)
+            && sorter.primary_sort_order() == gtk::SortType::Ascending
+    }
+
+    /// True when the playlist file is still the one on screen. Otherwise
+    /// shows it again and says so: positions taken from a stale view would
+    /// land on other entries.
+    fn ensure_fresh(&self, name: &str) -> bool {
+        if self.data.playlist_mtime(name) == self.shown_mtime.get() {
+            return true;
+        }
+        self.refresh();
+        self.status
+            .set_text("The playlist changed on disk and is shown again; nothing was changed");
+        false
+    }
+
+    /// After a failed edit the view may be stale: show the file again.
+    fn edit_failed(&self, what: &str, e: &anyhow::Error) {
+        self.refresh();
+        self.show_error(what, e);
+    }
+
+    /// A drop on a row of the playlist shown: reorders it when the rows
+    /// come from it and it is sorted by `#`.
+    fn drop_on_row(&self, before: usize) -> bool {
+        let Some(name) = self.playlist_name() else {
+            return false;
+        };
+        let Some(drag) = self.drag.borrow_mut().take() else {
+            return false;
+        };
+        if drag.from != Source::Playlist(name.clone()) {
+            self.status
+                .set_text("Drop tracks on a playlist in the sidebar to add them");
+            return false;
+        }
+        if !self.sorted_by_position() {
+            self.status
+                .set_text("Sort by # (ascending) to reorder the playlist");
+            return false;
+        }
+        self.move_entries(&name, &drag.positions, before);
+        true
+    }
+
+    fn move_entries(&self, name: &str, positions: &[usize], before: usize) {
+        if !self.ensure_fresh(name) {
+            return;
+        }
+        let len = self.store.n_items().try_into().unwrap_or(usize::MAX);
+        let order = match iprune_core::playlists::reorder(len, positions, before) {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+        if order.iter().copied().eq(1..=len) {
+            return;
+        }
+        match self.data.move_entries(name, positions, before) {
+            Ok(()) => {
+                self.refresh();
+                self.select_positions(&view_model::new_positions(&order, positions));
+            }
+            Err(e) => self.edit_failed("The playlist was not changed", &e),
+        }
+    }
+
+    /// Moves the selected entries one place up (`-1`) or down (`+1`). Only
+    /// adjacent entries: a scattered selection would be gathered instead.
+    fn nudge(&self, step: i32) {
+        let Some(name) = self.playlist_name() else {
+            return;
+        };
+        let positions = self.selected_positions();
+        let len = self.store.n_items() as usize;
+        match view_model::nudge_before(&positions, len, step < 0) {
+            view_model::Nudge::Before(before) => self.move_entries(&name, &positions, before),
+            view_model::Nudge::NotAdjacent => self
+                .status
+                .set_text("Select adjacent entries to move them with Ctrl+Up and Ctrl+Down"),
+            view_model::Nudge::Nothing => {}
+        }
+    }
+
+    /// Removes the selected entries; more than one asks first, since the
+    /// file is rewritten at once and there is no undo.
+    fn remove_selected(self: &Rc<Self>) {
+        let Some(name) = self.playlist_name() else {
+            return;
+        };
+        let positions = self.selected_positions();
+        match positions.len() {
+            0 => {}
+            1 => self.remove_entries(&name, &positions),
+            n => {
+                let dialog = gtk::AlertDialog::builder()
+                    .message(format!("Remove {n} entries from {name:?}?"))
+                    .detail("The tracks stay in the library.")
+                    .buttons(["Cancel", "Remove"])
+                    .cancel_button(0)
+                    .default_button(0)
+                    .modal(true)
+                    .build();
+                let ui = Rc::downgrade(self);
+                dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |answer| {
+                    if let (Some(ui), Ok(1)) = (ui.upgrade(), answer) {
+                        ui.remove_entries(&name, &positions);
+                    }
                 });
-                self.status.set_text(&format!("{e:#}"));
-                return;
+            }
+        }
+    }
+
+    fn remove_entries(&self, name: &str, positions: &[usize]) {
+        if !self.ensure_fresh(name) {
+            return;
+        }
+        let first = *positions.iter().min().expect("not empty");
+        match self.data.remove(name, positions) {
+            Ok(()) => {
+                self.refresh();
+                // Keep the place: select what now sits where the first was.
+                let len = self.store.n_items() as usize;
+                if len > 0 {
+                    self.select_positions(&[first.min(len)]);
+                }
+                self.status.set_text(&match positions.len() {
+                    1 => format!("Removed 1 entry from {name}"),
+                    n => format!("Removed {n} entries from {name}"),
+                });
+            }
+            Err(e) => self.edit_failed("The playlist was not changed", &e),
+        }
+    }
+
+    /// Adds the dragged files at the end of `target`. The playlist on screen
+    /// is the drag's source, never the target, so nothing to refresh.
+    fn drop_on_playlist(&self, target: &str) -> bool {
+        let Some(drag) = self.drag.borrow_mut().take() else {
+            return false;
+        };
+        if drag.from == Source::Playlist(target.to_owned()) || drag.paths.is_empty() {
+            return false;
+        }
+        match self.data.add(target, &drag.paths, None) {
+            Ok(()) => {
+                self.status.set_text(&match drag.paths.len() {
+                    1 => format!("Added 1 track to {target}"),
+                    n => format!("Added {n} tracks to {target}"),
+                });
+                true
+            }
+            Err(e) => {
+                self.show_error(&format!("Nothing was added to {target}"), &e);
+                false
+            }
+        }
+    }
+
+    /// Opens the grid's menu on the row at view position `pos`.
+    fn open_row_menu(&self, pos: u32, cell: &gtk::Label, x: f64, y: f64) {
+        if !self.selection.is_selected(pos) {
+            self.selection.select_item(pos, true);
+        }
+        let in_playlist = self.playlist_name().is_some();
+        for a in self.playlist_actions.borrow().iter() {
+            a.set_enabled(in_playlist);
+        }
+        let at = cell
+            .compute_point(&self.view, &gtk::graphene::Point::new(x as f32, y as f32))
+            .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
+        self.row_menu.set_pointing_to(Some(&gdk::Rectangle::new(
+            at.x() as i32,
+            at.y() as i32,
+            1,
+            1,
+        )));
+        self.row_menu.popup();
+    }
+
+    fn show_in_folder(&self) {
+        let Some(row) = self.selected_rows().into_iter().find(|r| !r.unresolved) else {
+            return;
+        };
+        let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&row.path)));
+        launcher.open_containing_folder(Some(&self.window), gio::Cancellable::NONE, |_| {});
+    }
+
+    /// The columns' current order, widths and visibility.
+    fn capture_layout(&self) -> Layout {
+        let model = self.view.columns();
+        let columns = (0..model.n_items())
+            .filter_map(|i| model.item(i).and_downcast::<gtk::ColumnViewColumn>())
+            .filter_map(|c| {
+                Some(view_model::ColumnState {
+                    id: c.id()?.to_string(),
+                    width: c.fixed_width(),
+                    visible: c.is_visible(),
+                })
+            })
+            .collect();
+        Layout { columns }
+    }
+
+    fn apply_layout(&self, layout: &Layout) {
+        for (i, state) in layout.columns.iter().enumerate() {
+            let Some(col) = Column::from_key(&state.id) else {
+                continue;
+            };
+            let Some((_, c)) = self.columns.iter().find(|(k, _)| *k == col) else {
+                continue;
+            };
+            self.view.insert_column(i as u32, c);
+            c.set_fixed_width(state.width);
+            c.set_visible(state.visible);
+        }
+    }
+
+    /// Keeps the layout of the kind of view on screen, and switches to the
+    /// other kind's when `playlist` differs.
+    fn switch_layout(&self, playlist: bool) {
+        if self.playlist_layout.get() == playlist {
+            return;
+        }
+        let now = self.capture_layout();
+        {
+            let mut layouts = self.layouts.borrow_mut();
+            match self.playlist_layout.get() {
+                true => layouts.playlist = now,
+                false => layouts.library = now,
+            }
+        }
+        let next = {
+            let layouts = self.layouts.borrow();
+            match playlist {
+                true => layouts.playlist.complete(true),
+                false => layouts.library.complete(false),
             }
         };
-        let objects: Vec<glib::Object> = rows
-            .into_iter()
-            .map(|r| glib::BoxedAnyObject::new(r).upcast())
-            .collect();
+        self.apply_layout(&next);
+        self.playlist_layout.set(playlist);
+        // Written now too, not only on close: a crash keeps the layout.
+        self.save_layouts();
+    }
+
+    fn save_layouts(&self) {
+        let now = self.capture_layout();
+        let mut layouts = self.layouts.borrow().clone();
+        match self.playlist_layout.get() {
+            true => layouts.playlist = now,
+            false => layouts.library = now,
+        }
+        let (Some(path), Ok(text)) = (layouts_file(), toml::to_string(&layouts)) else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, text);
+    }
+
+    /// Switches the grid to `source`: its layout, its default sort (`#` for
+    /// a playlist, artist for the library), then its rows.
+    fn show(&self, source: &Source) {
+        *self.current.borrow_mut() = source.clone();
+        self.title.set_text(match source {
+            Source::Library => "Music",
+            Source::Playlist(name) => name,
+        });
         let in_playlist = matches!(source, Source::Playlist(_));
-        let (sort_by, title) = match source {
-            Source::Library => (Column::Artist, "Music".to_owned()),
-            Source::Playlist(name) => (Column::Position, name.clone()),
+        let sort_by = match source {
+            Source::Library => Column::Artist,
+            Source::Playlist(_) => Column::Position,
         };
         // Sort order first, then the rows, so they are sorted once.
         self.store.remove_all();
-        for (col, c) in &self.columns {
-            if *col == Column::Position {
-                c.set_visible(in_playlist);
-            }
-            if *col == sort_by {
-                self.view.sort_by_column(Some(c), gtk::SortType::Ascending);
-            }
+        self.switch_layout(in_playlist);
+        if let Some((_, c)) = self.columns.iter().find(|(c, _)| *c == sort_by) {
+            // Cleared first, or the previous column stays as a second key
+            // with its own arrow.
+            self.view.sort_by_column(None, gtk::SortType::Ascending);
+            self.view.sort_by_column(Some(c), gtk::SortType::Ascending);
         }
-        self.store.extend_from_slice(&objects);
-        self.title.set_text(&title);
-        self.update_status();
+        self.load_rows();
+    }
+
+    /// Reads the current source's rows again, keeping the sort and layout
+    /// the user chose: after an edit or an outside change.
+    fn refresh(&self) {
+        self.load_rows();
+    }
+
+    fn load_rows(&self) {
+        let source = self.current.borrow().clone();
+        self.shown_mtime.set(match &source {
+            Source::Playlist(name) => self.data.playlist_mtime(name),
+            Source::Library => None,
+        });
+        let rows = match &source {
+            Source::Library => self.data.library(),
+            Source::Playlist(name) => self.data.playlist(name),
+        };
+        self.store.remove_all();
+        match rows {
+            Ok(rows) => {
+                let objects: Vec<glib::Object> = rows
+                    .into_iter()
+                    .map(|r| glib::BoxedAnyObject::new(r).upcast())
+                    .collect();
+                self.store.extend_from_slice(&objects);
+                self.update_status();
+            }
+            // Never leave the previous rows under the new title.
+            Err(e) => self.status.set_text(&format!("{e:#}")),
+        }
     }
 
     fn update_status(&self) {
@@ -220,21 +761,238 @@ impl Ui {
         let objects: Vec<glib::Object> = (0..n).filter_map(|i| self.filtered.item(i)).collect();
         let borrowed: Vec<std::cell::Ref<'_, Row>> = objects.iter().map(row_of).collect();
         let summary = view_model::summary(borrowed.iter().map(|r| &**r));
-        // A playlists folder that could not be read stays visible: the
-        // playlists shown may be out of date.
-        match &self.data.warning {
-            Some(w) => self.status.set_text(&format!("{summary}  |  {w}")),
-            None => self.status.set_text(&summary),
+        // Problems with the playlists folder stay visible: the playlists
+        // shown may be out of date.
+        let mut text = summary;
+        if let Some(w) = &self.data.warning {
+            text = format!("{text}  |  {w}");
+        }
+        if self.unwatched.get() {
+            text = format!("{text}  |  changes made elsewhere show after a restart");
+        }
+        self.status.set_text(&text);
+    }
+
+    /// Rebuilds the sidebar's playlists and selects the current source, or
+    /// the library when it is gone.
+    fn fill_sidebar(self: &Rc<Self>) {
+        while let Some(row) = self.sidebar.row_at_index(0) {
+            self.sidebar.remove(&row);
+        }
+        let mut sources = Vec::new();
+        self.sidebar.append(&sidebar_header("Library"));
+        sources.push(None);
+        self.sidebar.append(&sidebar_item("Music"));
+        sources.push(Some(Source::Library));
+        self.sidebar.append(&sidebar_header("Playlists"));
+        sources.push(None);
+        for name in self.data.playlist_names().unwrap_or_default() {
+            let row = sidebar_item(&name);
+            // Tracks dropped on a playlist are added at its end.
+            let target = drop_target();
+            {
+                let ui = Rc::downgrade(self);
+                let name = name.clone();
+                target.connect_drop(move |_, value, _, _| {
+                    let Some(ui) = ui.upgrade() else {
+                        return false;
+                    };
+                    is_drag(value) && ui.drop_on_playlist(&name)
+                });
+            }
+            row.add_controller(target);
+            self.sidebar.append(&row);
+            sources.push(Some(Source::Playlist(name)));
+        }
+        let current = self.current.borrow().clone();
+        let index = sources
+            .iter()
+            .position(|s| s.as_ref() == Some(&current))
+            .unwrap_or(1);
+        *self.sources.borrow_mut() = sources;
+        // Selecting shows it; a reload of the same source is fine.
+        if let Some(row) = self.sidebar.row_at_index(index as i32) {
+            self.sidebar.select_row(Some(&row));
+        }
+    }
+
+    fn new_playlist(self: &Rc<Self>) {
+        let ui = Rc::downgrade(self);
+        ask_name(
+            &self.window,
+            "New Playlist",
+            "Name of the new playlist",
+            "",
+            move |name| {
+                let Some(ui) = ui.upgrade() else { return };
+                match ui.data.create(&name) {
+                    Ok(()) => {
+                        *ui.current.borrow_mut() = Source::Playlist(name);
+                        ui.fill_sidebar();
+                    }
+                    Err(e) => ui.show_error("The playlist was not created", &e),
+                }
+            },
+        );
+    }
+
+    fn rename_playlist(self: &Rc<Self>, old: String) {
+        let ui = Rc::downgrade(self);
+        let initial = old.clone();
+        ask_name(
+            &self.window,
+            "Rename Playlist",
+            "New name",
+            &initial,
+            move |new| {
+                let Some(ui) = ui.upgrade() else { return };
+                if new == old {
+                    return;
+                }
+                match ui.data.rename(&old, &new) {
+                    Ok(()) => {
+                        if *ui.current.borrow() == Source::Playlist(old.clone()) {
+                            *ui.current.borrow_mut() = Source::Playlist(new);
+                        }
+                        ui.fill_sidebar();
+                    }
+                    Err(e) => ui.show_error("The playlist was not renamed", &e),
+                }
+            },
+        );
+    }
+
+    fn delete_playlist(self: &Rc<Self>, name: String) {
+        let dialog = gtk::AlertDialog::builder()
+            .message(format!("Delete the playlist {name:?}?"))
+            .detail(
+                "Its .m3u8 file is deleted. The tracks stay in the library. If the iPod has \
+                 this playlist, the next sync removes it there.",
+            )
+            .buttons(["Cancel", "Delete"])
+            .cancel_button(0)
+            .default_button(0)
+            .modal(true)
+            .build();
+        let ui = Rc::downgrade(self);
+        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |answer| {
+            let Some(ui) = ui.upgrade() else { return };
+            if answer != Ok(1) {
+                return;
+            }
+            match ui.data.delete(&name) {
+                // The sidebar falls back to the library when the playlist
+                // shown is gone.
+                Ok(()) => ui.fill_sidebar(),
+                Err(e) => ui.show_error("The playlist was not deleted", &e),
+            }
+        });
+    }
+
+    /// Called on every change in the playlists folder; reloads once things
+    /// settle.
+    fn schedule_reload(self: &Rc<Self>) {
+        if self.reload_pending.replace(true) {
+            return;
+        }
+        let ui = Rc::downgrade(self);
+        glib::timeout_add_local_once(Duration::from_millis(400), move || {
+            if let Some(ui) = ui.upgrade() {
+                ui.reload_pending.set(false);
+                ui.reload_from_disk();
+            }
+        });
+    }
+
+    /// Picks up playlist files changed by another program. iprune's own
+    /// writes already left the index up to date, so they reload nothing.
+    fn reload_from_disk(self: &Rc<Self>) {
+        if let Err(e) = self.data.reload_playlists() {
+            self.status.set_text(&format!("{e:#}"));
+            return;
+        }
+        // Another iprune (the CLI) may have updated the index while writing
+        // the file, so the file on screen is checked directly.
+        let shown_changed = match &*self.current.borrow() {
+            Source::Playlist(name) => self.data.playlist_mtime(name) != self.shown_mtime.get(),
+            Source::Library => false,
+        };
+        let listed: Vec<String> = self
+            .sources
+            .borrow()
+            .iter()
+            .filter_map(|s| match s {
+                Some(Source::Playlist(n)) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        let names = self.data.playlist_names().ok();
+        if names.as_ref() != Some(&listed) {
+            // The sidebar falls back to the library if the playlist shown
+            // is gone.
+            self.fill_sidebar();
+        } else if shown_changed {
+            self.refresh();
         }
     }
 }
 
+fn action(
+    window: &gtk::ApplicationWindow,
+    name: &str,
+    ui: &Rc<Ui>,
+    f: impl Fn(&Rc<Ui>) + 'static,
+) -> gio::SimpleAction {
+    let action = gio::SimpleAction::new(name, None);
+    let weak = Rc::downgrade(ui);
+    action.connect_activate(move |_, _| {
+        if let Some(ui) = weak.upgrade() {
+            f(&ui);
+        }
+    });
+    window.add_action(&action);
+    action
+}
+
+fn shortcut(controller: &gtk::ShortcutController, trigger: &str, action: &str) {
+    controller.add_shortcut(gtk::Shortcut::new(
+        gtk::ShortcutTrigger::parse_string(trigger),
+        Some(gtk::NamedAction::new(action)),
+    ));
+}
+
+/// A right-click menu over `widget`, built from `menu`.
+fn context_menu(
+    widget: &impl IsA<gtk::Widget>,
+    menu: &gio::Menu,
+    before: impl Fn(f64, f64) -> bool + 'static,
+) {
+    let popover = gtk::PopoverMenu::from_model(Some(menu));
+    popover.set_parent(widget);
+    popover.set_has_arrow(false);
+    {
+        let popover = popover.clone();
+        widget.connect_destroy(move |_| popover.unparent());
+    }
+    let click = gtk::GestureClick::new();
+    click.set_button(gdk::BUTTON_SECONDARY);
+    click.connect_pressed(move |_, _, x, y| {
+        if before(x, y) {
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        }
+    });
+    widget.add_controller(click);
+}
+
 fn build(window: &gtk::ApplicationWindow, data: Data) {
+    let slot: UiSlot = Rc::new(OnceCell::new());
     let store = gio::ListStore::new::<glib::BoxedAnyObject>();
-    let query = Rc::new(RefCell::new(view_model::Query::default()));
     let filter = {
-        let query = query.clone();
-        gtk::CustomFilter::new(move |obj| row_of(obj).matches(&query.borrow()))
+        let slot = slot.clone();
+        gtk::CustomFilter::new(move |obj| {
+            ui_of(&slot).is_none_or(|ui| row_of(obj).matches(&ui.query.borrow()))
+        })
     };
     let filtered = gtk::FilterListModel::new(Some(store.clone()), Some(filter.clone()));
     let view = gtk::ColumnView::new(None::<gtk::MultiSelection>);
@@ -244,15 +1002,26 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     view.set_reorderable(true);
     let mut columns = Vec::new();
     for col in Column::ALL {
-        let c = make_column(col);
+        let c = make_column(col, slot.clone());
         view.append_column(&c);
         columns.push((col, c));
     }
     let sorted = gtk::SortListModel::new(Some(filtered.clone()), view.sorter());
     let selection = gtk::MultiSelection::new(Some(sorted));
     view.set_model(Some(&selection));
+    // Opened by each cell's right-click, see `make_column`.
+    let grid_menu = gio::Menu::new();
+    grid_menu.append(Some("Remove from Playlist"), Some("win.remove"));
+    grid_menu.append(Some("Show in Folder"), Some("win.show-in-folder"));
+    let row_menu = gtk::PopoverMenu::from_model(Some(&grid_menu));
+    row_menu.set_parent(&view);
+    row_menu.set_has_arrow(false);
+    {
+        let row_menu = row_menu.clone();
+        view.connect_destroy(move |_| row_menu.unparent());
+    }
 
-    // Header: title and search.
+    // Header: columns menu, title and search.
     let header = gtk::HeaderBar::new();
     let title = gtk::Label::new(Some("Music"));
     title.add_css_class("title");
@@ -263,7 +1032,6 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     header.pack_end(&search);
     window.set_titlebar(Some(&header));
 
-    // Columns menu: show or hide each column.
     let menu = gio::Menu::new();
     let actions = gio::SimpleActionGroup::new();
     for (i, (col, c)) in columns.iter().enumerate() {
@@ -298,20 +1066,18 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     status.set_margin_top(4);
     status.set_margin_bottom(4);
 
-    // Sidebar.
+    // Sidebar, filled once the window state exists.
     let sidebar = gtk::ListBox::new();
     sidebar.add_css_class("navigation-sidebar");
-    let mut sources: Vec<Option<Source>> = Vec::new();
-    sidebar.append(&sidebar_header("Library"));
-    sources.push(None);
-    sidebar.append(&sidebar_item("Music"));
-    sources.push(Some(Source::Library));
-    sidebar.append(&sidebar_header("Playlists"));
-    sources.push(None);
-    for name in data.playlist_names().unwrap_or_default() {
-        sidebar.append(&sidebar_item(&name));
-        sources.push(Some(Source::Playlist(name)));
-    }
+    let new_button = gtk::Button::from_icon_name("list-add-symbolic");
+    new_button.set_tooltip_text(Some("New Playlist (Ctrl+N)"));
+    new_button.set_action_name(Some("win.new-playlist"));
+    new_button.add_css_class("flat");
+    new_button.set_halign(gtk::Align::Start);
+    new_button.set_margin_start(8);
+    new_button.set_margin_top(4);
+    new_button.set_margin_bottom(4);
+
     let device_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     if let Ok(Some(d)) = data.device() {
         let label = gtk::Label::new(Some(&device_text(&d)));
@@ -339,6 +1105,7 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         .child(&sidebar)
         .build();
     side.append(&side_scroll);
+    side.append(&new_button);
     side.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     side.append(&device_box);
 
@@ -360,41 +1127,77 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     window.set_child(Some(&paned));
 
     let ui = Rc::new(Ui {
+        window: window.clone(),
         data,
         store,
         filter,
-        query,
-        view,
+        query: RefCell::new(view_model::Query::default()),
+        view: view.clone(),
+        selection,
         columns,
         status,
         filtered,
         title,
+        sidebar: sidebar.clone(),
+        sources: RefCell::new(Vec::new()),
+        current: RefCell::new(Source::Library),
+        drag: RefCell::new(None),
+        context_playlist: RefCell::new(None),
+        layouts: RefCell::new(load_layouts()),
+        playlist_layout: Cell::new(false),
+        reload_pending: Cell::new(false),
+        monitor: RefCell::new(None),
+        shown_mtime: Cell::new(None),
+        row_menu,
+        playlist_actions: RefCell::new(Vec::new()),
+        unwatched: Cell::new(false),
     });
+    slot.set(Rc::downgrade(&ui)).expect("set once");
+    let library_layout = ui.layouts.borrow().library.complete(false);
+    ui.apply_layout(&library_layout);
 
-    let sources = Rc::new(sources);
-    {
-        let ui = ui.clone();
-        let sources = sources.clone();
-        sidebar.connect_row_selected(move |_, row| {
-            if let Some(Some(source)) = row.and_then(|r| sources.get(r.index() as usize)) {
-                ui.show(source);
-            }
-        });
-    }
-    {
-        let ui = ui.clone();
-        search.connect_search_changed(move |s| {
-            *ui.query.borrow_mut() = view_model::Query::new(&s.text());
-            ui.filter.changed(gtk::FilterChange::Different);
-            ui.update_status();
-        });
-    }
-    // Ctrl+F focuses the search, whatever Caps Lock says.
-    let shortcuts = gtk::ShortcutController::new();
-    shortcuts.set_scope(gtk::ShortcutScope::Global);
+    // Actions, also reachable from the keyboard and the context menus.
+    let remove = action(window, "remove", &ui, |ui| ui.remove_selected());
+    let up = action(window, "move-up", &ui, |ui| ui.nudge(-1));
+    let down = action(window, "move-down", &ui, |ui| ui.nudge(1));
+    action(window, "show-in-folder", &ui, |ui| ui.show_in_folder());
+    action(window, "new-playlist", &ui, |ui| ui.new_playlist());
+    // F2 renames the playlist on screen; the sidebar menu acts on the
+    // playlist it was opened on.
+    action(window, "rename-playlist", &ui, |ui| {
+        if let Some(name) = ui.playlist_name() {
+            ui.rename_playlist(name);
+        }
+    });
+    action(window, "rename-clicked", &ui, |ui| {
+        if let Some(name) = ui.context_playlist.take() {
+            ui.rename_playlist(name);
+        }
+    });
+    action(window, "delete-clicked", &ui, |ui| {
+        if let Some(name) = ui.context_playlist.take() {
+            ui.delete_playlist(name);
+        }
+    });
+    *ui.playlist_actions.borrow_mut() = vec![remove.clone(), up.clone(), down.clone()];
+
+    // Grid keys: Delete removes from the playlist, Ctrl+Up and Ctrl+Down
+    // move. Local to the grid, so the search field keeps its own keys.
+    let grid_keys = gtk::ShortcutController::new();
+    // Before the grid's own Ctrl+Up and Ctrl+Down, which move the focus.
+    grid_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    shortcut(&grid_keys, "Delete", "win.remove");
+    shortcut(&grid_keys, "<Control>Up", "win.move-up");
+    shortcut(&grid_keys, "<Control>Down", "win.move-down");
+    view.add_controller(grid_keys);
+    let window_keys = gtk::ShortcutController::new();
+    window_keys.set_scope(gtk::ShortcutScope::Global);
+    shortcut(&window_keys, "<Control>n", "win.new-playlist");
+    shortcut(&window_keys, "F2", "win.rename-playlist");
     {
         let search = search.clone();
-        shortcuts.add_shortcut(gtk::Shortcut::new(
+        // Ctrl+F focuses the search, whatever Caps Lock says.
+        window_keys.add_shortcut(gtk::Shortcut::new(
             gtk::ShortcutTrigger::parse_string("<Control>f"),
             Some(gtk::CallbackAction::new(move |_, _| {
                 search.grab_focus();
@@ -402,9 +1205,101 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
             })),
         ));
     }
-    window.add_controller(shortcuts);
+    window.add_controller(window_keys);
 
-    if let Some(music) = sidebar.row_at_index(1) {
-        sidebar.select_row(Some(&music));
+    // Sidebar context menu on a playlist: rename or delete it.
+    let side_menu = gio::Menu::new();
+    side_menu.append(Some("Rename…"), Some("win.rename-clicked"));
+    side_menu.append(Some("Delete…"), Some("win.delete-clicked"));
+    {
+        let weak = Rc::downgrade(&ui);
+        context_menu(&sidebar, &side_menu, move |_, y| {
+            let Some(ui) = weak.upgrade() else {
+                return false;
+            };
+            let Some(row) = ui.sidebar.row_at_y(y as i32) else {
+                return false;
+            };
+            let source = ui
+                .sources
+                .borrow()
+                .get(row.index() as usize)
+                .cloned()
+                .flatten();
+            match source {
+                Some(Source::Playlist(name)) => {
+                    *ui.context_playlist.borrow_mut() = Some(name);
+                    true
+                }
+                _ => false,
+            }
+        });
     }
+    {
+        let weak = Rc::downgrade(&ui);
+        let set_enabled = move |in_playlist: bool| {
+            for a in [&remove, &up, &down] {
+                a.set_enabled(in_playlist);
+            }
+        };
+        sidebar.connect_row_selected(move |_, row| {
+            let Some(ui) = weak.upgrade() else { return };
+            let source = row.and_then(|r| {
+                ui.sources
+                    .borrow()
+                    .get(r.index() as usize)
+                    .cloned()
+                    .flatten()
+            });
+            if let Some(source) = source {
+                set_enabled(matches!(source, Source::Playlist(_)));
+                ui.show(&source);
+            }
+        });
+    }
+    {
+        let weak = Rc::downgrade(&ui);
+        search.connect_search_changed(move |s| {
+            let Some(ui) = weak.upgrade() else { return };
+            *ui.query.borrow_mut() = view_model::Query::new(&s.text());
+            ui.filter.changed(gtk::FilterChange::Different);
+            ui.update_status();
+        });
+    }
+
+    // Playlist files changed by other programs are picked up.
+    let dir = gio::File::for_path(ui.data.playlists_dir());
+    if let Ok(monitor) =
+        dir.monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+    {
+        let weak = Rc::downgrade(&ui);
+        monitor.connect_changed(move |_, _, _, _| {
+            if let Some(ui) = weak.upgrade() {
+                ui.schedule_reload();
+            }
+        });
+        *ui.monitor.borrow_mut() = Some(monitor);
+    } else {
+        ui.unwatched.set(true);
+    }
+    {
+        let weak = Rc::downgrade(&ui);
+        window.connect_close_request(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.save_layouts();
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    // The window owns the state from here.
+    keep_alive(window, ui.clone());
+    ui.fill_sidebar();
+}
+
+/// Ties `ui` to the window's lifetime: everything else holds weak links.
+fn keep_alive(window: &gtk::ApplicationWindow, ui: Rc<Ui>) {
+    let cell = RefCell::new(Some(ui));
+    window.connect_destroy(move |_| {
+        cell.borrow_mut().take();
+    });
 }

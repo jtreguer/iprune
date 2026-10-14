@@ -258,3 +258,293 @@ fn open_warning_child() {
     assert!(w.contains("playlists folder"), "{w}");
     assert!(d.library().unwrap().is_empty());
 }
+
+// ------------------------------------------------------ playlist editing
+
+/// A `Data` whose playlists folder and tracks live in a temp dir.
+struct Sandbox {
+    _tmp: tempfile::TempDir,
+    data: Data,
+    lists: PathBuf,
+    tracks: Vec<PathBuf>,
+}
+
+fn sandbox(n: usize) -> Sandbox {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let lists = root.join("lists");
+    std::fs::create_dir_all(&lists).unwrap();
+    let mut config = Config::default();
+    config.library.roots = vec![root.join("music")];
+    config.playlists.dir = lists.clone();
+    config.device.mountpoint = root.join("nomount");
+    let store = Store::open_in_memory().unwrap();
+    let mut tracks = Vec::new();
+    for i in 0..n {
+        let path = root.join(format!("music/t{i}.mp3"));
+        let key = path.to_str().unwrap().to_owned();
+        let f = FileRecord {
+            path: path.clone(),
+            path_key: key,
+            size: 1,
+            mtime_ns: 0,
+            hash: [i as u8 + 1; 32],
+            info: AudioInfo {
+                kind: FileKind::Mp3,
+                duration_ms: Some(1000),
+                bitrate: None,
+                samplerate: None,
+            },
+            tags: Tags::default(),
+            tag_error: None,
+            drm: false,
+        };
+        store::insert_track(store.conn(), &f, 0).unwrap();
+        tracks.push(path);
+    }
+    Sandbox {
+        _tmp: tmp,
+        data: Data {
+            config,
+            store,
+            stats: HashMap::new(),
+            warning: None,
+        },
+        lists,
+        tracks,
+    }
+}
+
+impl Sandbox {
+    fn file(&self, name: &str) -> PathBuf {
+        self.lists.join(format!("{name}.m3u8"))
+    }
+    fn text(&self, name: &str) -> String {
+        std::fs::read_to_string(self.file(name)).unwrap()
+    }
+    /// Track paths of a playlist as the window would show them.
+    fn shown(&self, name: &str) -> Vec<PathBuf> {
+        self.data
+            .playlist(name)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect()
+    }
+    fn pick(&self, idx: &[usize]) -> Vec<PathBuf> {
+        idx.iter().map(|&i| self.tracks[i].clone()).collect()
+    }
+}
+
+#[test]
+fn playlists_dir_is_the_configured_folder() {
+    let sb = sandbox(0);
+    assert_eq!(sb.data.playlists_dir(), sb.lists.as_path());
+}
+
+#[test]
+fn create_makes_an_empty_playlist_that_is_listed_and_a_second_create_fails() {
+    let sb = sandbox(1);
+    sb.data.create("mix").unwrap();
+    assert_eq!(sb.text("mix"), "#EXTM3U\n");
+    assert_eq!(sb.data.playlist_names().unwrap(), ["mix"]);
+    assert!(sb.data.playlist("mix").unwrap().is_empty());
+
+    sb.data.add("mix", &sb.pick(&[0]), None).unwrap();
+    let before = sb.text("mix");
+    assert!(sb.data.create("mix").is_err());
+    assert_eq!(sb.text("mix"), before, "the existing playlist is untouched");
+    assert!(sb.data.create("bad/name").is_err());
+    assert_eq!(std::fs::read_dir(&sb.lists).unwrap().count(), 1);
+}
+
+#[test]
+fn add_appends_or_inserts_and_the_window_rows_follow() {
+    let sb = sandbox(4);
+    sb.data.create("mix").unwrap();
+    sb.data.add("mix", &sb.pick(&[0, 1]), None).unwrap();
+    assert_eq!(sb.shown("mix"), sb.pick(&[0, 1]));
+    sb.data.add("mix", &sb.pick(&[2, 3]), Some(2)).unwrap();
+    assert_eq!(sb.shown("mix"), sb.pick(&[0, 2, 3, 1]));
+    let rows = sb.data.playlist("mix").unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.position).collect::<Vec<_>>(),
+        [Some(1), Some(2), Some(3), Some(4)]
+    );
+    // the file says the same as the rows
+    let text = sb.text("mix");
+    let on_disk: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+    assert_eq!(
+        on_disk,
+        sb.pick(&[0, 2, 3, 1])
+            .iter()
+            .map(|p| p.to_str().unwrap())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn add_of_an_unindexed_file_or_to_an_unknown_playlist_fails_and_writes_nothing() {
+    let sb = sandbox(1);
+    sb.data.create("mix").unwrap();
+    let before = sb.text("mix");
+    let stranger = sb.lists.join("../music/stranger.mp3");
+    assert!(sb.data.add("mix", &[stranger], None).is_err());
+    assert!(sb.data.add("nope", &sb.pick(&[0]), None).is_err());
+    assert!(sb.data.add("mix", &sb.pick(&[0]), Some(5)).is_err());
+    assert_eq!(sb.text("mix"), before);
+    assert!(!sb.file("nope").exists());
+}
+
+#[test]
+fn move_entries_reorders_the_file_and_the_rows() {
+    let sb = sandbox(5);
+    sb.data.create("mix").unwrap();
+    sb.data
+        .add("mix", &sb.pick(&[0, 1, 2, 3, 4]), None)
+        .unwrap();
+    sb.data.move_entries("mix", &[2, 4], 1).unwrap();
+    assert_eq!(sb.shown("mix"), sb.pick(&[1, 3, 0, 2, 4]));
+    sb.data.move_entries("mix", &[1], 6).unwrap();
+    assert_eq!(sb.shown("mix"), sb.pick(&[3, 0, 2, 4, 1]));
+
+    // a bad position changes nothing
+    let before = sb.text("mix");
+    assert!(sb.data.move_entries("mix", &[9], 1).is_err());
+    assert!(sb.data.move_entries("mix", &[1], 7).is_err());
+    assert_eq!(sb.text("mix"), before);
+}
+
+#[test]
+fn remove_drops_exactly_those_entries() {
+    let sb = sandbox(4);
+    sb.data.create("mix").unwrap();
+    sb.data.add("mix", &sb.pick(&[0, 1, 2, 3]), None).unwrap();
+    sb.data.remove("mix", &[2, 4, 2]).unwrap();
+    assert_eq!(sb.shown("mix"), sb.pick(&[0, 2]));
+    let before = sb.text("mix");
+    assert!(sb.data.remove("mix", &[1, 3]).is_err());
+    assert_eq!(sb.text("mix"), before, "a bad position removes nothing");
+    // the library still has all four tracks
+    assert_eq!(sb.data.library().unwrap().len(), 4);
+}
+
+#[test]
+fn rename_moves_the_file_and_keeps_the_entries() {
+    let sb = sandbox(2);
+    sb.data.create("old").unwrap();
+    sb.data.add("old", &sb.pick(&[1, 0]), None).unwrap();
+    let text = sb.text("old");
+    sb.data.rename("old", "new").unwrap();
+    assert!(!sb.file("old").exists());
+    assert_eq!(sb.text("new"), text);
+    assert_eq!(sb.data.playlist_names().unwrap(), ["new"]);
+    assert_eq!(sb.shown("new"), sb.pick(&[1, 0]));
+
+    // onto an existing one, from an unknown one: nothing changes
+    sb.data.create("other").unwrap();
+    assert!(sb.data.rename("new", "other").is_err());
+    assert!(sb.data.rename("ghost", "x").is_err());
+    assert_eq!(sb.text("new"), text);
+    assert_eq!(sb.text("other"), "#EXTM3U\n");
+    assert!(!sb.file("x").exists());
+}
+
+#[test]
+fn delete_removes_the_file_and_the_listing_but_not_the_tracks() {
+    let sb = sandbox(2);
+    sb.data.create("keep").unwrap();
+    sb.data.create("gone").unwrap();
+    sb.data.add("gone", &sb.pick(&[0, 1]), None).unwrap();
+    let keep = sb.text("keep");
+    sb.data.delete("gone").unwrap();
+    assert!(!sb.file("gone").exists());
+    assert_eq!(sb.data.playlist_names().unwrap(), ["keep"]);
+    assert_eq!(sb.text("keep"), keep);
+    assert_eq!(sb.data.library().unwrap().len(), 2);
+    assert!(sb.data.delete("gone").is_err());
+    assert!(sb.data.playlist("gone").is_err());
+}
+
+#[test]
+fn playlist_mtime_follows_every_kind_of_edit_and_is_none_for_unknown_playlists() {
+    let sb = sandbox(3);
+    assert_eq!(sb.data.playlist_mtime("mix"), None);
+    sb.data.create("mix").unwrap();
+    let m0 = sb.data.playlist_mtime("mix").unwrap();
+    assert!(m0 > 0);
+    // Make the previous mtime unreachable by "now", whatever the clock grain.
+    let set_past = |secs: u64| {
+        std::fs::File::options()
+            .write(true)
+            .open(sb.file("mix"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    };
+    set_past(1_000_000);
+    let past = sb.data.playlist_mtime("mix").unwrap();
+    assert_ne!(past, m0);
+
+    sb.data.add("mix", &sb.pick(&[0, 1, 2]), None).unwrap();
+    let after_add = sb.data.playlist_mtime("mix").unwrap();
+    assert_ne!(after_add, past);
+    set_past(1_000_000);
+    sb.data.move_entries("mix", &[3], 1).unwrap();
+    let after_move = sb.data.playlist_mtime("mix").unwrap();
+    assert_ne!(after_move, past);
+    set_past(1_000_000);
+    sb.data.remove("mix", &[1]).unwrap();
+    assert_ne!(sb.data.playlist_mtime("mix").unwrap(), past);
+
+    // equals what the file system says, so a monitor can compare it
+    let fs_mtime = std::fs::metadata(sb.file("mix"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let ns = fs_mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    assert_eq!(sb.data.playlist_mtime("mix"), Some(ns));
+    sb.data.delete("mix").unwrap();
+    assert_eq!(sb.data.playlist_mtime("mix"), None);
+}
+
+#[test]
+fn reload_playlists_picks_up_outside_edits_and_deletions_and_writes_no_file() {
+    let sb = sandbox(3);
+    sb.data.create("mix").unwrap();
+    sb.data.add("mix", &sb.pick(&[0]), None).unwrap();
+    sb.data.create("doomed").unwrap();
+
+    // Another program rewrites one list, adds one, deletes one.
+    let body = |idx: &[usize]| {
+        let mut s = String::from("#EXTM3U\n");
+        for p in sb.pick(idx) {
+            s.push_str(&format!("{}\n", p.display()));
+        }
+        s
+    };
+    std::fs::write(sb.file("mix"), body(&[2, 1])).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(sb.file("mix"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+        .unwrap();
+    std::fs::write(sb.file("fresh"), body(&[0])).unwrap();
+    std::fs::remove_file(sb.file("doomed")).unwrap();
+    let mix_text = sb.text("mix");
+
+    let report = sb.data.reload_playlists().unwrap();
+    assert_eq!(report.removed, ["doomed"]);
+    assert!(report.loaded >= 2, "{report:?}");
+    assert_eq!(sb.data.playlist_names().unwrap(), ["fresh", "mix"]);
+    assert_eq!(sb.shown("mix"), sb.pick(&[2, 1]));
+    assert_eq!(sb.text("mix"), mix_text, "reload never rewrites a file");
+    assert!(!sb.file("doomed").exists());
+
+    // a second reload with nothing changed loads nothing
+    assert_eq!(sb.data.reload_playlists().unwrap().loaded, 0);
+}

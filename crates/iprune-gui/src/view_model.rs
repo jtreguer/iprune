@@ -288,6 +288,34 @@ impl Column {
         }
     }
 
+    /// A stable name for saving the layout.
+    pub fn key(self) -> &'static str {
+        match self {
+            Column::Position => "position",
+            Column::Name => "name",
+            Column::Time => "time",
+            Column::Artist => "artist",
+            Column::Album => "album",
+            Column::AlbumArtist => "album_artist",
+            Column::Composer => "composer",
+            Column::Genre => "genre",
+            Column::Year => "year",
+            Column::Disc => "disc",
+            Column::Track => "track",
+            Column::Plays => "plays",
+            Column::Skips => "skips",
+            Column::Rating => "rating",
+            Column::LastPlayed => "last_played",
+            Column::Added => "added",
+            Column::Kind => "kind",
+            Column::Size => "size",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Column> {
+        Column::ALL.into_iter().find(|c| c.key() == key)
+    }
+
     /// Initial width in pixels.
     pub fn width(self) -> i32 {
         match self {
@@ -483,3 +511,149 @@ pub fn summary<'a>(rows: impl Iterator<Item = &'a Row>) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// How one column is shown.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ColumnState {
+    pub id: String,
+    pub width: i32,
+    pub visible: bool,
+}
+
+/// The column layout of one kind of view (the library, or playlists), in
+/// display order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Layout {
+    pub columns: Vec<ColumnState>,
+}
+
+/// The saved layouts, `~/.local/state/iprune/ui.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Layouts {
+    #[serde(default)]
+    pub library: Layout,
+    #[serde(default)]
+    pub playlist: Layout,
+}
+
+impl Layout {
+    /// The default layout. In the library the position column is hidden:
+    /// there is no position.
+    pub fn default_for(playlist: bool) -> Layout {
+        Layout {
+            columns: Column::ALL
+                .iter()
+                .map(|c| ColumnState {
+                    id: c.key().to_owned(),
+                    width: c.width(),
+                    visible: c.visible_by_default() && (playlist || *c != Column::Position),
+                })
+                .collect(),
+        }
+    }
+
+    /// A saved layout made whole: unknown or repeated columns dropped, a
+    /// width below 24 pixels raised to 24, and columns it lacks (added in a
+    /// later version) appended with their defaults. In the library the
+    /// position column stays hidden.
+    pub fn complete(&self, playlist: bool) -> Layout {
+        let defaults = Layout::default_for(playlist);
+        let mut seen = std::collections::HashSet::new();
+        let mut columns: Vec<ColumnState> = self
+            .columns
+            .iter()
+            .filter(|c| Column::from_key(&c.id).is_some() && seen.insert(c.id.clone()))
+            .map(|c| ColumnState {
+                id: c.id.clone(),
+                width: c.width.max(24),
+                visible: c.visible && (playlist || c.id != Column::Position.key()),
+            })
+            .collect();
+        for d in defaults.columns {
+            if !seen.contains(&d.id) {
+                columns.push(d);
+            }
+        }
+        Layout { columns }
+    }
+}
+
+/// The 1-based positions the entries at `moved` end up at after
+/// [`iprune_core::playlists::reorder`] gave `order`, sorted.
+pub fn new_positions(order: &[usize], moved: &[usize]) -> Vec<usize> {
+    let mut out: Vec<usize> = order
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| moved.contains(p))
+        .map(|(i, _)| i + 1)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// Where a drop on the row at 1-based `position` inserts: before it in its
+/// upper half, after it in its lower half.
+pub fn drop_before(position: usize, y: f64, height: f64) -> usize {
+    if y < height / 2.0 {
+        position
+    } else {
+        position + 1
+    }
+}
+
+impl Layouts {
+    /// Reads `ui.toml`, keeping whatever is readable: a malformed column is
+    /// dropped on its own, and a view that cannot be read gets the default.
+    pub fn parse(text: &str) -> Layouts {
+        let Ok(table) = text.parse::<toml::Table>() else {
+            return Layouts::default();
+        };
+        let view = |key: &str| -> Layout {
+            let columns = table
+                .get(key)
+                .and_then(|v| v.get("columns"))
+                .and_then(|c| c.as_array())
+                .map(|cols| {
+                    cols.iter()
+                        .filter_map(|c| c.clone().try_into::<ColumnState>().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Layout { columns }
+        };
+        Layouts {
+            library: view("library"),
+            playlist: view("playlist"),
+        }
+    }
+}
+
+/// What Ctrl+Up or Ctrl+Down does with the selected positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nudge {
+    /// Move them before this 1-based position (see `playlists::reorder`).
+    Before(usize),
+    /// The selection has gaps: moving it would gather it.
+    NotAdjacent,
+    /// Nothing selected, or already at the top or bottom.
+    Nothing,
+}
+
+/// The move for Ctrl+Up (`up`) or Ctrl+Down on 1-based `positions` in a
+/// playlist of `len` entries: one place, adjacent entries only.
+pub fn nudge_before(positions: &[usize], len: usize, up: bool) -> Nudge {
+    let mut p = positions.to_vec();
+    p.sort_unstable();
+    p.dedup();
+    let (Some(&first), Some(&last)) = (p.first(), p.last()) else {
+        return Nudge::Nothing;
+    };
+    if last - first + 1 != p.len() {
+        return Nudge::NotAdjacent;
+    }
+    match up {
+        true if first > 1 => Nudge::Before(first - 1),
+        false if last < len => Nudge::Before(last + 2),
+        _ => Nudge::Nothing,
+    }
+}

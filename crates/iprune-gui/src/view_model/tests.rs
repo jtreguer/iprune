@@ -965,3 +965,461 @@ fn a_query_is_folded_once_and_empty_ones_match_everything() {
     assert!(blank().matches(&Query::default()));
     assert!(!blank().matches(&Query::new("a")));
 }
+
+// ------------------------------------------------------------- layout
+
+fn cs(id: &str, width: i32, visible: bool) -> ColumnState {
+    ColumnState {
+        id: id.to_owned(),
+        width,
+        visible,
+    }
+}
+
+fn ids(l: &Layout) -> Vec<&str> {
+    l.columns.iter().map(|c| c.id.as_str()).collect()
+}
+
+fn find<'a>(l: &'a Layout, id: &str) -> &'a ColumnState {
+    l.columns
+        .iter()
+        .find(|c| c.id == id)
+        .unwrap_or_else(|| panic!("no column {id}"))
+}
+
+#[test]
+fn column_keys_round_trip_and_are_unique() {
+    let mut seen = std::collections::HashSet::new();
+    for c in Column::ALL {
+        assert_eq!(Column::from_key(c.key()), Some(c), "{}", c.key());
+        assert!(seen.insert(c.key()), "duplicate key {}", c.key());
+    }
+    assert_eq!(seen.len(), 18);
+    for bad in ["", "Name", "nope", " name", "album artist"] {
+        assert_eq!(Column::from_key(bad), None, "{bad:?}");
+    }
+}
+
+#[test]
+fn column_keys_are_the_saved_names_and_must_not_change() {
+    // ui.toml files in the wild use these; renaming one drops the user's layout.
+    let want = [
+        (Column::Position, "position"),
+        (Column::Name, "name"),
+        (Column::Time, "time"),
+        (Column::Artist, "artist"),
+        (Column::Album, "album"),
+        (Column::AlbumArtist, "album_artist"),
+        (Column::Composer, "composer"),
+        (Column::Genre, "genre"),
+        (Column::Year, "year"),
+        (Column::Disc, "disc"),
+        (Column::Track, "track"),
+        (Column::Plays, "plays"),
+        (Column::Skips, "skips"),
+        (Column::Rating, "rating"),
+        (Column::LastPlayed, "last_played"),
+        (Column::Added, "added"),
+        (Column::Kind, "kind"),
+        (Column::Size, "size"),
+    ];
+    assert_eq!(want.len(), Column::ALL.len());
+    for (c, k) in want {
+        assert_eq!(c.key(), k);
+    }
+}
+
+#[test]
+fn default_layout_lists_every_column_once_with_its_defaults() {
+    for playlist in [false, true] {
+        let l = Layout::default_for(playlist);
+        assert_eq!(l.columns.len(), Column::ALL.len());
+        for (state, c) in l.columns.iter().zip(Column::ALL) {
+            assert_eq!(state.id, c.key());
+            assert_eq!(state.width, c.width());
+            let want = c.visible_by_default() && (playlist || c != Column::Position);
+            assert_eq!(state.visible, want, "{} playlist={playlist}", c.key());
+        }
+    }
+    assert!(find(&Layout::default_for(true), "position").visible);
+    assert!(!find(&Layout::default_for(false), "position").visible);
+    assert!(find(&Layout::default_for(false), "name").visible);
+}
+
+#[test]
+fn complete_of_a_default_layout_changes_nothing() {
+    for playlist in [false, true] {
+        let d = Layout::default_for(playlist);
+        assert_eq!(d.complete(playlist), d);
+        assert_eq!(
+            d.complete(playlist).complete(playlist),
+            d.complete(playlist)
+        );
+    }
+}
+
+#[test]
+fn complete_of_an_empty_layout_is_the_default() {
+    for playlist in [false, true] {
+        assert_eq!(
+            Layout::default().complete(playlist),
+            Layout::default_for(playlist)
+        );
+    }
+}
+
+#[test]
+fn complete_drops_unknown_and_repeated_columns_keeping_the_first() {
+    let saved = Layout {
+        columns: vec![
+            cs("artist", 150, true),
+            cs("bogus", 100, true),
+            cs("name", 300, false),
+            cs("artist", 999, false), // repeat: ignored, the first one stands
+            cs("", 50, true),
+        ],
+    };
+    let l = saved.complete(true);
+    assert_eq!(&ids(&l)[..2], ["artist", "name"]);
+    assert_eq!(l.columns.iter().filter(|c| c.id == "artist").count(), 1);
+    assert!(l.columns.iter().all(|c| Column::from_key(&c.id).is_some()));
+    assert_eq!(find(&l, "artist"), &cs("artist", 150, true));
+    assert_eq!(find(&l, "name"), &cs("name", 300, false));
+}
+
+#[test]
+fn complete_raises_narrow_widths_to_24_and_leaves_others() {
+    let saved = Layout {
+        columns: vec![
+            cs("name", 0, true),
+            cs("artist", -5, true),
+            cs("album", 23, true),
+            cs("genre", 24, true),
+            cs("year", 25, true),
+            cs("time", 4000, true),
+        ],
+    };
+    let l = saved.complete(true);
+    let w = |id| find(&l, id).width;
+    assert_eq!(
+        [
+            w("name"),
+            w("artist"),
+            w("album"),
+            w("genre"),
+            w("year"),
+            w("time")
+        ],
+        [24, 24, 24, 24, 25, 4000]
+    );
+}
+
+#[test]
+fn complete_appends_missing_columns_after_the_saved_ones_with_their_defaults() {
+    let saved = Layout {
+        columns: vec![cs("album", 111, false), cs("name", 222, true)],
+    };
+    let l = saved.complete(true);
+    assert_eq!(l.columns.len(), Column::ALL.len());
+    assert_eq!(&ids(&l)[..2], ["album", "name"]);
+    // the rest, in the default order, exactly as the default has them
+    let defaults = Layout::default_for(true);
+    let rest: Vec<_> = defaults
+        .columns
+        .iter()
+        .filter(|c| c.id != "album" && c.id != "name")
+        .cloned()
+        .collect();
+    assert_eq!(l.columns[2..], rest[..]);
+    // saved state is not overridden by the defaults
+    assert_eq!(find(&l, "album"), &cs("album", 111, false));
+}
+
+#[test]
+fn complete_keeps_position_hidden_in_the_library_only() {
+    let saved = Layout {
+        columns: vec![cs("position", 60, true), cs("name", 200, true)],
+    };
+    let lib = saved.complete(false);
+    assert!(!find(&lib, "position").visible);
+    assert_eq!(find(&lib, "position").width, 60);
+    assert!(find(&lib, "name").visible);
+    let pl = saved.complete(true);
+    assert!(find(&pl, "position").visible);
+    // a position column the saved layout lacks is appended hidden in the library
+    let lib = Layout {
+        columns: vec![cs("name", 200, true)],
+    }
+    .complete(false);
+    assert!(!find(&lib, "position").visible);
+}
+
+#[test]
+fn layouts_round_trip_through_toml() {
+    let layouts = Layouts {
+        library: Layout {
+            columns: vec![cs("name", 310, true), cs("album_artist", 77, false)],
+        },
+        playlist: Layout::default_for(true),
+    };
+    let text = toml::to_string(&layouts).unwrap();
+    let back: Layouts = toml::from_str(&text).unwrap();
+    assert_eq!(back, layouts);
+    // the keys in the file are the column keys
+    assert!(text.contains("id = \"album_artist\""), "{text}");
+}
+
+#[test]
+fn layouts_read_with_missing_sections_default_to_empty_and_complete_later() {
+    let l: Layouts = toml::from_str("").unwrap();
+    assert_eq!(l, Layouts::default());
+    let l: Layouts =
+        toml::from_str("[[playlist.columns]]\nid = \"year\"\nwidth = 90\nvisible = true\n")
+            .unwrap();
+    assert!(l.library.columns.is_empty());
+    assert_eq!(l.playlist.columns, vec![cs("year", 90, true)]);
+    assert_eq!(l.library.complete(false), Layout::default_for(false));
+}
+
+#[test]
+fn strict_serde_rejects_a_malformed_column_which_is_why_the_window_uses_parse() {
+    // a column missing its width
+    assert!(
+        toml::from_str::<Layouts>("[[library.columns]]\nid = \"name\"\nvisible = true\n").is_err()
+    );
+}
+
+// ------------------------------------------------- new_positions, drop_before
+
+#[test]
+fn new_positions_table() {
+    // (order from reorder, moved old positions, expected new 1-based positions)
+    let cases: &[(&[usize], &[usize], &[usize])] = &[
+        (&[2, 5, 1, 3, 4, 6], &[2, 5], &[1, 2]),
+        (&[1, 3, 4, 2, 5], &[2], &[4]),
+        (&[1, 2, 3, 4], &[2, 3], &[2, 3]),
+        (&[3, 4, 5, 6, 1, 2], &[1, 2], &[5, 6]),
+        (&[2, 3, 1], &[1], &[3]),
+        (&[1, 2, 3], &[], &[]),
+        // unsorted and repeated input is fine, the result is sorted
+        (&[2, 5, 1, 3, 4, 6], &[5, 2, 5], &[1, 2]),
+        (&[], &[], &[]),
+        // positions that are not in the order are ignored
+        (&[1, 2], &[7], &[]),
+    ];
+    for (order, moved, want) in cases {
+        assert_eq!(&new_positions(order, moved), want, "{order:?} {moved:?}");
+    }
+}
+
+#[test]
+fn new_positions_agrees_with_reorder() {
+    for (len, moved, before) in [
+        (6usize, vec![2usize, 5], 1usize),
+        (5, vec![1, 2], 6),
+        (7, vec![3, 4, 6], 2),
+    ] {
+        let order = iprune_core::playlists::reorder(len, &moved, before).unwrap();
+        let np = new_positions(&order, &moved);
+        assert_eq!(np.len(), moved.len());
+        for (new, old) in np.iter().zip(&moved) {
+            assert_eq!(order[new - 1], *old);
+        }
+    }
+}
+
+#[test]
+fn drop_before_splits_a_row_at_its_middle() {
+    // (position, y, height, expected)
+    let cases = [
+        (3, 0.0, 24.0, 3),
+        (3, 11.9, 24.0, 3),
+        (3, 12.0, 24.0, 4), // exactly in the middle counts as the lower half
+        (3, 12.1, 24.0, 4),
+        (3, 24.0, 24.0, 4),
+        (1, 0.0, 24.0, 1),
+        (1, 23.9, 24.0, 2),
+        (10, 5.0, 0.0, 11), // degenerate height: never before
+        (2, -3.0, 24.0, 2), // above the row: before it
+    ];
+    for (p, y, h, want) in cases {
+        assert_eq!(drop_before(p, y, h), want, "pos {p} y {y} h {h}");
+    }
+}
+
+// ------------------------------------------------------------- nudge_before
+
+#[test]
+fn nudge_before_table() {
+    use Nudge::*;
+    // (positions, len, up, expected)
+    let cases: &[(&[usize], usize, bool, Nudge)] = &[
+        (&[3], 5, true, Before(2)),
+        (&[3], 5, false, Before(5)),
+        (&[2, 3, 4], 6, true, Before(1)),
+        (&[2, 3, 4], 6, false, Before(6)),
+        // any order, repeats
+        (&[4, 2, 3], 6, true, Before(1)),
+        (&[3, 3, 2, 2], 6, false, Before(5)),
+        // ends: down from the next to last reaches len + 1
+        (&[5], 5, true, Before(4)),
+        (&[4], 5, false, Before(6)),
+        (&[1], 5, false, Before(3)),
+        // already at the top or bottom
+        (&[1], 5, true, Nothing),
+        (&[1, 2], 5, true, Nothing),
+        (&[5], 5, false, Nothing),
+        (&[4, 5], 5, false, Nothing),
+        (&[1], 1, true, Nothing),
+        (&[1], 1, false, Nothing),
+        // empty
+        (&[], 5, true, Nothing),
+        (&[], 5, false, Nothing),
+        // gaps
+        (&[1, 3], 5, true, NotAdjacent),
+        (&[1, 3], 5, false, NotAdjacent),
+        (&[2, 3, 5], 6, true, NotAdjacent),
+        (&[5, 1], 5, false, NotAdjacent),
+        // gaps win over the edge: still not adjacent at the top
+        (&[1, 3], 3, true, NotAdjacent),
+    ];
+    for (p, len, up, want) in cases {
+        assert_eq!(nudge_before(p, *len, *up), *want, "{p:?} len {len} up {up}");
+    }
+}
+
+#[test]
+fn nudge_before_shifts_an_adjacent_block_by_exactly_one_place() {
+    for len in 1..=7usize {
+        for first in 1..=len {
+            for last in first..=len {
+                let block: Vec<usize> = (first..=last).collect();
+                for up in [true, false] {
+                    let n = nudge_before(&block, len, up);
+                    let edge = if up { first == 1 } else { last == len };
+                    if edge {
+                        assert_eq!(n, Nudge::Nothing, "{block:?} len {len} up {up}");
+                        continue;
+                    }
+                    let Nudge::Before(before) = n else {
+                        panic!("{block:?} len {len} up {up}: {n:?}")
+                    };
+                    let order = iprune_core::playlists::reorder(len, &block, before).unwrap();
+                    let shift: isize = if up { -1 } else { 1 };
+                    let want: Vec<usize> = block
+                        .iter()
+                        .map(|&p| (p as isize + shift) as usize)
+                        .collect();
+                    assert_eq!(
+                        new_positions(&order, &block),
+                        want,
+                        "{block:?} len {len} up {up} before {before}"
+                    );
+                    // and the entries that were not selected keep their order
+                    let others: Vec<usize> = order
+                        .iter()
+                        .copied()
+                        .filter(|p| !block.contains(p))
+                        .collect();
+                    assert_eq!(
+                        others,
+                        (1..=len).filter(|p| !block.contains(p)).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------ Layouts::parse
+
+#[test]
+fn parse_of_text_that_is_not_toml_gives_the_defaults() {
+    for bad in [
+        "",
+        "not toml at all {{",
+        "[library\ncolumns = ",
+        "\u{0}\u{1}",
+    ] {
+        assert_eq!(Layouts::parse(bad), Layouts::default(), "{bad:?}");
+    }
+}
+
+#[test]
+fn parse_drops_a_malformed_column_alone_and_keeps_the_others_in_order() {
+    let text = r#"
+[[library.columns]]
+id = "name"
+width = 300
+visible = true
+
+[[library.columns]]
+id = "artist"
+width = "wide"
+visible = true
+
+[[library.columns]]
+id = "album"
+visible = false
+
+[[library.columns]]
+id = "year"
+width = 70
+visible = false
+
+[[playlist.columns]]
+id = "genre"
+width = 99
+visible = true
+"#;
+    let l = Layouts::parse(text);
+    assert_eq!(
+        l.library.columns,
+        vec![cs("name", 300, true), cs("year", 70, false)]
+    );
+    assert_eq!(l.playlist.columns, vec![cs("genre", 99, true)]);
+}
+
+#[test]
+fn parse_gives_an_empty_layout_for_a_view_without_a_usable_columns_array() {
+    let good = "[[playlist.columns]]\nid = \"year\"\nwidth = 90\nvisible = true\n";
+    let want = vec![cs("year", 90, true)];
+    for bad_library in [
+        "[library]\n",
+        "[library]\ncolumns = \"name\"\n",
+        "[library]\ncolumns = 5\n",
+        "[library.columns]\nid = \"name\"\nwidth = 5\nvisible = true\n",
+        "library = 3\n",
+        "library = [1, 2]\n",
+    ] {
+        let l = Layouts::parse(&format!("{bad_library}\n{good}"));
+        assert!(l.library.columns.is_empty(), "{bad_library:?}");
+        assert_eq!(l.playlist.columns, want, "{bad_library:?}");
+    }
+    // and the other way round: the playlist view is the broken one
+    let l = Layouts::parse(
+        "[[library.columns]]\nid = \"year\"\nwidth = 90\nvisible = true\n[playlist]\ncolumns = 1\n",
+    );
+    assert_eq!(l.library.columns, want);
+    assert!(l.playlist.columns.is_empty());
+}
+
+#[test]
+fn parse_reads_back_what_serializing_wrote() {
+    for layouts in [
+        Layouts::default(),
+        Layouts {
+            library: Layout::default_for(false),
+            playlist: Layout::default_for(true),
+        },
+        Layouts {
+            library: Layout {
+                columns: vec![cs("album_artist", 24, false), cs("name", 4000, true)],
+            },
+            playlist: Layout::default(),
+        },
+    ] {
+        let text = toml::to_string(&layouts).unwrap();
+        assert_eq!(Layouts::parse(&text), layouts, "{text}");
+    }
+}

@@ -366,3 +366,46 @@ pub fn move_entry(
         Ok(())
     })
 }
+
+/// The order after moving the entries at 1-based `positions` (in any order,
+/// repeats ignored) so they sit together, in their current order, just
+/// before the entry now at 1-based `before`, or at the end when `before` is
+/// `len + 1`. Returns, for each new place, the 1-based position the entry
+/// came from. Pure.
+pub fn reorder(len: usize, positions: &[usize], before: usize) -> Result<Vec<usize>> {
+    let mut moved: Vec<usize> = positions.to_vec();
+    moved.sort_unstable();
+    moved.dedup();
+    for &p in &moved {
+        check_position(p, len)?;
+    }
+    check_position(before, len + 1)?;
+    let mut rest: Vec<usize> = (1..=len)
+        .filter(|p| moved.binary_search(p).is_err())
+        .collect();
+    // Where `before` lands once the moved entries are taken out. A target
+    // that is itself moved stands for the first entry after it that stays.
+    let at = rest.iter().position(|&p| p >= before).unwrap_or(rest.len());
+    rest.splice(at..at, moved);
+    Ok(rest)
+}
+
+/// Moves several entries at once, see [`reorder`]. One write of the file.
+pub fn move_entries(
+    conn: &Connection,
+    cfg: &Config,
+    name: &str,
+    positions: &[usize],
+    before: usize,
+) -> Result<()> {
+    edit(conn, cfg, name, |items| {
+        let order = reorder(items.len(), positions, before)?;
+        let old = std::mem::take(items);
+        let mut old: Vec<Option<Item>> = old.into_iter().map(Some).collect();
+        *items = order
+            .iter()
+            .map(|&p| old[p - 1].take().expect("each position once"))
+            .collect();
+        Ok(())
+    })
+}

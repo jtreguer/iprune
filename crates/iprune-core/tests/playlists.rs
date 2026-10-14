@@ -643,3 +643,266 @@ fn rename_leaves_a_single_file_with_one_link() {
     assert_eq!(fs::read_dir(&env.lists).unwrap().count(), 1);
     assert_eq!(fs::metadata(env.playlist_file("dst")).unwrap().nlink(), 1);
 }
+
+// ------------------------------------------------------- reorder / move_entries
+
+fn bad_position(r: iprune_core::Result<Vec<usize>>) -> (usize, usize) {
+    match r {
+        Err(Error::BadPosition { position, len }) => (position, len),
+        other => panic!("expected BadPosition, got {other:?}"),
+    }
+}
+
+#[test]
+fn reorder_table() {
+    // (len, positions, before, expected order as old 1-based positions)
+    let cases: &[(usize, &[usize], usize, &[usize])] = &[
+        // one entry down and up
+        (5, &[2], 5, &[1, 3, 4, 2, 5]),
+        (5, &[4], 2, &[1, 4, 2, 3, 5]),
+        // to the very end and to the very start
+        (4, &[1], 5, &[2, 3, 4, 1]),
+        (4, &[4], 1, &[4, 1, 2, 3]),
+        // a block to the start and to the end
+        (6, &[4, 5, 6], 1, &[4, 5, 6, 1, 2, 3]),
+        (6, &[1, 2], 7, &[3, 4, 5, 6, 1, 2]),
+        // a block in the middle, moved down and up
+        (7, &[2, 3], 6, &[1, 4, 5, 2, 3, 6, 7]),
+        (7, &[5, 6], 2, &[1, 5, 6, 2, 3, 4, 7]),
+        // non contiguous selections gather, keeping their relative order
+        (6, &[2, 5], 1, &[2, 5, 1, 3, 4, 6]),
+        (6, &[2, 5], 7, &[1, 3, 4, 6, 2, 5]),
+        (6, &[1, 6], 4, &[2, 3, 1, 6, 4, 5]),
+        // positions given out of order: the current order wins
+        (6, &[5, 2], 1, &[2, 5, 1, 3, 4, 6]),
+        // before inside the moved set stands for the next entry that stays
+        (5, &[2, 3], 3, &[1, 2, 3, 4, 5]),
+        (5, &[2, 3], 2, &[1, 2, 3, 4, 5]),
+        (6, &[2, 3, 4], 3, &[1, 2, 3, 4, 5, 6]),
+        (6, &[1, 3], 3, &[2, 1, 3, 4, 5, 6]),
+        (6, &[2, 4], 4, &[1, 3, 2, 4, 5, 6]),
+        // before inside the moved set, with the next staying entry later
+        (6, &[2, 3], 2, &[1, 2, 3, 4, 5, 6]),
+        (6, &[5, 6], 6, &[1, 2, 3, 4, 5, 6]),
+        // no-ops
+        (3, &[1], 1, &[1, 2, 3]),
+        (3, &[1], 2, &[1, 2, 3]),
+        (3, &[3], 4, &[1, 2, 3]),
+        (3, &[3], 3, &[1, 2, 3]),
+        (3, &[1, 2, 3], 2, &[1, 2, 3]),
+        (3, &[1, 2, 3], 4, &[1, 2, 3]),
+        (3, &[], 2, &[1, 2, 3]),
+        // repeats count once
+        (4, &[2, 2, 2], 5, &[1, 3, 4, 2]),
+        (5, &[4, 2, 4, 2], 1, &[2, 4, 1, 3, 5]),
+        // empty and single playlists
+        (0, &[], 1, &[]),
+        (1, &[1], 1, &[1]),
+        (1, &[1], 2, &[1]),
+    ];
+    for (len, positions, before, want) in cases {
+        let got = playlists::reorder(*len, positions, *before)
+            .unwrap_or_else(|e| panic!("len {len} {positions:?} before {before}: {e}"));
+        assert_eq!(&got, want, "len {len} {positions:?} before {before}");
+    }
+}
+
+#[test]
+fn reorder_rejects_bad_positions_and_before_with_the_offending_value() {
+    // position 0 and past the end
+    assert_eq!(bad_position(playlists::reorder(3, &[0], 1)), (0, 3));
+    assert_eq!(bad_position(playlists::reorder(3, &[4], 1)), (4, 3));
+    // one bad value among good ones, repeated or not, still refuses
+    assert_eq!(bad_position(playlists::reorder(3, &[1, 2, 9], 1)), (9, 3));
+    assert_eq!(bad_position(playlists::reorder(3, &[2, 2, 0], 1)), (0, 3));
+    // before: 0 and past len + 1 (len + 1 itself is the end and is valid)
+    assert_eq!(bad_position(playlists::reorder(3, &[1], 0)), (0, 4));
+    assert_eq!(bad_position(playlists::reorder(3, &[1], 5)), (5, 4));
+    assert!(playlists::reorder(3, &[1], 4).is_ok());
+    // empty playlist: nothing to move, only before = 1 is valid
+    assert_eq!(bad_position(playlists::reorder(0, &[1], 1)), (1, 0));
+    assert_eq!(bad_position(playlists::reorder(0, &[], 2)), (2, 1));
+}
+
+mod reorder_prop {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // The result is a permutation of 1..=len; the moved entries are
+        // contiguous and in their original relative order; the others keep
+        // their relative order too.
+        #[test]
+        fn reorder_is_a_permutation_with_the_moved_entries_together(
+            len in 0usize..30,
+            raw in proptest::collection::vec(0usize..32, 0..12),
+            before_raw in 0usize..32,
+        ) {
+            let positions: Vec<usize> = raw.iter().map(|p| if len == 0 { 1 } else { p % len + 1 }).collect();
+            let positions: Vec<usize> = if len == 0 { vec![] } else { positions };
+            let before = before_raw % (len + 1) + 1;
+            let order = playlists::reorder(len, &positions, before).unwrap();
+
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            prop_assert_eq!(sorted, (1..=len).collect::<Vec<_>>());
+
+            let mut moved: Vec<usize> = positions.clone();
+            moved.sort_unstable();
+            moved.dedup();
+            let at: Vec<usize> = order.iter().enumerate()
+                .filter(|(_, p)| moved.contains(p)).map(|(i, _)| i).collect();
+            let in_order: Vec<usize> = order.iter().copied().filter(|p| moved.contains(p)).collect();
+            prop_assert_eq!(&in_order, &moved);
+            if let (Some(first), Some(last)) = (at.first(), at.last()) {
+                prop_assert_eq!(last - first + 1, moved.len(), "moved entries contiguous: {:?}", order);
+            }
+            let stay: Vec<usize> = order.iter().copied().filter(|p| !moved.contains(p)).collect();
+            let stay_want: Vec<usize> = (1..=len).filter(|p| !moved.contains(p)).collect();
+            prop_assert_eq!(stay, stay_want);
+
+            // Where the block landed: right before the first staying entry
+            // at or after `before`, or at the end.
+            let next_stay = (before..=len).find(|p| !moved.contains(p));
+            if !moved.is_empty() {
+                let block_end = at[at.len() - 1];
+                match next_stay {
+                    Some(p) => prop_assert_eq!(order[block_end + 1], p),
+                    None => prop_assert_eq!(block_end, len - 1),
+                }
+            }
+        }
+    }
+}
+
+/// A playlist with five entries a b c a b (titles 1 2 3 1 2), plus a read
+/// of the titles after moving.
+fn moved_titles(positions: &[usize], before: usize) -> Vec<String> {
+    let (env, t) = env3();
+    five(&env, &t);
+    playlists::move_entries(env.store.conn(), &env.cfg, "mix", positions, before).unwrap();
+    titles(&env, "mix")
+}
+
+#[test]
+fn move_entries_rewrites_the_file_and_the_index_to_the_new_order() {
+    let (env, t) = env3();
+    let conn = env.store.conn();
+    five(&env, &t); // 1 2 3 1 2
+    playlists::move_entries(conn, &env.cfg, "mix", &[5, 2], 1).unwrap();
+    assert_eq!(
+        titles(&env, "mix"),
+        ["Title2", "Title2", "Title1", "Title3", "Title1"]
+    );
+    // The file, not just the reader: location lines in the new order.
+    assert_eq!(
+        env.locations("mix"),
+        [&t[1], &t[1], &t[0], &t[2], &t[0]].map(|p| s(p))
+    );
+    // The index agrees: positions 0..5, each resolved to the right track.
+    let idx = env.indexed_items("mix");
+    assert_eq!(idx.iter().map(|i| i.0).collect::<Vec<_>>(), [0, 1, 2, 3, 4]);
+    let want: Vec<i64> = [&t[1], &t[1], &t[0], &t[2], &t[0]]
+        .iter()
+        .map(|p| env.track(p).id)
+        .collect();
+    assert_eq!(idx.iter().map(|i| i.1.unwrap()).collect::<Vec<_>>(), want);
+    // Still the same number of entries: nothing lost or duplicated.
+    assert_eq!(env.locations("mix").len(), 5);
+}
+
+#[test]
+fn move_entries_matches_reorder_for_blocks_and_ends() {
+    assert_eq!(
+        moved_titles(&[4, 5], 1),
+        ["Title1", "Title2", "Title1", "Title2", "Title3"]
+    );
+    assert_eq!(
+        moved_titles(&[1, 2], 6),
+        ["Title3", "Title1", "Title2", "Title1", "Title2"]
+    );
+    // before inside the moved set: nothing moves
+    assert_eq!(
+        moved_titles(&[2, 3], 3),
+        ["Title1", "Title2", "Title3", "Title1", "Title2"]
+    );
+}
+
+#[test]
+fn move_entries_with_bad_input_changes_nothing_and_leaves_no_temp_file() {
+    let (env, t) = env3();
+    five(&env, &t);
+    let conn = env.store.conn();
+    let text = env.read_playlist("mix");
+    let idx = env.indexed_items("mix");
+    let err = playlists::move_entries(conn, &env.cfg, "mix", &[1, 6], 1).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::BadPosition {
+                position: 6,
+                len: 5
+            }
+        ),
+        "{err:?}"
+    );
+    let err = playlists::move_entries(conn, &env.cfg, "mix", &[1], 7).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::BadPosition {
+                position: 7,
+                len: 6
+            }
+        ),
+        "{err:?}"
+    );
+    let err = playlists::move_entries(conn, &env.cfg, "nope", &[1], 1).unwrap_err();
+    assert!(
+        matches!(err, Error::NoSuchPlaylist(ref n) if n == "nope"),
+        "{err:?}"
+    );
+    assert_eq!(env.read_playlist("mix"), text);
+    assert_eq!(env.indexed_items("mix"), idx);
+    assert_eq!(fs::read_dir(&env.lists).unwrap().count(), 1);
+    assert!(!env.playlist_file("nope").exists());
+}
+
+#[test]
+fn move_entries_carries_unresolved_entries_verbatim_with_their_extinf() {
+    let (env, t) = env3();
+    let original = format!(
+        "#EXTM3U\n#EXTINF:241,Ghost - Gone Song\n/old/place/ghost.mp3\n{}\n#EXTINF:7,Odd\nhttp://example.com/stream one\n  spaced entry.mp3\n",
+        t[0].display()
+    );
+    env.write_playlist("mix", &original);
+    playlists::sync_from_disk(env.store.conn(), &env.cfg, true).unwrap();
+
+    // [ghost a http spaced] -> move ghost and http to the end
+    playlists::move_entries(env.store.conn(), &env.cfg, "mix", &[1, 3], 5).unwrap();
+
+    let text = env.read_playlist("mix");
+    assert!(
+        text.contains("#EXTINF:241,Ghost - Gone Song\n/old/place/ghost.mp3\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("#EXTINF:7,Odd\nhttp://example.com/stream one\n"),
+        "{text}"
+    );
+    assert!(text.contains("\n  spaced entry.mp3\n"), "{text:?}");
+    assert_eq!(
+        env.locations("mix"),
+        vec![
+            s(&t[0]),
+            "  spaced entry.mp3".to_owned(),
+            "/old/place/ghost.mp3".to_owned(),
+            "http://example.com/stream one".to_owned(),
+        ]
+    );
+    let idx = env.indexed_items("mix");
+    assert_eq!(
+        idx.iter().map(|i| i.1.is_some()).collect::<Vec<_>>(),
+        [true, false, false, false]
+    );
+}

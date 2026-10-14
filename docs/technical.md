@@ -705,8 +705,20 @@ libadwaita's widgets.
 Built in steps: (1) the read-only window: sidebar, grid over the library or a
 playlist (in file order, unresolved entries dimmed), every column sortable
 with iTunes-style ties (artist, album, disc, track, name), a column menu,
-search, a status line with totals, and the iPod's state; (2) editing and
-the saved column layout; (3) the sync plan dialog and Apply; then M5.
+search, a status line with totals, and the iPod's state; (2) editing:
+dragging rows onto a playlist in the sidebar appends them, dragging inside a
+playlist sorted by `#` (ascending) reorders it (`playlists::move_entries`,
+one write for several rows), Delete removes the selected entries, Ctrl+Up
+and Ctrl+Down move them, a context menu offers Remove from Playlist and Show
+in Folder, and playlists are created (Ctrl+N or the + button), renamed (F2
+or the sidebar's context menu) and deleted (context menu, with
+confirmation). A `gio::FileMonitor` on the playlists folder reloads changes
+made by other programs, the CLI included, by comparing the file on screen
+with its modification time when it was read. The column order, widths and
+visibility are saved in `~/.local/state/iprune/ui.toml`, one layout for the
+library and one for playlists; (3) the sync plan dialog and Apply; then
+M5. `iprune-gui` is a single-instance application: starting it again opens
+a window in the running one.
 
 ## 15. Omarchy packaging
 

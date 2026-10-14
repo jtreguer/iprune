@@ -13,8 +13,8 @@ is right rather than silently picking one.
 M0 to M4 done (bindings, read-only `gpod` wrapper, `iprune snapshot`;
 config, scan, SQLite index, `.m3u8` editing, `playlist` commands; `adopt`;
 planner and `sync --plan-only`; playlist sync with statistics pull, backups,
-checks, verification, `backups` and `restore`). M6 started: the read-only
-window (`iprune-gui`). Work follows the milestones in `docs/technical.md` section 17:
+checks, verification, `backups` and `restore`). M6 under way: the window
+(`iprune-gui`) shows the library and playlists and edits playlists. Work follows the milestones in `docs/technical.md` section 17:
 
 | # | Deliverable | Writes to iPod |
 |---|---|---|

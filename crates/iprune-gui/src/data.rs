@@ -80,6 +80,77 @@ impl Data {
         Ok(view_model::playlist_rows(&items, &self.stats))
     }
 
+    /// The playlist file's modification time, if it can be read.
+    pub fn playlist_mtime(&self, name: &str) -> Option<i64> {
+        let file = playlists::file_for(&self.config, name).ok()?;
+        iprune_core::playlist::mtime_ns(&file).ok()
+    }
+
+    pub fn playlists_dir(&self) -> &std::path::Path {
+        &self.config.playlists.dir
+    }
+
+    /// Re-reads playlist files changed since they were last read. Only the
+    /// index is written.
+    pub fn reload_playlists(&self) -> Result<playlists::LoadReport> {
+        Ok(playlists::sync_from_disk(
+            self.store.conn(),
+            &self.config,
+            false,
+        )?)
+    }
+
+    /// Adds library files to a playlist, at 1-based `at` or at the end.
+    pub fn add(&self, name: &str, files: &[PathBuf], at: Option<usize>) -> Result<()> {
+        Ok(playlists::add(
+            self.store.conn(),
+            &self.config,
+            name,
+            files,
+            at,
+        )?)
+    }
+
+    /// Removes the entries at 1-based `positions`.
+    pub fn remove(&self, name: &str, positions: &[usize]) -> Result<()> {
+        Ok(playlists::remove(
+            self.store.conn(),
+            &self.config,
+            name,
+            positions,
+        )?)
+    }
+
+    /// Moves the entries at 1-based `positions` before `before`.
+    pub fn move_entries(&self, name: &str, positions: &[usize], before: usize) -> Result<()> {
+        Ok(playlists::move_entries(
+            self.store.conn(),
+            &self.config,
+            name,
+            positions,
+            before,
+        )?)
+    }
+
+    pub fn create(&self, name: &str) -> Result<()> {
+        Ok(playlists::create(self.store.conn(), &self.config, name)?)
+    }
+
+    pub fn rename(&self, old: &str, new: &str) -> Result<()> {
+        Ok(playlists::rename(
+            self.store.conn(),
+            &self.config,
+            old,
+            new,
+        )?)
+    }
+
+    /// Deletes the playlist file. One mapped to the iPod stays as a
+    /// tombstone until the next sync deletes it there.
+    pub fn delete(&self, name: &str) -> Result<()> {
+        Ok(playlists::delete(self.store.conn(), &self.config, name)?)
+    }
+
     /// The iPod to show: a mounted one that iprune adopted, else a mounted
     /// one it did not, else the first adopted one, not connected.
     pub fn device(&self) -> Result<Option<DeviceInfo>> {
