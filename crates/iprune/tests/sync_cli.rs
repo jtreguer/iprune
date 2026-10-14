@@ -2,13 +2,15 @@
 //! folders in a temp dir and a closed stdin. The "iPod" is a fake tree in a
 //! temp dir whose iTunesDB is written by libgpod (`make_ipod.c`), and the
 //! config always points `device.mountpoint` at it, so mount detection never
-//! looks at the machine's real mounts.
+//! looks at the machine's real mounts. A fake `notify-send` first on the
+//! PATH logs what a sync would show on the desktop, to `notify.log`.
 
 #[path = "../../iprune-core/tests/common/mod.rs"]
 mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -29,9 +31,19 @@ impl Sandbox {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().canonicalize().unwrap();
         let (music, lists, ipod) = (base.join("music"), base.join("lists"), base.join("ipod"));
-        for d in [&music, &lists, &ipod] {
+        for d in [&music, &lists, &ipod, &base.join("bin")] {
             fs::create_dir(d).unwrap();
         }
+        let tool = base.join("bin/notify-send");
+        fs::write(
+            &tool,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done >> '{}'\n",
+                base.join("notify.log").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
         Sandbox {
             dir,
             music,
@@ -50,11 +62,17 @@ impl Sandbox {
 
     fn run(&self, args: &[&str]) -> Output {
         let base = self.base();
+        let path = format!(
+            "{}:{}",
+            base.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
         Command::new(env!("CARGO_BIN_EXE_iprune"))
             .args(args)
             .env("HOME", base.join("home"))
             .env("XDG_CONFIG_HOME", base.join("config"))
             .env("XDG_DATA_HOME", base.join("data"))
+            .env("PATH", path)
             .stdin(Stdio::null())
             .output()
             .unwrap()
@@ -1067,4 +1085,90 @@ fn sync_takes_back_tracks_a_crash_left_unrecorded_and_says_so() {
     assert!(out(&o).contains("Nothing to apply"), "{}", out(&o));
     assert_eq!(sb.music_files().len(), 1, "not copied a second time");
     assert_eq!(sb.mappings().0, 4);
+}
+
+// ---- desktop notifications (M7)
+
+impl Sandbox {
+    /// What the fake `notify-send` was given, one argument per line. `send`
+    /// does not wait, so this polls for `want` lines for a moment; with 0 it
+    /// waits a while to catch a notification that comes late.
+    fn notifications(&self, want: usize) -> Vec<String> {
+        let log = self.base().join("notify.log");
+        let mut lines = Vec::new();
+        for _ in 0..if want == 0 { 40 } else { 200 } {
+            lines = fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            if want > 0 && lines.len() >= want {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        lines
+    }
+}
+
+/// The arguments of the notification: `--` then summary and body.
+fn text_of(lines: &[String]) -> &[String] {
+    let dash = lines
+        .iter()
+        .position(|l| l == "--")
+        .expect("-- before text");
+    &lines[dash + 1..]
+}
+
+#[test]
+fn a_sync_that_applies_sends_one_normal_notification_and_an_empty_one_sends_none() {
+    let sb = adopted();
+    sb.reverse_road();
+    sb.ok(&["sync", "--yes"]);
+    let lines = sb.notifications(7);
+    assert!(lines.contains(&"--urgency=normal".to_owned()), "{lines:?}");
+    let text = text_of(&lines);
+    assert_eq!(text.len(), 2, "one summary and one body: {lines:?}");
+    assert_eq!(text[0], "iPod synced");
+    assert!(text[1].contains("1 playlist change"), "{}", text[1]);
+
+    // Nothing left to apply: no second notification.
+    let again = sb.ok(&["sync", "--yes"]);
+    assert!(out(&again).contains("Nothing to apply"), "{}", out(&again));
+    assert_eq!(sb.notifications(0), lines, "no new notification");
+}
+
+#[test]
+fn plan_only_a_refused_plan_and_a_busy_ipod_send_no_notification() {
+    let sb = adopted();
+    sb.reverse_road();
+    sb.ok(&["sync", "--plan-only"]);
+    // No terminal and no --yes: the plan is refused.
+    assert_code(&sb.run(&["sync"]), 1);
+    let lock = sb.hold_ipod_lock();
+    assert_code(&sb.run(&["sync", "--yes"]), 1);
+    drop(lock);
+    assert_eq!(sb.notifications(0), Vec::<String>::new());
+    assert!(!sb.base().join("notify.log").exists());
+}
+
+#[test]
+fn a_sync_that_fails_while_applying_sends_a_critical_notification() {
+    let sb = adopted();
+    sb.reverse_road();
+    // The database cannot be written: libgpod fails after applying began.
+    let dir = sb.ipod.join("iPod_Control/iTunes");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let o = sb.run(&["sync", "--yes"]);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_code(&o, 1);
+    let lines = sb.notifications(7);
+    assert!(
+        lines.contains(&"--urgency=critical".to_owned()),
+        "{lines:?}"
+    );
+    let text = text_of(&lines);
+    assert_eq!(text.len(), 2, "{lines:?}");
+    assert_eq!(text[0], "iPod sync failed");
+    assert!(!text[1].is_empty());
 }

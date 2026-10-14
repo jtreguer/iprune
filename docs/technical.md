@@ -45,10 +45,12 @@ iprune/
         exec.rs             applies a plan through gpod
         verify.rs           snapshot and compare
         stats.rs            play count pull and export
+        notify.rs           desktop notifications at the end of a sync
     iprune/                 binary `iprune`: the CLI
       src/main.rs
     iprune-gui/             binary `iprune-gui`: the GTK4 window
       src/{main,view_model,...}.rs
+  packaging/                iprune.desktop, install.sh
   docs/
   tests/
     fixtures/
@@ -809,18 +811,33 @@ sync (CLI, window) and `doctor --fix` take it before reading the iPod and
 hold it until the write is verified, so none writes back a database
 another changed in between: `exec::sync` takes the held lock as an
 argument. `exec::restore` and both ejects take it themselves.
-`iprune-gui` is a single-instance application: starting it again opens
-a window in the running one.
+`iprune-gui` is a single-instance application: starting it again brings
+the running one's window to the front.
 
 ## 15. Omarchy packaging
 
-- `cargo install --path crates/iprune` and `--path crates/iprune-gui`, or a
-  PKGBUILD later.
-- Desktop entry `~/.local/share/applications/iprune.desktop` that starts
-  `iprune-gui`.
-- Notifications through `notify-send` at the end of a sync.
+- `packaging/install.sh` runs `cargo install --locked` for `crates/iprune`
+  and `crates/iprune-gui` (into `$CARGO_INSTALL_ROOT`, by default
+  `~/.cargo`) and writes the desktop entry
+  `~/.local/share/applications/iprune.desktop` from
+  `packaging/iprune.desktop`, with `Exec` set to the installed
+  `iprune-gui` in full, since the launcher may not have cargo's folder on
+  its PATH. `StartupWMClass` is the application id, `dev.iprune.Iprune`.
+  `install.sh --uninstall` removes the binaries and the entry. A PKGBUILD
+  may come later.
+- Notifications through `notify-send` (module `notify`), once a plan is
+  confirmed (`--yes`, the prompt, or Apply in the window): "iPod synced"
+  with what changed, "iPod sync stopped early" with why, or "iPod sync
+  failed" with the error, shown until dismissed. A failure after the
+  confirmation notifies even when it came before any write, such as a
+  plan that changed since the window showed it, since the user may have
+  walked away. The CLI and the window use the same wording. `notify-send`
+  is started without waiting for it, and a notification that cannot be
+  shown is ignored. A plan that is only shown, declined or found empty gives
+  none. Plugging in the iPod gives none either.
 - Optional binding, for example in `~/.config/hypr/bindings.conf`:
-  `bindd = SUPER SHIFT, I, iPod, exec, iprune-gui`.
+  `bindd = SUPER SHIFT, I, iPod, exec, iprune-gui`. Pressing it again
+  brings the open window to the front.
 
 ## 16. Testing
 

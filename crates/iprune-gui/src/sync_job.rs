@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Context, Result, bail};
 use iprune_core::config::{Config, Paths};
 use iprune_core::exec::{self, FullWork, Progress};
+use iprune_core::notify::{self, Note};
 use iprune_core::store::Store;
 use iprune_core::{device, scan, sync};
 
@@ -53,6 +54,8 @@ pub struct Applied {
     /// Files not copied (gone or changed since the scan), with why.
     pub skipped: Vec<(PathBuf, String)>,
     pub warnings: Vec<String>,
+    /// The desktop notification for it; `None` when nothing was applied.
+    pub note: Option<Note>,
 }
 
 fn open(paths: &Paths) -> Result<Store> {
@@ -160,6 +163,7 @@ pub fn apply(
         cancel,
     )?;
     Ok(Applied {
+        note: Some(notify::synced(&done)),
         copied: done.copied,
         recopied: done.recopied,
         removed: done.removed,

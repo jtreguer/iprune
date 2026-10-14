@@ -330,6 +330,11 @@ fn apply_changes_the_ipod_and_reads_back() {
 
     assert_eq!(done.applied, 4);
     assert!(done.warnings.is_empty(), "{:?}", done.warnings);
+    // The notification says what was done, and is not the failure one.
+    let note = done.note.expect("a write gives a notification");
+    assert_eq!(note.summary, "iPod synced");
+    assert!(!note.urgent);
+    assert!(note.body.contains("4 playlist changes"), "{}", note.body);
     assert_eq!(w.members("Road"), Some(vec![D2, D1, D1]));
     assert_eq!(w.members("Mixed"), Some(vec![D3]));
     assert_eq!(w.members("Mix"), None);
@@ -472,6 +477,7 @@ fn apply_with_no_changes_writes_nothing_and_takes_no_backup() {
         (0, 0, 0, 0)
     );
     assert!(done.stamp.is_none() && done.warnings.is_empty());
+    assert_eq!(done.note, None, "nothing applied, nothing to notify");
     assert_eq!(w.tree(), tree);
     assert!(w.backups().is_empty());
     assert!(!w.paths.data_dir.join("backups").exists());
@@ -885,4 +891,9 @@ fn apply_takes_the_lock_before_it_reads_the_ipod() {
             .is_none_or(|e| !matches!(e, iprune_core::Error::IpodBusy)),
         "{e:#}"
     );
+}
+
+#[test]
+fn a_default_applied_has_no_notification() {
+    assert_eq!(Applied::default().note, None);
 }

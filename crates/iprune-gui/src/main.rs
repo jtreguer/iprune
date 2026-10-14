@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
+use iprune_core::notify;
 
 use data::{Data, DeviceInfo};
 use view_model::{Column, Layout, Layouts, Row};
@@ -116,6 +117,12 @@ fn main() -> glib::ExitCode {
 }
 
 fn activate(app: &gtk::Application) {
+    // Started again, from the launcher or a key binding: the running
+    // instance gets the activation and shows its window.
+    if let Some(window) = app.windows().first() {
+        window.present();
+        return;
+    }
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("iprune")
@@ -1134,7 +1141,14 @@ impl Ui {
             dialog.set_deletable(true);
             let Some(ui) = ui.upgrade() else { return };
             ui.writing.set(false);
-            match joined(result) {
+            let result = joined(result);
+            if let Some(note) = match &result {
+                Ok(done) => done.note.clone(),
+                Err(e) => Some(notify::failed(&format!("{e:#}"))),
+            } {
+                notify::send(&note);
+            }
+            match result {
                 Ok(done) => {
                     let (title, mut text) = match &done.stopped {
                         None => ("Sync done", String::new()),

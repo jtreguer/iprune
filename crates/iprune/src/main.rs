@@ -507,6 +507,10 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
     if tty {
         eprintln!();
     }
+    iprune_core::notify::send(&match &done {
+        Ok(o) => iprune_core::notify::synced(o),
+        Err(e) => iprune_core::notify::failed(&format!("{e:#}")),
+    });
     let done = done?;
     let mut out = io::stdout().lock();
     if done.recovered > 0 {

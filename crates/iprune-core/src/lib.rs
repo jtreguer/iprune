@@ -10,6 +10,7 @@ mod error;
 pub mod exec;
 pub mod ipod;
 pub mod lock;
+pub mod notify;
 pub mod paths;
 pub mod plan;
 pub mod playlist;

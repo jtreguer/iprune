@@ -10,12 +10,14 @@ is right rather than silently picking one.
 
 ## Status
 
-M0 to M6 done (bindings, read-only `gpod` wrapper, `iprune snapshot`;
+M0 to M7 done (bindings, read-only `gpod` wrapper, `iprune snapshot`;
 config, scan, SQLite index, `.m3u8` editing, `playlist` commands; `adopt`;
 planner and `sync --plan-only`; playlist sync with statistics pull, backups,
 checks, verification, `backups` and `restore`; track copy, removal and
 retagging with checkpoints, `doctor`; the window: library and playlist
-grid, playlist editing, sync, adoption review, eject). Next: M7. Work follows the milestones in `docs/technical.md` section 17:
+grid, playlist editing, sync, adoption review, eject; desktop entry,
+notifications, `packaging/install.sh`). All milestones are done. Work
+followed the milestones in `docs/technical.md` section 17:
 
 | # | Deliverable | Writes to iPod |
 |---|---|---|
@@ -65,13 +67,15 @@ crates/iprune-core/  config, store, scan, playlist (.m3u8 format), playlists (op
                      matching), adoption (run, report, save), plan (pure planner),
                      sync (planner input and plan text), transfer (track work from
                      the plan), exec (apply, restore), verify (checks around a
-                     write), stats, backup, doctor
+                     write), stats, backup, doctor, notify (notify-send
+                     after a sync)
 crates/iprune/       binary `iprune`: CLI
 crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6); view_model
                      (rows, columns, sort, search) is plain and tested, data loads, sync_job
                      and adopt_job are the workers (no GTK, tested), main and adopt_dialog
                      are GTK
 crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c
+packaging/           iprune.desktop and install.sh (cargo install and the desktop entry)
 ```
 
 ## Commands
@@ -83,6 +87,7 @@ cargo test                                  # needs gcc (C snapshot tool) and ff
 cargo test -p gpod -- --include-ignored     # also compares against the real backup, read only
 cargo clippy --all-targets -- -D warnings
 cargo fmt
+packaging/install.sh                        # install both binaries and the desktop entry
 ```
 
 Requires `libgpod` installed (`pacman -S libgpod`) and `pkg-config libgpod-1.0`
