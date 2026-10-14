@@ -38,22 +38,96 @@ fn unescape(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// One mountinfo line: the mount and its source (`/dev/sdc2`).
+fn parse_line(line: &str) -> Option<(Mount, String)> {
+    let (left, right) = line.split_once(" - ")?;
+    let left: Vec<&str> = left.split(' ').collect();
+    let mountpoint = unescape(left.get(4)?);
+    let options = left.get(5)?;
+    let mut right = right.split(' ');
+    let fstype = right.next()?.to_owned();
+    let source = unescape(right.next().unwrap_or(""));
+    Some((
+        Mount {
+            mountpoint: PathBuf::from(mountpoint),
+            fstype,
+            read_only: options.split(',').any(|o| o == "ro"),
+        },
+        source,
+    ))
+}
+
 /// Parses `/proc/self/mountinfo`. Malformed lines are skipped.
 pub fn parse_mountinfo(text: &str) -> Vec<Mount> {
     text.lines()
-        .filter_map(|line| {
-            let (left, right) = line.split_once(" - ")?;
-            let left: Vec<&str> = left.split(' ').collect();
-            let mountpoint = unescape(left.get(4)?);
-            let options = left.get(5)?;
-            let fstype = right.split(' ').next()?.to_owned();
-            Some(Mount {
-                mountpoint: PathBuf::from(mountpoint),
-                fstype,
-                read_only: options.split(',').any(|o| o == "ro"),
-            })
-        })
+        .filter_map(|l| Some(parse_line(l)?.0))
         .collect()
+}
+
+/// The block device mounted exactly at `mountpoint`, from mountinfo
+/// `text`: the last such entry, as for [`check_writable`]. `None` when
+/// `mountpoint` is not itself a mount of a `/dev/` device.
+pub fn block_device(text: &str, mountpoint: &Path) -> Option<String> {
+    let path = std::fs::canonicalize(mountpoint).unwrap_or_else(|_| mountpoint.to_owned());
+    text.lines()
+        .filter_map(parse_line)
+        .rfind(|(m, _)| m.mountpoint == path)
+        .map(|(_, source)| source)
+        .filter(|s| s.starts_with("/dev/"))
+}
+
+/// Unmounts the iPod at `mountpoint` and powers it off, through
+/// `udisksctl`, as the file manager would. Returns a warning when it was
+/// unmounted but could not be powered off: it can be unplugged then too,
+/// since unmounting writes everything out.
+pub fn eject(mountpoint: &Path) -> Result<Option<String>> {
+    let path = Path::new("/proc/self/mountinfo");
+    let text = std::fs::read_to_string(path).at(path)?;
+    let Some(dev) = block_device(&text, mountpoint) else {
+        return Err(Error::Eject(format!(
+            "{} is not a mounted device",
+            mountpoint.display()
+        )));
+    };
+    eject_device(&dev, &mut udisksctl)
+}
+
+/// The two steps of [`eject`] on `dev`, with `run` standing for `udisksctl`
+/// (a seam for tests).
+fn eject_device(
+    dev: &str,
+    run: &mut dyn FnMut(&[&str]) -> std::result::Result<(), String>,
+) -> Result<Option<String>> {
+    run(&["unmount", "--block-device", dev])
+        .map_err(|e| Error::Eject(format!("could not unmount {dev}: {e}")))?;
+    Ok(run(&["power-off", "--block-device", dev])
+        .err()
+        .map(|e| format!("unmounted, but not powered off ({e}); it can be unplugged")))
+}
+
+/// Runs `udisksctl` with `args`, without asking anything; its error output
+/// on failure.
+fn udisksctl(args: &[&str]) -> std::result::Result<(), String> {
+    run_tool("udisksctl", args)
+}
+
+/// [`udisksctl`] with the program named, so tests can use a fake one.
+fn run_tool(program: &str, args: &[&str]) -> std::result::Result<(), String> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .arg("--no-user-interaction")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("udisksctl: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+    Err(if err.is_empty() {
+        format!("udisksctl {}: {}", args[0], out.status)
+    } else {
+        err
+    })
 }
 
 /// The database file of an iPod mounted at `mountpoint`.
@@ -187,6 +261,222 @@ garbage line
         );
         assert_eq!((m[1].fstype.as_str(), m[1].read_only), ("vfat", false));
         assert!(m[2].read_only);
+    }
+
+    const INFO: &str = "\
+22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw
+95 22 8:33 / /run/media/julien/iPod\\040de\\040Julien rw,nosuid shared:50 - vfat /dev/sdc1 rw,uid=1000
+96 22 0:50 / /run/media/julien/tmpfs rw - tmpfs tmpfs rw
+97 22 0:51 / /run/media/julien/fuse rw - fuse.x /dev rw
+";
+
+    #[test]
+    fn parse_line_returns_the_source_with_escapes_decoded() {
+        let (m, src) =
+            parse_line("95 22 8:33 / /mnt/a\\040b ro,nosuid - vfat /dev/disk/by-label/A\\040B rw")
+                .unwrap();
+        assert_eq!(m.mountpoint, Path::new("/mnt/a b"));
+        assert!(m.read_only);
+        assert_eq!(src, "/dev/disk/by-label/A B");
+        assert!(parse_line("garbage").is_none());
+    }
+
+    #[test]
+    fn block_device_decodes_octal_escapes_in_the_mountpoint() {
+        assert_eq!(
+            block_device(INFO, Path::new("/run/media/julien/iPod de Julien")).as_deref(),
+            Some("/dev/sdc1")
+        );
+    }
+
+    #[test]
+    fn block_device_is_none_for_a_folder_that_is_not_a_mount() {
+        // A folder inside a mount, and the parent of one.
+        assert_eq!(
+            block_device(
+                INFO,
+                Path::new("/run/media/julien/iPod de Julien/iPod_Control")
+            ),
+            None
+        );
+        assert_eq!(block_device(INFO, Path::new("/run/media/julien")), None);
+    }
+
+    #[test]
+    fn block_device_ignores_a_sibling_that_only_shares_a_prefix() {
+        let text = "95 22 8:33 / /mnt/ipod2 rw - vfat /dev/sdc1 rw\n";
+        assert_eq!(block_device(text, Path::new("/mnt/ipod")), None);
+        assert_eq!(
+            block_device(text, Path::new("/mnt/ipod2")).as_deref(),
+            Some("/dev/sdc1")
+        );
+    }
+
+    #[test]
+    fn block_device_is_none_when_the_source_is_not_under_dev() {
+        assert_eq!(
+            block_device(INFO, Path::new("/run/media/julien/tmpfs")),
+            None
+        );
+        // "/dev" itself is not a device node either.
+        assert_eq!(
+            block_device(INFO, Path::new("/run/media/julien/fuse")),
+            None
+        );
+    }
+
+    #[test]
+    fn block_device_takes_the_last_entry_for_a_mountpoint() {
+        let text = "\
+1 0 8:1 / /mnt/x rw - vfat /dev/sdb1 rw
+2 0 8:2 / /mnt/x rw - vfat /dev/sdc1 rw
+";
+        assert_eq!(
+            block_device(text, Path::new("/mnt/x")).as_deref(),
+            Some("/dev/sdc1")
+        );
+        // A later non-device entry hides the earlier device.
+        let text = format!("{text}3 0 0:5 / /mnt/x rw - tmpfs tmpfs rw\n");
+        assert_eq!(block_device(&text, Path::new("/mnt/x")), None);
+    }
+
+    #[test]
+    fn block_device_follows_symlinks_to_the_mountpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let text = format!("1 0 8:1 / {} rw - vfat /dev/sdb1 rw\n", real.display());
+        assert_eq!(block_device(&text, &link).as_deref(), Some("/dev/sdb1"));
+    }
+
+    #[test]
+    fn eject_refuses_a_folder_that_is_not_a_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = eject(dir.path()).unwrap_err();
+        match err {
+            Error::Eject(m) => assert!(m.ends_with("is not a mounted device"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    type Calls = Vec<Vec<String>>;
+
+    fn recorded(
+        fail: &'static [&'static str],
+    ) -> (Calls, impl FnMut(&[&str]) -> Result<(), String>) {
+        (Vec::new(), move |args: &[&str]| {
+            if fail.contains(&args[0]) {
+                Err(format!("{} failed", args[0]))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn run_recording(fail: &'static [&'static str]) -> (Calls, Result<Option<String>>) {
+        let (_, mut inner) = recorded(fail);
+        let mut calls: Calls = Vec::new();
+        let r = eject_device("/dev/sdc1", &mut |a| {
+            calls.push(a.iter().map(|s| s.to_string()).collect());
+            inner(a)
+        });
+        (calls, r)
+    }
+
+    #[test]
+    fn eject_unmounts_then_powers_off_the_same_device() {
+        let (calls, r) = run_recording(&[]);
+        assert_eq!(r.unwrap(), None);
+        assert_eq!(
+            calls,
+            vec![
+                vec!["unmount", "--block-device", "/dev/sdc1"],
+                vec!["power-off", "--block-device", "/dev/sdc1"],
+            ]
+        );
+    }
+
+    #[test]
+    fn eject_does_not_power_off_when_unmounting_fails() {
+        let (calls, r) = run_recording(&["unmount"]);
+        match r.unwrap_err() {
+            Error::Eject(m) => assert!(m.contains("could not unmount /dev/sdc1"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0][0], "unmount");
+    }
+
+    #[test]
+    fn eject_warns_when_only_power_off_fails() {
+        let (calls, r) = run_recording(&["power-off"]);
+        let warning = r.unwrap().expect("a warning");
+        assert!(warning.contains("unmounted"), "{warning}");
+        assert!(warning.contains("power-off failed"), "{warning}");
+        assert_eq!(calls.len(), 2);
+    }
+
+    /// A script that appends its arguments to `log` and exits with `code`,
+    /// writing `err` to stderr.
+    fn fake_tool(dir: &Path, code: i32, err: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (tool, log) = (dir.join("fake-udisksctl"), dir.join("log"));
+        std::fs::write(
+            &tool,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{}'\necho '{err}' >&2\nexit {code}\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (tool, log)
+    }
+
+    /// Writing a script and running it while another test forks can fail
+    /// with "Text file busy"; these tests take turns.
+    static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn run_tool_adds_no_user_interaction_last() {
+        let _turn = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, log) = fake_tool(dir.path(), 0, "");
+        run_tool(
+            tool.to_str().unwrap(),
+            &["unmount", "--block-device", "/dev/sdc1"],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap().trim(),
+            "unmount --block-device /dev/sdc1 --no-user-interaction"
+        );
+    }
+
+    #[test]
+    fn run_tool_failure_carries_stderr_or_the_status() {
+        let _turn = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, _) = fake_tool(dir.path(), 1, "Device is busy");
+        assert_eq!(
+            run_tool(tool.to_str().unwrap(), &["unmount"]).unwrap_err(),
+            "Device is busy"
+        );
+        let (tool, _) = fake_tool(dir.path(), 3, "");
+        // The fake echoes an empty line to stderr, which trims to nothing.
+        let e = run_tool(tool.to_str().unwrap(), &["unmount"]).unwrap_err();
+        assert!(
+            e.starts_with("udisksctl unmount:") && e.contains('3'),
+            "{e}"
+        );
+        assert!(
+            run_tool("/nonexistent/udisksctl", &["x"])
+                .unwrap_err()
+                .starts_with("udisksctl:")
+        );
     }
 
     #[test]

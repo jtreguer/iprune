@@ -788,7 +788,28 @@ application is held, so the process cannot end mid-write. The result shows
 the backup stamp, or the error with the restore command. libgpod objects
 never cross threads: each worker opens its own database and its own
 connection to the index (SQLite waits up to 10 s for the other's writes).
-Then M5. `iprune-gui` is a single-instance application: starting it again opens
+With M5 the same dialog runs the full sync, with a progress bar and Stop;
+(4) the iPod panel's buttons and the grid's Add to Playlist menu. An iPod
+mounted but not adopted gets an Adopt button: a worker (`adopt_job`, no
+GTK) scans the library, reads the iPod and runs `adoption::run`, writing
+`adopt-report.txt`; the dialog shows the summary and a grid, one row per
+proposal, whose last column is a drop-down of "leave it unmanaged" and the
+candidates, set to what `--accept-proposals` would take. Picking one
+library file for two iPod tracks, or one an accepted match holds, is shown
+and Save refused until resolved (`adopt::resolve_choices`). Save checks the
+iPod mounted is still the one reviewed and calls `adoption::choose` and
+`adoption::save`; an iPod already adopted is refused, as without `--force`.
+Eject runs `device::eject` on a worker: the block device mounted at the
+mountpoint, from mountinfo, is unmounted then powered off with `udisksctl`.
+Sync, Adopt and Eject share one busy flag: one of them at a time. Across
+processes, an advisory `flock` on `ipod.lock` in the data folder, taken
+without waiting, keeps the CLI and the window from writing or unmounting
+the iPod under each other; the second is refused and changes nothing. A
+sync (CLI, window) and `doctor --fix` take it before reading the iPod and
+hold it until the write is verified, so none writes back a database
+another changed in between: `exec::sync` takes the held lock as an
+argument. `exec::restore` and both ejects take it themselves.
+`iprune-gui` is a single-instance application: starting it again opens
 a window in the running one.
 
 ## 15. Omarchy packaging

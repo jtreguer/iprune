@@ -85,6 +85,8 @@ enum Command {
         #[arg(long, requires = "fix")]
         allow_mass_removal: bool,
     },
+    /// Unmount the iPod and power it off, so it can be unplugged.
+    Eject,
     /// List the iPod database backups taken before each sync.
     Backups,
     /// Put a backup back on the connected iPod.
@@ -387,6 +389,9 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
         r.missing.len()
     );
     let mp = find_mountpoint(&config)?;
+    // Held from before the iPod is read until its write is verified, so
+    // another iprune cannot change it in between.
+    let lock = iprune_core::lock::ipod(&paths)?;
     eprintln!("reading the iPod at {}", mp.display());
     let db = gpod::Database::open(&mp)?;
     let conn = store.conn();
@@ -497,7 +502,7 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
         }
     };
     let done = exec::sync(
-        conn, &config, &paths, &mp, db, &prepared, &work, opts, &progress, &cancel,
+        conn, &config, &paths, &lock, &mp, db, &prepared, &work, opts, &progress, &cancel,
     );
     if tty {
         eprintln!();
@@ -552,6 +557,9 @@ fn run_doctor(fix: bool, yes: bool, allow_mass_removal: bool) -> Result<Outcome>
     let paths = paths()?;
     let conn = store.conn();
     let mp = find_mountpoint(&config)?;
+    // Held from the examination to the last repair: a sync in between
+    // would make the report wrong (its new files would look orphaned).
+    let lock = iprune_core::lock::ipod(&paths)?;
     eprintln!("reading the iPod at {}", mp.display());
     let db = gpod::Database::open(&mp)?;
     let contents = ipod::read(&db);
@@ -624,6 +632,7 @@ fn run_doctor(fix: bool, yes: bool, allow_mass_removal: bool) -> Result<Outcome>
             conn,
             &config,
             &paths,
+            &lock,
             &mp,
             db,
             &prepared,
@@ -652,6 +661,18 @@ fn run_doctor(fix: bool, yes: bool, allow_mass_removal: bool) -> Result<Outcome>
         );
     }
     Ok(Outcome::Done)
+}
+
+fn run_eject() -> Result<()> {
+    let (config, _store) = load()?;
+    let mp = find_mountpoint(&config)?;
+    // Not while another iprune writes the iPod.
+    let _lock = iprune_core::lock::ipod(&paths()?)?;
+    match device::eject(&mp)? {
+        Some(warning) => println!("{warning}"),
+        None => println!("ejected {}: the iPod can be unplugged", mp.display()),
+    }
+    Ok(())
 }
 
 fn run_backups() -> Result<()> {
@@ -817,6 +838,7 @@ fn main() -> ExitCode {
             yes,
             allow_mass_removal,
         } => run_doctor(*fix, *yes, *allow_mass_removal),
+        Command::Eject => run_eject().map(|()| Outcome::Done),
         Command::Backups => run_backups().map(|()| Outcome::Done),
         Command::Restore { stamp, yes } => run_restore(stamp, *yes),
         Command::Playlist(cmd) => playlist(cmd),

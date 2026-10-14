@@ -441,6 +441,55 @@ pub fn resolve(a: &Adoption, accept_proposals: bool) -> (Vec<(u64, i64)>, Vec<&P
     (mapping, left)
 }
 
+/// A library track chosen for several iPod tracks, or for one when another
+/// already matched it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub track_id: i64,
+    /// The iPod tracks that would share it, in dbid order.
+    pub dbids: Vec<u64>,
+}
+
+/// A mapping and the proposals it leaves unresolved.
+pub type Resolved<'a> = (Vec<(u64, i64)>, Vec<&'a Proposal>);
+
+/// The final `(dbid, library id)` mapping from a decision per proposal:
+/// `Some(id)` maps the iPod track to that candidate; `None`, no entry or an
+/// id that is not one of its candidates leaves it unmanaged. The mapping is
+/// one to one, so a library track chosen twice, or chosen when an accepted
+/// match has it, is refused with every such conflict. Returns the mapping
+/// and the proposals left, as [`resolve`] does.
+pub fn resolve_choices<'a>(
+    a: &'a Adoption,
+    choices: &HashMap<u64, Option<i64>>,
+) -> std::result::Result<Resolved<'a>, Vec<Conflict>> {
+    let mut mapping = a.accepted.clone();
+    let mut left = Vec::new();
+    for p in &a.proposals {
+        match choices.get(&p.dbid).copied().flatten() {
+            Some(id) if p.candidates.contains(&id) => mapping.push((p.dbid, id)),
+            _ => left.push(p),
+        }
+    }
+    let mut users: BTreeMap<i64, Vec<u64>> = BTreeMap::new();
+    for &(dbid, id) in &mapping {
+        users.entry(id).or_default().push(dbid);
+    }
+    let conflicts: Vec<Conflict> = users
+        .into_iter()
+        .filter(|(_, d)| d.len() > 1)
+        .map(|(track_id, mut dbids)| {
+            dbids.sort_unstable();
+            Conflict { track_id, dbids }
+        })
+        .collect();
+    if !conflicts.is_empty() {
+        return Err(conflicts);
+    }
+    mapping.sort_unstable();
+    Ok((mapping, left))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpodPlaylist {
     /// libgpod's persistent playlist id.

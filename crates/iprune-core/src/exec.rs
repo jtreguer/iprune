@@ -506,12 +506,14 @@ const CHECKPOINT_SECS: u64 = 600;
 /// Applies `work` to the iPod at `mountpoint`, whose database `db` was read
 /// for `prepared`: removals, copies (with checkpoints), tag updates, then
 /// playlists, checked, written and verified. `cancel` stops the copies after
-/// the current file; what was done is written as a checkpoint.
+/// the current file; what was done is written as a checkpoint. `lock` is
+/// the iPod lock, taken before `db` was read.
 #[allow(clippy::too_many_arguments)]
 pub fn sync(
     conn: &Connection,
     cfg: &Config,
     paths: &Paths,
+    lock: &crate::lock::IpodLock,
     mountpoint: &Path,
     mut db: gpod::Database,
     prepared: &Prepared,
@@ -520,6 +522,8 @@ pub fn sync(
     progress: &dyn Fn(Progress),
     cancel: &AtomicBool,
 ) -> Result<Outcome> {
+    // Held by the caller since before it read the iPod for `prepared`.
+    lock.check(paths)?;
     device::check_writable(mountpoint)?;
     let device = devices::device_id(conn, &prepared.guid)?
         .ok_or_else(|| Error::NotAdopted(prepared.guid.clone()))?;
@@ -836,6 +840,7 @@ pub fn sync_playlists(
     conn: &Connection,
     cfg: &Config,
     paths: &Paths,
+    lock: &crate::lock::IpodLock,
     mountpoint: &Path,
     db: gpod::Database,
     prepared: &Prepared,
@@ -851,6 +856,7 @@ pub fn sync_playlists(
         conn,
         cfg,
         paths,
+        lock,
         mountpoint,
         db,
         prepared,
@@ -985,6 +991,7 @@ pub fn restore(
     guid: &str,
     stamp: &str,
 ) -> Result<Restored> {
+    let _lock = crate::lock::ipod(paths)?;
     let backups = paths.data_dir.join("backups");
     let backup = backup::list(&backups, guid)?
         .into_iter()

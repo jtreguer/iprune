@@ -10,13 +10,12 @@ is right rather than silently picking one.
 
 ## Status
 
-M0 to M5 done (bindings, read-only `gpod` wrapper, `iprune snapshot`;
+M0 to M6 done (bindings, read-only `gpod` wrapper, `iprune snapshot`;
 config, scan, SQLite index, `.m3u8` editing, `playlist` commands; `adopt`;
 planner and `sync --plan-only`; playlist sync with statistics pull, backups,
 checks, verification, `backups` and `restore`; track copy, removal and
-retagging with checkpoints, `doctor`). M6 under way: the window
-(`iprune-gui`) shows the library and playlists, edits playlists and runs the
-full sync. Still to do in M6: Eject, the adoption review grid. Work follows the milestones in `docs/technical.md` section 17:
+retagging with checkpoints, `doctor`; the window: library and playlist
+grid, playlist editing, sync, adoption review, eject). Next: M7. Work follows the milestones in `docs/technical.md` section 17:
 
 | # | Deliverable | Writes to iPod |
 |---|---|---|
@@ -69,7 +68,9 @@ crates/iprune-core/  config, store, scan, playlist (.m3u8 format), playlists (op
                      write), stats, backup, doctor
 crates/iprune/       binary `iprune`: CLI
 crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6); view_model
-                     (rows, columns, sort, search) is plain and tested, data loads, main is GTK
+                     (rows, columns, sort, search) is plain and tested, data loads, sync_job
+                     and adopt_job are the workers (no GTK, tested), main and adopt_dialog
+                     are GTK
 crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c
 ```
 

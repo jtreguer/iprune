@@ -138,6 +138,40 @@ pub fn run(
     })
 }
 
+/// Replaces the run's mapping with the one from a decision per proposal
+/// (see [`adopt::resolve_choices`]) and matches the playlists again with it.
+/// A library track chosen twice is refused and the run left as it was.
+pub fn choose(conn: &Connection, r: &mut Run, choices: &HashMap<u64, Option<i64>>) -> Result<()> {
+    let (mapping, left) = match adopt::resolve_choices(&r.adoption, choices) {
+        Ok((m, l)) => (m, l.into_iter().cloned().collect()),
+        Err(conflicts) => {
+            return Err(Error::ChoiceConflicts(
+                conflicts
+                    .iter()
+                    .map(|c| {
+                        let path = r.library.get(&c.track_id).map_or_else(
+                            || c.track_id.to_string(),
+                            |t| t.path.display().to_string(),
+                        );
+                        let dbids: Vec<String> =
+                            c.dbids.iter().map(|d| format!("{d:016x}")).collect();
+                        format!("{path} is chosen for iPod tracks {}", dbids.join(", "))
+                    })
+                    .collect(),
+            ));
+        }
+    };
+    let playlists = adopt::match_playlists(
+        &r.ipod.playlists,
+        &devices::library_playlists(conn)?,
+        &mapping,
+    );
+    r.mapping = mapping;
+    r.left = left;
+    r.playlists = playlists;
+    Ok(())
+}
+
 /// Saves the mapping for the device with `guid`. Refuses to replace an
 /// earlier adoption unless `force` is set.
 pub fn save(conn: &Connection, r: &Run, guid: &str, force: bool) -> Result<()> {
@@ -185,7 +219,8 @@ pub fn save(conn: &Connection, r: &Run, guid: &str, force: bool) -> Result<()> {
     })
 }
 
-fn reason(r: Reason) -> &'static str {
+/// Why a proposal needs a decision, in a few words.
+pub fn reason(r: Reason) -> &'static str {
     match r {
         Reason::WeakTags => "same size and duration, title or artist differ",
         Reason::SeveralCandidates => "several identical library files",

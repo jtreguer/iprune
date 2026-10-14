@@ -801,3 +801,88 @@ fn stop_is_untouched_by_removing_and_verifying() {
         None
     );
 }
+
+// ---- the iPod lock
+
+#[test]
+fn apply_is_refused_while_the_ipod_lock_is_held_and_changes_nothing() {
+    let w = World::new(&[]);
+    w.write_list("Road", &[D2, D1]);
+    let p = w.plan();
+    assert_eq!(p.work.playlists.ops.len(), 1, "there is something to apply");
+    let tree = w.tree();
+    let snap = w.snapshot();
+
+    let lock = iprune_core::lock::ipod(&w.paths).unwrap();
+    let e = apply(
+        &w.env.cfg,
+        &w.paths,
+        &p.work,
+        false,
+        &|_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            e.downcast_ref::<iprune_core::Error>(),
+            Some(iprune_core::Error::IpodBusy)
+        ),
+        "{e:#}"
+    );
+    assert_eq!(w.tree(), tree);
+    assert_eq!(w.snapshot(), snap);
+    assert!(w.backups().is_empty());
+
+    drop(lock);
+    let done = apply(
+        &w.env.cfg,
+        &w.paths,
+        &p.work,
+        false,
+        &|_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(done.applied, 1);
+}
+
+// The lock is taken before the iPod is read: with the database unreadable
+// the answer is still "busy", not a libgpod error.
+#[test]
+fn apply_takes_the_lock_before_it_reads_the_ipod() {
+    let w = World::new(&[]);
+    let p = w.plan();
+    fs::write(
+        w.root.join("iPod_Control/iTunes/iTunesDB"),
+        b"not a database",
+    )
+    .unwrap();
+    let args = || {
+        apply(
+            &w.env.cfg,
+            &w.paths,
+            &p.work,
+            false,
+            &|_| {},
+            &AtomicBool::new(false),
+        )
+    };
+    let lock = iprune_core::lock::ipod(&w.paths).unwrap();
+    let e = args().unwrap_err();
+    assert!(
+        matches!(
+            e.downcast_ref::<iprune_core::Error>(),
+            Some(iprune_core::Error::IpodBusy)
+        ),
+        "{e:#}"
+    );
+    // Without the lock the unreadable database is what fails.
+    drop(lock);
+    let e = args().unwrap_err();
+    assert!(
+        e.downcast_ref::<iprune_core::Error>()
+            .is_none_or(|e| !matches!(e, iprune_core::Error::IpodBusy)),
+        "{e:#}"
+    );
+}

@@ -1,9 +1,11 @@
 //! The adoption algorithm, tested through its public API only. Expected values
 //! come from docs/technical.md section 10, not from reading the code.
 
+use std::collections::HashMap;
+
 use iprune_core::adopt::{
-    Adoption, IpodPlaylist, IpodTrack, LibPlaylist, LibTrack, Proposal, Reason, adopt,
-    match_playlists, normalize, resolve, to_compare,
+    Adoption, Conflict, IpodPlaylist, IpodTrack, LibPlaylist, LibTrack, Proposal, Reason, adopt,
+    match_playlists, normalize, resolve, resolve_choices, to_compare,
 };
 
 fn ip(dbid: u64, size: u64, ms: u32, title: &str, artist: &str) -> IpodTrack {
@@ -1336,4 +1338,164 @@ fn a_content_identical_claimant_gets_the_default_over_a_better_used_tag_match() 
     );
     let (mapping, _) = resolve(&a, true);
     assert_eq!(mapping, vec![(1, 10)]);
+}
+
+// ---- resolve_choices
+
+fn prop(dbid: u64, candidates: &[i64]) -> Proposal {
+    Proposal {
+        dbid,
+        reason: Reason::WeakTags,
+        score: 0,
+        candidates: candidates.to_vec(),
+        default: candidates.first().copied(),
+    }
+}
+
+fn adoption_of(accepted: &[(u64, i64)], proposals: Vec<Proposal>) -> Adoption {
+    Adoption {
+        accepted: accepted.to_vec(),
+        proposals,
+        ..Adoption::default()
+    }
+}
+
+fn picks(p: &[(u64, Option<i64>)]) -> HashMap<u64, Option<i64>> {
+    p.iter().copied().collect()
+}
+
+fn left_dbids(left: &[&Proposal]) -> Vec<u64> {
+    left.iter().map(|p| p.dbid).collect()
+}
+
+#[test]
+fn resolve_choices_table() {
+    // proposals: 10 -> [1, 2], 20 -> [2, 3], 30 -> [4]; accepted: 99 -> 9.
+    let a = adoption_of(
+        &[(99, 9)],
+        vec![prop(10, &[1, 2]), prop(20, &[2, 3]), prop(30, &[4])],
+    );
+    // (name, choices, expected mapping, expected dbids left)
+    #[allow(clippy::type_complexity)]
+    let cases: Vec<(&str, HashMap<u64, Option<i64>>, Vec<(u64, i64)>, Vec<u64>)> = vec![
+        ("no choices", picks(&[]), vec![(99, 9)], vec![10, 20, 30]),
+        (
+            "all picked, not the first candidate",
+            picks(&[(10, Some(2)), (20, Some(3)), (30, Some(4))]),
+            vec![(10, 2), (20, 3), (30, 4), (99, 9)],
+            vec![],
+        ),
+        (
+            "None leaves it",
+            picks(&[(10, None), (20, Some(3))]),
+            vec![(20, 3), (99, 9)],
+            vec![10, 30],
+        ),
+        (
+            "a pick that is not a candidate leaves it",
+            picks(&[(10, Some(3)), (30, Some(1))]),
+            vec![(99, 9)],
+            vec![10, 20, 30],
+        ),
+        (
+            "an entry for an unknown dbid is ignored",
+            picks(&[(777, Some(1))]),
+            vec![(99, 9)],
+            vec![10, 20, 30],
+        ),
+    ];
+    for (name, choices, mapping, left) in cases {
+        let (m, l) = resolve_choices(&a, &choices).unwrap_or_else(|c| panic!("{name}: {c:?}"));
+        assert_eq!(m, mapping, "{name}");
+        assert_eq!(left_dbids(&l), left, "{name}");
+    }
+}
+
+#[test]
+fn resolve_choices_mapping_is_sorted_whatever_the_proposal_order() {
+    let a = adoption_of(
+        &[(50, 5)],
+        vec![prop(30, &[3]), prop(10, &[1]), prop(70, &[7])],
+    );
+    let c = picks(&[(30, Some(3)), (10, Some(1)), (70, Some(7))]);
+    let (m, _) = resolve_choices(&a, &c).unwrap();
+    assert_eq!(m, vec![(10, 1), (30, 3), (50, 5), (70, 7)]);
+}
+
+#[test]
+fn resolve_choices_refuses_a_library_track_picked_twice() {
+    let a = adoption_of(
+        &[],
+        vec![prop(30, &[1, 2]), prop(10, &[1, 2]), prop(20, &[2])],
+    );
+    let c = picks(&[(30, Some(1)), (10, Some(1)), (20, Some(2))]);
+    let err = resolve_choices(&a, &c).unwrap_err();
+    assert_eq!(
+        err,
+        vec![Conflict {
+            track_id: 1,
+            dbids: vec![10, 30]
+        }]
+    );
+}
+
+#[test]
+fn resolve_choices_refuses_a_track_an_accepted_match_holds() {
+    let a = adoption_of(&[(99, 1)], vec![prop(10, &[1, 2])]);
+    let err = resolve_choices(&a, &picks(&[(10, Some(1))])).unwrap_err();
+    assert_eq!(
+        err,
+        vec![Conflict {
+            track_id: 1,
+            dbids: vec![10, 99]
+        }]
+    );
+    // Picking the other candidate is fine.
+    assert!(resolve_choices(&a, &picks(&[(10, Some(2))])).is_ok());
+}
+
+#[test]
+fn resolve_choices_reports_every_conflict_in_track_order() {
+    let a = adoption_of(
+        &[(99, 5)],
+        vec![
+            prop(10, &[1, 5]),
+            prop(20, &[1]),
+            prop(30, &[5, 8]),
+            prop(40, &[8]),
+        ],
+    );
+    let c = picks(&[(10, Some(1)), (20, Some(1)), (30, Some(8)), (40, Some(8))]);
+    let err = resolve_choices(&a, &c).unwrap_err();
+    assert_eq!(
+        err,
+        vec![
+            Conflict {
+                track_id: 1,
+                dbids: vec![10, 20]
+            },
+            Conflict {
+                track_id: 8,
+                dbids: vec![30, 40]
+            },
+        ]
+    );
+    // Both accepted-vs-pick and pick-vs-pick are covered by one call.
+    let c = picks(&[(10, Some(5)), (20, Some(1)), (30, Some(5)), (40, None)]);
+    let err = resolve_choices(&a, &c).unwrap_err();
+    assert_eq!(
+        err,
+        vec![Conflict {
+            track_id: 5,
+            dbids: vec![10, 30, 99]
+        }]
+    );
+}
+
+#[test]
+fn resolve_choices_with_the_defaults_matches_resolve() {
+    let a = adoption_of(&[(99, 9)], vec![prop(10, &[1, 2]), prop(20, &[3])]);
+    let (expected, _) = resolve(&a, true);
+    let c = picks(&[(10, Some(1)), (20, Some(3))]);
+    assert_eq!(resolve_choices(&a, &c).unwrap().0, expected);
 }

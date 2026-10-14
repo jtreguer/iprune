@@ -9,6 +9,7 @@ pub mod doctor;
 mod error;
 pub mod exec;
 pub mod ipod;
+pub mod lock;
 pub mod paths;
 pub mod plan;
 pub mod playlist;

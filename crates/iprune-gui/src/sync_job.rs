@@ -128,6 +128,8 @@ pub fn apply(
     progress: &dyn Fn(Progress),
     cancel: &AtomicBool,
 ) -> Result<Applied> {
+    // Held from before the iPod is read until its write is verified.
+    let lock = iprune_core::lock::ipod(paths)?;
     let store = open(paths)?;
     let conn = store.conn();
     let mountpoint = device::mountpoint(config)?;
@@ -148,6 +150,7 @@ pub fn apply(
         conn,
         config,
         paths,
+        &lock,
         &mountpoint,
         db,
         &prepared,

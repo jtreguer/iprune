@@ -687,6 +687,61 @@ fn restore_with_no_backups_at_all_fails_cleanly() {
     assert_eq!(sb.tree(&sb.ipod), ipod_before);
 }
 
+// ---- the iPod lock
+
+impl Sandbox {
+    /// Holds the iPod lock the way a running sync would.
+    fn hold_ipod_lock(&self) -> iprune_core::lock::IpodLock {
+        iprune_core::lock::ipod(&iprune_core::config::Paths {
+            config_file: self.base().join("config/iprune/config.toml"),
+            data_dir: self.base().join("data/iprune"),
+        })
+        .unwrap()
+    }
+}
+
+#[test]
+fn sync_while_the_ipod_lock_is_held_fails_busy_and_leaves_the_ipod_alone() {
+    let sb = adopted();
+    sb.reverse_road();
+    let ipod_before = sb.tree(&sb.ipod);
+    let lock = sb.hold_ipod_lock();
+    let o = sb.run(&["sync", "--yes"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("another iprune is"), "{}", err(&o));
+    assert_eq!(sb.tree(&sb.ipod), ipod_before);
+    assert!(sb.stamps().is_empty(), "no backup");
+
+    // Once the lock is free the same command applies the change.
+    drop(lock);
+    sb.ok(&["sync", "--yes"]);
+    assert_eq!(sb.ipod_playlist("Road"), Some(vec![2, u64::MAX - 1]));
+}
+
+#[test]
+fn plan_only_and_doctor_read_the_ipod_only_under_the_lock() {
+    let sb = adopted();
+    let lock = sb.hold_ipod_lock();
+    for args in [&["sync", "--plan-only"][..], &["doctor"][..]] {
+        let o = sb.run(args);
+        assert_code(&o, 1);
+        assert!(
+            err(&o).contains("another iprune is"),
+            "{args:?}: {}",
+            err(&o)
+        );
+        assert!(
+            !err(&o).contains("reading the iPod"),
+            "{args:?}: {}",
+            err(&o)
+        );
+    }
+    assert!(!sb.plan_json().exists(), "no plan saved");
+    drop(lock);
+    sb.ok(&["sync", "--plan-only"]);
+    sb.ok(&["doctor"]);
+}
+
 // ---- doctor
 
 impl Sandbox {
@@ -789,6 +844,38 @@ fn doctor_fix_repairs_the_entries_the_orphans_and_keeps_the_playlist_mappings() 
     // And doctor now finds nothing.
     let o = sb.ok(&["doctor"]);
     assert!(out(&o).contains("nothing to repair"), "{}", out(&o));
+}
+
+// Doctor holds one lock from before it reads the iPod to the last repair,
+// and `exec::sync` borrows it, so the repair does not block itself; a lock
+// held by someone else stops it before anything is read.
+#[test]
+fn doctor_fix_deletes_orphans_after_its_own_sync_and_leaves_the_lock_free() {
+    let sb = adopted();
+    sb.give_files(2); // track 3 has no file: a sync runs, then the orphans go
+    let orphans = sb.orphans(2);
+    let o = sb.ok(&["doctor", "--fix", "--yes"]);
+    assert!(out(&o).contains("deleted 2 orphan files"), "{}", out(&o));
+    assert!(orphans.iter().all(|f| !f.exists()));
+    drop(sb.hold_ipod_lock());
+}
+
+#[test]
+fn doctor_fix_will_not_delete_orphans_while_the_ipod_lock_is_held() {
+    let sb = adopted();
+    sb.give_files(3); // nothing missing: only orphans to delete
+    let orphans = sb.orphans(2);
+    let before = sb.tree(&sb.ipod);
+    let lock = sb.hold_ipod_lock();
+    let o = sb.run(&["doctor", "--fix", "--yes"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("another iprune is"), "{}", err(&o));
+    assert!(orphans.iter().all(|f| f.exists()));
+    assert_eq!(sb.tree(&sb.ipod), before);
+
+    drop(lock);
+    let o = sb.ok(&["doctor", "--fix", "--yes"]);
+    assert!(out(&o).contains("deleted 2 orphan files"), "{}", out(&o));
 }
 
 #[test]

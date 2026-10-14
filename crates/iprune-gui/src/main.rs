@@ -2,6 +2,8 @@
 //! playlist editing. Every edit goes through `iprune-core`, as the CLI does,
 //! and is written to the `.m3u8` file at once.
 
+mod adopt_dialog;
+mod adopt_job;
 mod data;
 mod sync_job;
 mod view_model;
@@ -86,14 +88,18 @@ struct Ui {
     /// The grid's right-click menu and the actions only a playlist enables.
     row_menu: gtk::PopoverMenu,
     playlist_actions: RefCell<Vec<gio::SimpleAction>>,
-    /// The sidebar's iPod panel and the action that syncs it.
+    /// The sidebar's iPod panel and the actions on the iPod.
     device_box: gtk::Box,
     sync_action: RefCell<Option<gio::SimpleAction>>,
+    adopt_action: RefCell<Option<gio::SimpleAction>>,
+    eject_action: RefCell<Option<gio::SimpleAction>>,
+    /// The grid menu's Add to Playlist submenu, filled when it opens.
+    add_menu: gio::Menu,
     /// True while a sync writes to the iPod: the window cannot close.
     writing: Cell<bool>,
-    /// True while a sync dialog is open or its plan is still being made:
-    /// only one sync at a time.
-    syncing: Cell<bool>,
+    /// True while a sync or adoption dialog is open, its worker still
+    /// runs, or an eject is under way: one thing at a time with the iPod.
+    busy: Cell<bool>,
     /// True while the plan's worker runs (it scans and writes the index).
     planning: Cell<bool>,
     /// Kept so its mount signals keep coming.
@@ -296,7 +302,7 @@ fn device_text(d: &DeviceInfo) -> String {
     if d.adopted {
         lines.push(format!("{} tracks managed", d.mapped_tracks));
     } else {
-        lines.push("run `iprune adopt` to manage it".into());
+        lines.push("Adopt matches its tracks to the library".into());
     }
     match (d.free, d.capacity) {
         (Some(free), Some(cap)) => lines.push(format!(
@@ -616,9 +622,24 @@ impl Ui {
         if !self.selection.is_selected(pos) {
             self.selection.select_item(pos, true);
         }
-        let in_playlist = self.playlist_name().is_some();
+        let current = self.playlist_name();
         for a in self.playlist_actions.borrow().iter() {
-            a.set_enabled(in_playlist);
+            a.set_enabled(current.is_some());
+        }
+        // Every playlist but the one shown.
+        self.add_menu.remove_all();
+        for name in self.data.playlist_names().unwrap_or_default() {
+            if Some(&name) == current.as_ref() {
+                continue;
+            }
+            let item = gio::MenuItem::new(Some(&name), None);
+            item.set_action_and_target_value(Some("win.add-to"), Some(&name.to_variant()));
+            self.add_menu.append_item(&item);
+        }
+        if self.add_menu.n_items() == 0 {
+            // No such action: shown greyed out.
+            self.add_menu
+                .append(Some("No other playlist"), Some("win.no-playlist"));
         }
         let at = cell
             .compute_point(&self.view, &gtk::graphene::Point::new(x as f32, y as f32))
@@ -786,16 +807,24 @@ impl Ui {
         self.status.set_text(&text);
     }
 
-    /// Shows the iPod's state in the sidebar and enables Sync for an
-    /// adopted iPod that is mounted.
+    /// Shows the iPod's state in the sidebar and enables Sync and Eject for
+    /// an adopted iPod that is mounted, Adopt and Eject for one not adopted.
     fn refresh_device(&self) {
         while let Some(child) = self.device_box.first_child() {
             self.device_box.remove(&child);
         }
         let device = self.data.device().ok().flatten();
-        let can_sync = device.as_ref().is_some_and(|d| d.connected && d.adopted);
-        if let Some(a) = &*self.sync_action.borrow() {
-            a.set_enabled(can_sync && !self.syncing.get());
+        let free = !self.busy.get();
+        let connected = device.as_ref().is_some_and(|d| d.connected);
+        let adopted = device.as_ref().is_some_and(|d| d.adopted);
+        for (action, on) in [
+            (&self.sync_action, connected && adopted),
+            (&self.adopt_action, connected && !adopted),
+            (&self.eject_action, connected),
+        ] {
+            if let Some(a) = &*action.borrow() {
+                a.set_enabled(on && free);
+            }
         }
         let Some(d) = device else {
             return;
@@ -816,6 +845,74 @@ impl Ui {
         }
         self.device_box.append(&heading);
         self.device_box.append(&label);
+        if d.connected {
+            let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            buttons.set_margin_start(12);
+            buttons.set_margin_bottom(12);
+            if !d.adopted {
+                let adopt = gtk::Button::with_label("Adopt…");
+                adopt.set_tooltip_text(Some("Match the tracks on the iPod to library files"));
+                adopt.set_action_name(Some("win.adopt"));
+                buttons.append(&adopt);
+            }
+            let eject = gtk::Button::with_label("Eject");
+            eject.set_tooltip_text(Some("Unmount the iPod and power it off"));
+            eject.set_action_name(Some("win.eject"));
+            buttons.append(&eject);
+            self.device_box.append(&buttons);
+        }
+    }
+
+    /// Unmounts the iPod and powers it off, on a worker.
+    fn eject(self: &Rc<Self>) {
+        if self.busy.replace(true) {
+            return;
+        }
+        self.refresh_device();
+        self.status.set_text("Ejecting the iPod…");
+        let config = self.data.config().clone();
+        let paths = self.data.paths().clone();
+        let ui = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+                // Not while the CLI writes the iPod.
+                let _lock = iprune_core::lock::ipod(&paths)?;
+                let mountpoint = iprune_core::device::mountpoint(&config)?;
+                Ok(iprune_core::device::eject(&mountpoint)?)
+            })
+            .await;
+            let Some(ui) = ui.upgrade() else { return };
+            ui.busy.set(false);
+            match result.unwrap_or_else(|_| Err(anyhow::anyhow!("the eject worker crashed"))) {
+                Ok(None) => ui.status.set_text("The iPod can be unplugged"),
+                Ok(Some(warning)) => ui.status.set_text(&warning),
+                Err(e) => {
+                    ui.update_status();
+                    ui.show_error("The iPod was not ejected", &e);
+                }
+            }
+            ui.refresh_device();
+        });
+    }
+
+    /// Adds the selected tracks that have a file at the end of `target`.
+    fn add_selected_to(&self, target: &str) {
+        let paths: Vec<PathBuf> = self
+            .selected_rows()
+            .into_iter()
+            .filter(|r| !r.unresolved)
+            .map(|r| r.path)
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        match self.data.add(target, &paths, None) {
+            Ok(()) => self.status.set_text(&match paths.len() {
+                1 => format!("Added 1 track to {target}"),
+                n => format!("Added {n} tracks to {target}"),
+            }),
+            Err(e) => self.show_error(&format!("Nothing was added to {target}"), &e),
+        }
     }
 
     /// Plans a sync on a worker thread and shows the plan in a dialog, from
@@ -823,7 +920,7 @@ impl Ui {
     fn open_sync(self: &Rc<Self>) {
         // One sync at a time, planning included: a second one would read
         // the iPod while the first writes it.
-        if self.syncing.replace(true) {
+        if self.busy.replace(true) {
             return;
         }
         let dialog = gtk::Window::builder()
@@ -850,14 +947,13 @@ impl Ui {
                 if let Some(ui) = ui.upgrade()
                     && !ui.planning.get()
                 {
-                    ui.syncing.set(false);
+                    ui.busy.set(false);
                     ui.refresh_device();
                 }
             });
         }
-        if let Some(a) = &*self.sync_action.borrow() {
-            a.set_enabled(false);
-        }
+        // Sync, Adopt and Eject are off until it is over.
+        self.refresh_device();
         self.planning.set(true);
         let stack = gtk::Stack::new();
         dialog.set_child(Some(&stack));
@@ -877,7 +973,7 @@ impl Ui {
             let dialog = match dialog_weak.upgrade() {
                 Some(d) if !gone.get() => d,
                 _ => {
-                    ui.syncing.set(false);
+                    ui.busy.set(false);
                     ui.refresh_device();
                     return;
                 }
@@ -1085,7 +1181,22 @@ impl Ui {
                     }
                     result_page(&dialog, &stack, title, &text);
                 }
-                Err(e) => result_page(&dialog, &stack, "The sync stopped", &format!("{e:#}")),
+                Err(e) => {
+                    let busy = e
+                        .downcast_ref::<iprune_core::Error>()
+                        .is_some_and(|e| matches!(e, iprune_core::Error::IpodBusy));
+                    match busy {
+                        true => result_page(
+                            &dialog,
+                            &stack,
+                            "The iPod is busy",
+                            &format!("{e:#}\n\nNothing was written to the iPod."),
+                        ),
+                        false => {
+                            result_page(&dialog, &stack, "The sync stopped", &format!("{e:#}"))
+                        }
+                    }
+                }
             }
             // Statistics, mappings and the last sync may have changed,
             // whatever the outcome.
@@ -1290,6 +1401,7 @@ fn result_page(dialog: &gtk::Window, stack: &gtk::Stack, title: &str, text: &str
     heading.set_xalign(0.0);
     let body = gtk::Label::new(Some(text));
     body.set_wrap(true);
+    body.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     body.set_xalign(0.0);
     body.set_yalign(0.0);
     body.set_selectable(true);
@@ -1478,6 +1590,8 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     view.set_model(Some(&selection));
     // Opened by each cell's right-click, see `make_column`.
     let grid_menu = gio::Menu::new();
+    let add_menu = gio::Menu::new();
+    grid_menu.append_submenu(Some("Add to Playlist"), &add_menu);
     grid_menu.append(Some("Remove from Playlist"), Some("win.remove"));
     grid_menu.append(Some("Show in Folder"), Some("win.show-in-folder"));
     let row_menu = gtk::PopoverMenu::from_model(Some(&grid_menu));
@@ -1605,8 +1719,11 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         playlist_actions: RefCell::new(Vec::new()),
         device_box: device_box.clone(),
         sync_action: RefCell::new(None),
+        adopt_action: RefCell::new(None),
+        eject_action: RefCell::new(None),
+        add_menu,
         writing: Cell::new(false),
-        syncing: Cell::new(false),
+        busy: Cell::new(false),
         planning: Cell::new(false),
         volumes: RefCell::new(None),
         unwatched: Cell::new(false),
@@ -1641,6 +1758,20 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     *ui.playlist_actions.borrow_mut() = vec![remove.clone(), up.clone(), down.clone()];
     let sync = action(window, "sync", &ui, |ui| ui.open_sync());
     *ui.sync_action.borrow_mut() = Some(sync);
+    let adopt = action(window, "adopt", &ui, |ui| ui.open_adopt());
+    *ui.adopt_action.borrow_mut() = Some(adopt);
+    let eject = action(window, "eject", &ui, |ui| ui.eject());
+    *ui.eject_action.borrow_mut() = Some(eject);
+    {
+        let add_to = gio::SimpleAction::new("add-to", Some(glib::VariantTy::STRING));
+        let weak = Rc::downgrade(&ui);
+        add_to.connect_activate(move |_, target| {
+            if let (Some(ui), Some(name)) = (weak.upgrade(), target.and_then(|t| t.str())) {
+                ui.add_selected_to(name);
+            }
+        });
+        window.add_action(&add_to);
+    }
     ui.refresh_device();
     // An iPod plugged in or out updates the panel and the Sync button.
     let volumes = gio::VolumeMonitor::get();

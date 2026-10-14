@@ -178,6 +178,7 @@ impl World {
             self.env.store.conn(),
             &self.env.cfg,
             &self.paths,
+            &iprune_core::lock::ipod(&self.paths).unwrap(),
             &self.root,
             self.open(),
             p,
@@ -1242,5 +1243,93 @@ fn the_guid_read_without_the_database_names_the_backup_folder() {
             Err(Error::NoSuchBackup(_))
         ),
         "no backups yet"
+    );
+}
+
+// ---- the iPod lock
+
+fn sync_with_lock(w: &World, lock: &iprune_core::lock::IpodLock) -> iprune_core::Result<Outcome> {
+    let prepared = w.prepare();
+    let work = exec::playlist_work(&prepared.plan, &prepared.tracks_map, &prepared.ipod);
+    exec::sync_playlists(
+        w.env.store.conn(),
+        &w.env.cfg,
+        &w.paths,
+        lock,
+        &w.root,
+        w.open(),
+        &prepared,
+        &work,
+        Options::default(),
+    )
+}
+
+#[test]
+fn a_sync_with_the_lock_of_another_data_folder_is_refused_and_changes_nothing() {
+    let w = world_with_old();
+    // A play on the iPod, which a sync would pull before writing.
+    w.write_play_counts(&[(3, 1_700_000_000, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]);
+    change_everything(&w);
+    let tree_before = w.ipod_tree();
+    let snap_before = w.snapshot();
+    let stats_before = w.stats_rows();
+
+    let other = tempfile::tempdir().unwrap();
+    let elsewhere = Paths {
+        config_file: other.path().join("config.toml"),
+        data_dir: other.path().join("data"),
+    };
+    let wrong = iprune_core::lock::ipod(&elsewhere).unwrap();
+    let e = sync_with_lock(&w, &wrong).unwrap_err();
+    assert!(matches!(e, Error::NotWritable(_)), "{e}");
+    assert_eq!(w.ipod_tree(), tree_before);
+    assert_eq!(w.snapshot(), snap_before);
+    assert!(w.backups().is_empty());
+    assert!(!w.paths.data_dir.join("backups").exists());
+    assert_eq!(w.pending_pulls(), 0);
+    assert_eq!(w.stats_rows(), stats_before);
+    assert!(w.play_counts().exists());
+}
+
+// The caller holds the lock for the whole sync, so the sync must not take it
+// again: a second attempt in the same process would be refused.
+#[test]
+fn a_sync_given_the_held_lock_of_its_data_folder_goes_through() {
+    let w = world_with_old();
+    change_everything(&w);
+    let snap_before = w.snapshot();
+    let lock = iprune_core::lock::ipod(&w.paths).unwrap();
+    sync_with_lock(&w, &lock).unwrap();
+    assert_ne!(w.snapshot(), snap_before);
+    assert_eq!(w.backups().len(), 1);
+    // Still held afterwards, by the caller.
+    assert!(matches!(
+        iprune_core::lock::ipod(&w.paths),
+        Err(Error::IpodBusy)
+    ));
+}
+
+#[test]
+fn a_restore_while_the_ipod_lock_is_held_is_refused_and_changes_nothing() {
+    let w = world_with_old();
+    let db_before = fs::read(w.root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+    change_everything(&w);
+    let out = w.sync().unwrap();
+    let tree_after_sync = w.ipod_tree();
+    let snap_after_sync = w.snapshot();
+    let maps = mapping_view(&w);
+
+    let lock = iprune_core::lock::ipod(&w.paths).unwrap();
+    let e = restore(&w, &out.backup.stamp).unwrap_err();
+    assert!(matches!(e, Error::IpodBusy), "{e}");
+    assert_eq!(w.ipod_tree(), tree_after_sync);
+    assert_eq!(w.snapshot(), snap_after_sync);
+    assert_eq!(mapping_view(&w), maps);
+
+    drop(lock);
+    restore(&w, &out.backup.stamp).unwrap();
+    assert_eq!(
+        fs::read(w.root.join("iPod_Control/iTunes/iTunesDB")).unwrap(),
+        db_before
     );
 }

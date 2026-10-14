@@ -92,6 +92,14 @@ pub enum Error {
     WriteIncomplete { cause: String, stamp: String },
     #[error("{cause}; undoing the statistics pull also failed: {undo}")]
     UndoFailed { cause: Box<Error>, undo: Box<Error> },
+    #[error("each library file can match one iPod track only:\n  {}", .0.join("\n  "))]
+    ChoiceConflicts(Vec<String>),
+    #[error(
+        "another iprune is syncing, repairing, restoring or ejecting the iPod; try again once it is done"
+    )]
+    IpodBusy,
+    #[error("eject: {0}")]
+    Eject(String),
     #[error("no backup {0:?}; `iprune backups` lists them")]
     NoSuchBackup(String),
     #[error("position {position} is out of range (playlist has {len} entries)")]
