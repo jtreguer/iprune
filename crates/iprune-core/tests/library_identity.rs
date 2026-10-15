@@ -79,7 +79,8 @@ fn pairing_by_audio_needs_the_same_title_or_the_same_artist_and_album() {
             assert_eq!(new.id, id, "{what}");
             assert!(old_row.missing_since.is_none(), "{what}");
             assert_eq!(old_row.path, new.path, "{what}");
-            assert_eq!(old_row.tags.title.as_deref(), Some(title), "{what}");
+            // Tags are stored trimmed.
+            assert_eq!(old_row.tags.title.as_deref(), Some(title.trim()), "{what}");
         } else {
             assert!(r.moved.is_empty(), "{what}");
             assert_eq!((r.added, r.missing.len()), (1, 1), "{what}");

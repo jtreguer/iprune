@@ -19,6 +19,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0004_pending_pulls.sql"),
     include_str!("migrations/0005_stable_ids.sql"),
     include_str!("migrations/0006_synced_rating.sql"),
+    include_str!("migrations/0007_tags_version.sql"),
 ];
 
 /// First line of a migration that rebuilds tables: it runs with foreign
@@ -241,9 +242,9 @@ pub fn insert_track(conn: &Connection, f: &FileRecord, added_at: i64) -> Result<
     conn.execute(
         "INSERT INTO tracks (path, path_key, size, mtime_ns, hash, duration_ms, filetype, bitrate, samplerate, \
          title, artist, album, album_artist, composer, genre, year, track_no, track_total, disc_no, disc_total, \
-         compilation, tags_hash, added_at, tag_error, drm) \
+         compilation, tags_hash, added_at, tag_error, drm, tags_version) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, \
-         ?24, ?25)",
+         ?24, ?25, ?26)",
         params![
             path_str(&f.path),
             f.path_key,
@@ -270,6 +271,7 @@ pub fn insert_track(conn: &Connection, f: &FileRecord, added_at: i64) -> Result<
             added_at,
             f.tag_error,
             f.drm,
+            crate::tags::READER_VERSION,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -282,8 +284,8 @@ pub fn update_track(conn: &Connection, id: i64, f: &FileRecord) -> Result<()> {
         "UPDATE tracks SET path = ?2, path_key = ?3, size = ?4, mtime_ns = ?5, hash = ?6, duration_ms = ?7, \
          filetype = ?8, bitrate = ?9, samplerate = ?10, title = ?11, artist = ?12, album = ?13, \
          album_artist = ?14, composer = ?15, genre = ?16, year = ?17, track_no = ?18, track_total = ?19, \
-         disc_no = ?20, disc_total = ?21, compilation = ?22, tags_hash = ?23, tag_error = ?24, drm = ?25, missing_since = NULL \
-         WHERE id = ?1",
+         disc_no = ?20, disc_total = ?21, compilation = ?22, tags_hash = ?23, tag_error = ?24, drm = ?25, missing_since = NULL, \
+         tags_version = ?26 WHERE id = ?1",
         params![
             id,
             path_str(&f.path),
@@ -310,6 +312,7 @@ pub fn update_track(conn: &Connection, id: i64, f: &FileRecord) -> Result<()> {
             &f.tags.hash()[..],
             f.tag_error,
             f.drm,
+            crate::tags::READER_VERSION,
         ],
     )?;
     Ok(())
@@ -513,6 +516,16 @@ pub fn insert_tombstone(conn: &Connection, name: &str) -> Result<i64> {
         params![id, name, file],
     )?;
     Ok(id)
+}
+
+/// Ids of present tracks whose tags an older tag reader read.
+pub fn stale_tags(conn: &Connection) -> Result<std::collections::HashSet<i64>> {
+    let mut stmt =
+        conn.prepare("SELECT id FROM tracks WHERE missing_since IS NULL AND tags_version < ?1")?;
+    let ids = stmt
+        .query_map([crate::tags::READER_VERSION], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ids)
 }
 
 /// `(id, name)` of the tombstones: deleted playlists still mapped to an iPod.

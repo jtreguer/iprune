@@ -281,6 +281,28 @@ impl Database {
         unsafe { apply_audio(t, audio) }
     }
 
+    /// Clears what described the track's previous file once new audio
+    /// replaced it: gapless data, start and stop times, Sound Check and the
+    /// resume position. The iPod would apply them to the new audio (cut it
+    /// short, click, play at the wrong level). Play counts, rating, dates and
+    /// the album's gapless flag stay. (`samplerate2` needs nothing: libgpod
+    /// derives it from the sample rate when it reads the database.)
+    pub fn reset_replaced_audio(&mut self, dbid: u64) -> Result<()> {
+        let t = self.track_ptr(dbid)?;
+        unsafe {
+            (*t).pregap = 0;
+            (*t).postgap = 0;
+            (*t).samplecount = 0;
+            (*t).gapless_data = 0;
+            (*t).gapless_track_flag = 0;
+            (*t).soundcheck = 0;
+            (*t).starttime = 0;
+            (*t).stoptime = 0;
+            (*t).bookmark_time = 0;
+        }
+        Ok(())
+    }
+
     /// Removes a track: from every playlist first, master and smart ones
     /// included, then from the database. Returns its file, which is not
     /// deleted here: it goes once the new database is written.

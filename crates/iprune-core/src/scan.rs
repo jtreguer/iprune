@@ -199,6 +199,22 @@ fn without_panics<T>(
     })
 }
 
+/// A file's tags read again, its content hash `hash` kept.
+fn read_tags(s: &Seen, hash: [u8; 32]) -> Result<FileRecord, ReadError> {
+    let read = without_panics(|| tags::read(&s.path))?;
+    Ok(FileRecord {
+        path: s.path.clone(),
+        path_key: s.key.clone(),
+        size: s.size,
+        mtime_ns: s.mtime_ns,
+        hash,
+        info: read.info,
+        tags: read.tags,
+        tag_error: read.tag_error,
+        drm: read.drm,
+    })
+}
+
 fn read_file(s: &Seen) -> Result<FileRecord, ReadError> {
     let read = without_panics(|| tags::read(&s.path))?;
     let hash = hash_file(&s.path).map_err(|e| ReadError::Unreadable(e.to_string()))?;
@@ -292,7 +308,10 @@ pub fn scan(
             && !walk_errors.iter().any(|e| t.path.starts_with(e))
     };
 
-    let mut to_read: Vec<(&Seen, Option<&TrackRow>)> = Vec::new();
+    // Rows whose tags an older reader read: their tags are read again, not
+    // their audio, whose hash is kept.
+    let stale = store::stale_tags(store.conn())?;
+    let mut to_read: Vec<(&Seen, Option<&TrackRow>, bool)> = Vec::new();
     for s in &seen {
         match by_key.get(s.key.as_str()) {
             Some(t)
@@ -303,9 +322,13 @@ pub fn scan(
                     // Files whose tags failed are retried on every scan.
                     && t.tag_error.is_none() =>
             {
-                report.unchanged += 1;
+                if stale.contains(&t.id) {
+                    to_read.push((s, Some(t), true));
+                } else {
+                    report.unchanged += 1;
+                }
             }
-            t => to_read.push((s, t.copied())),
+            t => to_read.push((s, t.copied(), false)),
         }
     }
 
@@ -318,8 +341,11 @@ pub fn scan(
     let results: Vec<_> = pool.install(|| {
         to_read
             .par_iter()
-            .map(|&(s, t)| {
-                let r = read_file(s);
+            .map(|&(s, t, tags_only)| {
+                let r = match (tags_only, t) {
+                    (true, Some(t)) => read_tags(s, t.hash),
+                    _ => read_file(s),
+                };
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_multiple_of(25) || n == total {
                     progress(Progress::Reading { done: n, total });

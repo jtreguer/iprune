@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{
     Env, IpodSpec, Kind, PlaylistSpec, fairplay_m4a, fake_ipod, fixture, fixture_secs, id3v24_text,
-    ipod_playlist, mp3_with_id3v2,
+    ipod_playlist, mp3_secs_with_id3v2, mp3_with_id3v2, read_audio_data, seed_old_audio,
 };
 use iprune_core::config::Paths;
 use iprune_core::exec::{self, FullWork, Options, Outcome, Progress};
@@ -4813,4 +4813,236 @@ mod library_identity {
         );
         assert!(w.prepare().plan.is_empty());
     }
+}
+
+// ---- audit step 7: tags (M13, M15, M16)
+
+/// A 3 second copy of Mp3 fixture `variant` whose tag holds only `frames`.
+fn long_mp3_with(variant: u32, frames: &[Vec<u8>]) -> Vec<u8> {
+    mp3_secs_with_id3v2(variant, 3, frames)
+}
+
+fn ipod_title(w: &World, d: u64) -> Option<String> {
+    w.open()
+        .track_by_dbid(d)
+        .unwrap()
+        .title()
+        .map(|s| s.into_owned())
+}
+
+// Prevents (audit M16): a replace putting the file name over a title that
+// exists only on the iPod, when the new file has no title tag.
+#[test]
+fn a_replace_keeps_the_ipod_title_when_the_new_file_has_no_title_tag() {
+    let mut w = World::new(3);
+    let src = w.files[1].clone();
+    // Same audio, no title: a retag leaves the iPod title.
+    w.env.add_bytes(
+        "s2.mp3",
+        &mp3_with_id3v2(2, &[id3v24_text("TPE1", 3, b"Artist2")]),
+    );
+    w.rescan();
+    assert_eq!(w.env.track(&src).tags.title, None, "set up: no title tag");
+    w.sync().unwrap();
+    assert_eq!(ipod_title(&w, dbid(2)).as_deref(), Some("Title2"));
+
+    // New, longer audio, a new artist, still no title tag.
+    let bytes = long_mp3_with(2, &[id3v24_text("TPE1", 3, b"New Artist")]);
+    w.env.add_bytes("s2.mp3", &bytes);
+    w.rescan();
+    let p = w.prepare();
+    assert_eq!(p.plan.replace.len(), 1, "{:?}", p.plan);
+    let work = exec::full_work(&p);
+    assert_eq!(work.tracks.copies.len(), 1);
+    assert!(work.tracks.copies[0].replace);
+    let out = w.sync().unwrap();
+    assert_eq!((out.copied, out.recopied), (0, 1));
+
+    assert_eq!(
+        ipod_title(&w, dbid(2)).as_deref(),
+        Some("Title2"),
+        "the replace overwrote the iPod-only title"
+    );
+    // The replace did happen, and the other tags of the file were applied.
+    assert_eq!(fs::read(w.file_of(dbid(2))).unwrap(), bytes);
+    let t = w.open();
+    assert_eq!(
+        t.track_by_dbid(dbid(2)).unwrap().artist().as_deref(),
+        Some("New Artist")
+    );
+    assert!(w.prepare().plan.is_empty(), "settled");
+}
+
+// Prevents (audit M16): the same loss for a file whose tags fail to parse.
+#[test]
+fn a_replace_keeps_the_ipod_title_when_the_new_files_tags_fail_to_parse() {
+    let mut w = World::new(3);
+    let src = w.files[1].clone();
+    // A TRCK frame in UTF-16 with a byte order mark that is neither FF FE nor
+    // FE FF: not even Relaxed parsing reads the tag.
+    let bad = id3v24_text("TRCK", 1, &[0x31, 0x00, 0x32, 0x00]);
+    let bytes = long_mp3_with(2, &[id3v24_text("TIT2", 3, b"Lost"), bad]);
+    w.env.add_bytes("s2.mp3", &bytes);
+    w.rescan();
+    let row = w.env.track(&src);
+    assert!(row.tag_error.is_some(), "set up: the tags fail to parse");
+    assert_eq!(row.tags.title, None, "set up: nothing half-parsed is kept");
+    let p = w.prepare();
+    assert_eq!(p.plan.replace.len(), 1, "{:?}", p.plan);
+    let out = w.sync().unwrap();
+    assert_eq!((out.copied, out.recopied), (0, 1));
+
+    assert_eq!(ipod_title(&w, dbid(2)).as_deref(), Some("Title2"));
+    assert_eq!(fs::read(w.file_of(dbid(2))).unwrap(), bytes);
+    assert_eq!(w.mapping()[&w.id_of(&src)], dbid(2));
+}
+
+// A new track still gets the file name when the file has no title.
+#[test]
+fn a_new_copy_of_a_file_without_a_title_tag_gets_the_file_name() {
+    let mut w = World::new(3);
+    let new = w.env.add_bytes(
+        "Untitled Song.mp3",
+        &mp3_with_id3v2(21, &[id3v24_text("TPE1", 3, b"Someone")]),
+    );
+    w.rescan();
+    assert_eq!(w.env.track(&new).tags.title, None, "set up: no title tag");
+    let mut road = w.files.clone();
+    road.push(new.clone());
+    w.write_list("Road", &road);
+    w.reload();
+    let p = w.prepare();
+    let work = exec::full_work(&p);
+    assert_eq!(work.tracks.copies.len(), 1);
+    assert!(!work.tracks.copies[0].replace);
+    let d = work.tracks.copies[0].dbid;
+    let out = w.run(
+        &p,
+        &work,
+        Options::default(),
+        &|_| {},
+        &AtomicBool::new(false),
+    );
+    assert_eq!(out.unwrap().copied, 1);
+    assert_eq!(ipod_title(&w, d).as_deref(), Some("Untitled Song"));
+}
+
+const OLD_AUDIO_DATA: [(&str, &str); 9] = [
+    ("pregap", "576"),
+    ("postgap", "1100"),
+    ("samplecount", "8820000"),
+    ("gapless_data", "12345"),
+    ("gapless_track_flag", "1"),
+    ("soundcheck", "1200"),
+    ("starttime", "5000"),
+    ("stoptime", "190000"),
+    ("bookmark_time", "7000"),
+];
+
+// Prevents (audit M13): a replace leaving the old file's gapless data, start
+// and stop times, Sound Check and bookmark on the new audio.
+#[test]
+fn a_replace_clears_what_described_the_old_audio_and_keeps_plays_rating_and_dates() {
+    let mut w = World::new(3);
+    seed_old_audio(&w.root, dbid(3));
+    let before = read_audio_data(&w.root, dbid(3));
+    for (k, v) in OLD_AUDIO_DATA {
+        assert_eq!(before[k], v, "set up: {k}");
+    }
+    let src = w.files[2].clone();
+    fs::copy(fixture_secs(Kind::Mp3, 3, 3), &src).unwrap();
+    w.rescan();
+    let p = w.prepare();
+    assert_eq!(p.plan.replace.len(), 1, "{:?}", p.plan);
+    let out = w.sync().unwrap();
+    assert_eq!((out.copied, out.recopied), (0, 1));
+
+    let after = read_audio_data(&w.root, dbid(3));
+    for (k, _) in OLD_AUDIO_DATA {
+        assert_eq!(after[k], "0", "{k} still describes the old file");
+    }
+    // The new audio's rate.
+    let rate = w.open().track_by_dbid(dbid(3)).unwrap().samplerate();
+    assert_ne!(rate, 22050, "set up: the replace set the new rate");
+    assert_eq!(after["samplerate"], rate.to_string());
+    // What belongs to the user, or to the album, stays.
+    for k in [
+        "playcount",
+        "skipcount",
+        "rating",
+        "time_added",
+        "time_played",
+        "gapless_album_flag",
+    ] {
+        assert_eq!(after[k], before[k], "{k} was changed by the replace");
+    }
+    // The audio really was replaced.
+    assert!(w.track(dbid(3)).unwrap().adopt.duration_ms > 2500);
+}
+
+// A tag update does not touch the audio data: only a replace resets it.
+#[test]
+fn a_retag_leaves_the_audio_data_of_the_track_alone() {
+    let mut w = World::new(3);
+    seed_old_audio(&w.root, dbid(2));
+    let before = read_audio_data(&w.root, dbid(2));
+    w.env.add_bytes(
+        "s2.mp3",
+        &retagged_mp3(2, "Other Title", "Artist2", None, None),
+    );
+    w.rescan();
+    let p = w.prepare();
+    assert!(p.plan.replace.is_empty(), "{:?}", p.plan);
+    let out = w.sync().unwrap();
+    assert_eq!((out.retagged, out.recopied), (1, 0));
+    assert_eq!(ipod_title(&w, dbid(2)).as_deref(), Some("Other Title"));
+    assert_eq!(read_audio_data(&w.root, dbid(2)), before);
+}
+
+// Prevents (audit M15): a multi-value tag reaching the iPod cut to its first
+// value, and the library's stored tags disagreeing with what was sent.
+#[test]
+fn a_file_with_several_values_per_tag_puts_the_joined_values_on_the_ipod() {
+    let mut w = World::new(3);
+    let multi = |variant: u32| {
+        mp3_with_id3v2(
+            variant,
+            &[
+                id3v24_text("TIT2", 3, b"Title2"),
+                id3v24_text("TPE1", 3, b"Artist A\0Artist B"),
+                id3v24_text("TALB", 3, b"Album\0Second"),
+                id3v24_text("TCON", 3, b"Rock\0Pop"),
+            ],
+        )
+    };
+    // An existing track is retagged...
+    w.env.add_bytes("s2.mp3", &multi(2));
+    // ... and a new one is copied.
+    let new = w.env.add_bytes("new.mp3", &multi(21));
+    w.rescan();
+    let mut road = w.files.clone();
+    road.push(new.clone());
+    w.write_list("Road", &road);
+    w.reload();
+    let p = w.prepare();
+    let work = exec::full_work(&p);
+    assert_eq!(work.tracks.copies.len(), 1);
+    let d = work.tracks.copies[0].dbid;
+    let out = w.run(
+        &p,
+        &work,
+        Options::default(),
+        &|_| {},
+        &AtomicBool::new(false),
+    );
+    let out = out.unwrap();
+    assert_eq!((out.copied, out.retagged), (1, 1));
+    for dbid in [dbid(2), d] {
+        let db = w.open();
+        let t = db.track_by_dbid(dbid).unwrap();
+        assert_eq!(t.artist().as_deref(), Some("Artist A/Artist B"), "{dbid:x}");
+        assert_eq!(t.album().as_deref(), Some("Album/Second"), "{dbid:x}");
+        assert_eq!(t.genre().as_deref(), Some("Rock/Pop"), "{dbid:x}");
+    }
+    assert!(w.prepare().plan.is_empty(), "the second plan is empty");
 }

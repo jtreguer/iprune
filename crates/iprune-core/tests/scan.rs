@@ -9,7 +9,8 @@ use common::{
     Env, Kind, chmod_000_blocks_reads, fairplay_m4a, fixture, id3v24_text, mp3_with_id3v2,
 };
 use iprune_core::Error;
-use iprune_core::tags::FileKind;
+use iprune_core::store::Store;
+use iprune_core::tags::{self, FileKind};
 
 const NFC: &str = "J\u{f3}hann.mp3";
 const NFD: &str = "Jo\u{301}hann.mp3";
@@ -886,4 +887,163 @@ fn replacing_a_fairplay_file_with_an_ordinary_one_clears_the_flag() {
     let r = env.scan();
     assert!(r.drm.is_empty());
     assert!(!env.track(&p).drm);
+}
+
+// ---- tags read by an older reader (audit M15)
+
+fn index_path(env: &Env) -> PathBuf {
+    env.music.parent().unwrap().join("db/iprune.sqlite")
+}
+
+fn versions(env: &Env) -> Vec<(String, i64)> {
+    let mut stmt = env
+        .store
+        .conn()
+        .prepare("SELECT path, tags_version FROM tracks ORDER BY path")
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// Turns the index into one that the previous version of iprune left: no
+/// `tags_version` column, schema version 6. Opening it again migrates it.
+fn downgrade_to_version_6(env: &mut Env) {
+    let conn = env.store.conn();
+    conn.execute_batch("ALTER TABLE tracks DROP COLUMN tags_version")
+        .unwrap();
+    conn.pragma_update(None, "user_version", 6).unwrap();
+    env.store = Store::open(&index_path(env)).unwrap();
+}
+
+fn multi_value_mp3() -> Vec<u8> {
+    mp3_with_id3v2(
+        1,
+        &[
+            id3v24_text("TIT2", 3, b"Multi"),
+            id3v24_text("TPE1", 3, b"Artist A\0Artist B"),
+            id3v24_text("TCON", 3, b"Rock\0Pop"),
+        ],
+    )
+}
+
+// Prevents: a changed tag reader never reaching files already indexed (the
+// scan skips them by size and mtime), and a tags-only re-read replacing the
+// content hash that move detection depends on.
+#[test]
+fn rows_read_by_an_older_reader_get_their_tags_read_again_but_keep_their_hash_once() {
+    let mut env = Env::new();
+    let multi = env.add_bytes("multi.mp3", &multi_value_mp3());
+    let plain = env.add("plain.mp3", Kind::Mp3, 2);
+    let current = env.add("current.mp3", Kind::Mp3, 3);
+    let r = env.scan();
+    assert_eq!((r.added, r.updated, r.unchanged), (3, 0, 0));
+    assert!(
+        versions(&env)
+            .iter()
+            .all(|(_, v)| *v == tags::READER_VERSION),
+        "a new row records the reader that read it: {:?}",
+        versions(&env)
+    );
+    let ids: Vec<i64> = [&multi, &plain, &current]
+        .iter()
+        .map(|p| env.track(p).id)
+        .collect();
+
+    // The index of the previous version: the multi-value tags were cut to the
+    // first value, and the hashes are not the files' (so a re-hash shows).
+    downgrade_to_version_6(&mut env);
+    let conn = env.store.conn();
+    let mut cut = env.track(&multi).tags;
+    cut.artist = Some("Artist A".into());
+    cut.genre = Some("Rock".into());
+    conn.execute(
+        "UPDATE tracks SET artist = 'Artist A', genre = 'Rock', tags_hash = ?1 WHERE path = ?2",
+        rusqlite::params![&cut.hash()[..], multi.to_str().unwrap()],
+    )
+    .unwrap();
+    for (k, p) in [&multi, &plain, &current].iter().enumerate() {
+        conn.execute(
+            "UPDATE tracks SET hash = ?1 WHERE path = ?2",
+            rusqlite::params![&[k as u8 + 1; 32][..], p.to_str().unwrap()],
+        )
+        .unwrap();
+    }
+    // One row was already read by the current reader, whatever its tags say.
+    conn.execute(
+        "UPDATE tracks SET tags_version = ?1, title = 'Marker' WHERE path = ?2",
+        rusqlite::params![tags::READER_VERSION, current.to_str().unwrap()],
+    )
+    .unwrap();
+    let marker_hash = env.track(&current).tags_hash;
+    let versions_before: Vec<i64> = versions(&env).into_iter().map(|(_, v)| v).collect();
+    assert_eq!(
+        versions_before.iter().filter(|v| **v == 0).count(),
+        2,
+        "set up"
+    );
+
+    let r = env.scan();
+    assert_eq!(
+        (r.updated, r.unchanged, r.added, r.returned),
+        (2, 1, 0, 0),
+        "{r:?}"
+    );
+    let t = env.track(&multi);
+    assert_eq!(t.tags.artist.as_deref(), Some("Artist A/Artist B"));
+    assert_eq!(t.tags.genre.as_deref(), Some("Rock/Pop"));
+    assert_eq!(t.tags_hash, t.tags.hash(), "the tag hash follows the tags");
+    assert_ne!(t.tags_hash, cut.hash());
+    assert_eq!(t.hash, [1; 32], "the content hash is kept");
+    assert_eq!(env.track(&plain).hash, [2; 32], "the content hash is kept");
+    assert_eq!(env.track(&plain).tags.title.as_deref(), Some("Title2"));
+    // The row of the current reader was not read again.
+    let c = env.track(&current);
+    assert_eq!(c.tags.title.as_deref(), Some("Marker"));
+    assert_eq!(c.tags_hash, marker_hash);
+    assert_eq!(c.hash, [3; 32]);
+    // Same rows, all at the current version.
+    assert_eq!(
+        [&multi, &plain, &current].map(|p| env.track(p).id).to_vec(),
+        ids
+    );
+    assert!(
+        versions(&env)
+            .iter()
+            .all(|(_, v)| *v == tags::READER_VERSION),
+        "{:?}",
+        versions(&env)
+    );
+
+    // Once: the next scan finds everything unchanged.
+    let r = env.scan();
+    assert_eq!((r.updated, r.unchanged, r.added), (0, 3, 0), "{r:?}");
+}
+
+// Prevents: a stale row whose file also changed being read tags-only, which
+// would keep the hash of the old content.
+#[test]
+fn a_stale_row_whose_file_changed_is_read_in_full_and_gets_the_new_hash() {
+    let mut env = Env::new();
+    let p = env.add("a.mp3", Kind::Mp3, 1);
+    env.scan();
+    downgrade_to_version_6(&mut env);
+    env.store
+        .conn()
+        .execute("UPDATE tracks SET hash = ?1", [&[9u8; 32][..]])
+        .unwrap();
+    fs::copy(fixture(Kind::Mp3, 5), &p).unwrap();
+    bump_mtime(&p);
+    let r = env.scan();
+    assert_eq!((r.updated, r.unchanged, r.added), (1, 0, 0), "{r:?}");
+    let t = env.track(&p);
+    assert_eq!(t.tags.title.as_deref(), Some("Title5"));
+    assert_ne!(t.hash, [9; 32], "the content changed, so did its hash");
+    // The hash is the new file's: the same file in a fresh index.
+    let mut other = Env::new();
+    let q = other.add("a.mp3", Kind::Mp3, 5);
+    other.scan();
+    assert_eq!(t.hash, other.track(&q).hash);
+    assert_eq!(versions(&env)[0].1, tags::READER_VERSION);
 }

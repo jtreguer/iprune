@@ -320,8 +320,10 @@ impl Plan {
 }
 
 /// A tag value without surrounding spaces (ID3v1 pads with them) and in NFC,
-/// so the same text stored two ways compares equal. Values separated by NUL
-/// (ID3v2.4), which the iPod's C strings cannot hold, are joined with "/".
+/// so the same text stored two ways compares equal. Values separated by NUL,
+/// which the iPod's C strings cannot hold, are joined with "/": the tag
+/// reader joins them already, so this is left for rows an older reader
+/// stored.
 /// `None` when empty.
 pub(crate) fn clean(s: &Option<String>) -> Option<String> {
     let s = s.as_deref()?;

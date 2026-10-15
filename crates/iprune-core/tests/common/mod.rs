@@ -134,7 +134,12 @@ pub fn id3v24_text(id: &str, encoding: u8, text: &[u8]) -> Vec<u8> {
 /// The bytes of the cached Mp3 fixture `variant` with its ID3v2 tag replaced
 /// by a hand-built ID3v2.4 tag made of `frames`. The audio is untouched.
 pub fn mp3_with_id3v2(variant: u32, frames: &[Vec<u8>]) -> Vec<u8> {
-    let raw = fs::read(fixture(Kind::Mp3, variant)).unwrap();
+    mp3_secs_with_id3v2(variant, 1, frames)
+}
+
+/// [`mp3_with_id3v2`] on the fixture lasting `secs` seconds.
+pub fn mp3_secs_with_id3v2(variant: u32, secs: u32, frames: &[Vec<u8>]) -> Vec<u8> {
+    let raw = fs::read(fixture_secs(Kind::Mp3, variant, secs)).unwrap();
     let audio = if raw.starts_with(b"ID3") {
         let size = raw[6..10]
             .iter()
@@ -517,6 +522,68 @@ pub fn add_cover_art(root: &Path, sysinfo_rest: &str) {
 /// `<dbid hex> <title> <rgb hex>` or `NONE`.
 pub fn read_covers(root: &Path) -> String {
     run_art("show", root)
+}
+
+// ---- audio data of a track, read and set through libgpod
+
+/// Compiles `c_audio.c` once per test binary.
+fn audio_tool() -> PathBuf {
+    static TOOL: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    TOOL.get_or_init(|| {
+        let flags = Command::new("pkg-config")
+            .args(["--cflags", "--libs", "libgpod-1.0", "glib-2.0"])
+            .output()
+            .expect("pkg-config");
+        assert!(flags.status.success(), "pkg-config libgpod-1.0");
+        let flags = String::from_utf8(flags.stdout).unwrap();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/c_audio.c");
+        let dir = target_tmp().join("c-tools");
+        fs::create_dir_all(&dir).unwrap();
+        let out = dir.join(format!("c_audio-{}", std::process::id()));
+        let status = Command::new("gcc")
+            .arg("-o")
+            .arg(&out)
+            .arg(&src)
+            .args(flags.split_whitespace())
+            .status()
+            .expect("gcc");
+        assert!(status.success(), "compiling {}", src.display());
+        out
+    })
+    .clone()
+}
+
+fn run_audio(verb: &str, root: &Path, dbid: u64) -> String {
+    let o = Command::new(audio_tool())
+        .arg(verb)
+        .arg(root)
+        .arg(format!("{dbid:x}"))
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "c_audio {verb}: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    String::from_utf8(o.stdout).unwrap()
+}
+
+/// Gives the fake iPod's track `dbid` the audio data of an older encoding
+/// (gapless data, start and stop times, Sound Check, a bookmark, 22050 Hz)
+/// and plays, rating and dates of its own, written by libgpod.
+pub fn seed_old_audio(root: &Path, dbid: u64) {
+    run_audio("set", root, dbid);
+}
+
+/// Those fields of the track as libgpod reads them, by name.
+pub fn read_audio_data(root: &Path, dbid: u64) -> std::collections::BTreeMap<String, String> {
+    run_audio("show", root, dbid)
+        .lines()
+        .map(|l| {
+            let (k, v) = l.split_once('=').expect("name=value");
+            (k.to_owned(), v.to_owned())
+        })
+        .collect()
 }
 
 // ---- damaged databases

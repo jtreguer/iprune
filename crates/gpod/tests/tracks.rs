@@ -499,3 +499,163 @@ fn set_track_audio_with_a_zero_date_keeps_the_date_added_and_a_date_sets_it() {
     assert_eq!(t.time_added(), 1_700_000_000, "0 leaves the date alone");
     assert_eq!(t.size(), 20, "the rest is still set");
 }
+
+// ---- reset_replaced_audio: what described the old file (audit M13)
+
+/// The per-file audio data of a track as libgpod stores it, read back
+/// through libgpod itself and not through the wrapper under test.
+#[derive(Debug, PartialEq)]
+struct Raw {
+    pregap: u32,
+    postgap: u32,
+    samplecount: u64,
+    gapless_data: u32,
+    gapless_track_flag: u32,
+    gapless_album_flag: u32,
+    soundcheck: u32,
+    starttime: u32,
+    stoptime: u32,
+    bookmark_time: u32,
+    samplerate: u32,
+    playcount: u32,
+    skipcount: u32,
+    rating: u32,
+    time_added: i64,
+    time_played: i64,
+}
+
+/// Parses the fake iPod at `root` with raw libgpod, applies `f` to the track
+/// `dbid` and, when `write`, writes it back. Returns its fields.
+fn with_raw_track(
+    root: &Path,
+    dbid: u64,
+    write: bool,
+    f: impl Fn(&mut gpod_sys::Itdb_Track),
+) -> Raw {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let mp = CString::new(root.as_os_str().as_bytes()).unwrap();
+    unsafe {
+        let mut err = std::ptr::null_mut();
+        let db = gpod_sys::itdb_parse(mp.as_ptr(), &mut err);
+        assert!(!db.is_null(), "itdb_parse failed");
+        let mut l = (*db).tracks;
+        let mut found = None;
+        while !l.is_null() {
+            let t = (*l).data as *mut gpod_sys::Itdb_Track;
+            if (*t).dbid == dbid {
+                found = Some(t);
+            }
+            l = (*l).next;
+        }
+        let t = found.expect("no such track");
+        f(&mut *t);
+        if write {
+            assert_ne!(gpod_sys::itdb_write(db, &mut err), 0, "itdb_write failed");
+        }
+        let t = &*t;
+        let raw = Raw {
+            pregap: t.pregap,
+            postgap: t.postgap,
+            samplecount: t.samplecount,
+            gapless_data: t.gapless_data,
+            gapless_track_flag: t.gapless_track_flag.into(),
+            gapless_album_flag: t.gapless_album_flag.into(),
+            soundcheck: t.soundcheck,
+            starttime: t.starttime,
+            stoptime: t.stoptime,
+            bookmark_time: t.bookmark_time,
+            samplerate: t.samplerate.into(),
+            playcount: t.playcount,
+            skipcount: t.skipcount,
+            rating: t.rating,
+            time_added: t.time_added,
+            time_played: t.time_played,
+        };
+        gpod_sys::itdb_free(db);
+        raw
+    }
+}
+
+fn old_audio(t: &mut gpod_sys::Itdb_Track) {
+    t.pregap = 576;
+    t.postgap = 1100;
+    t.samplecount = 8_820_000;
+    t.gapless_data = 12345;
+    t.gapless_track_flag = 1;
+    t.gapless_album_flag = 1;
+    t.soundcheck = 1200;
+    t.starttime = 5000;
+    t.stoptime = 190_000;
+    t.bookmark_time = 7000;
+    t.samplerate = 22_050;
+    t.samplerate2 = 22_050.0;
+    t.playcount = 7;
+    t.skipcount = 2;
+    t.rating = 80;
+    t.time_added = 1_600_000_000;
+    t.time_played = 1_650_000_000;
+}
+
+fn read_raw(root: &Path, dbid: u64) -> Raw {
+    with_raw_track(root, dbid, false, |_| {})
+}
+
+#[test]
+fn reset_replaced_audio_clears_the_old_files_data_and_keeps_plays_rating_and_dates() {
+    let ipod = FakeIpod::from_manifest(MANIFEST);
+    let root = ipod.root();
+    with_raw_track(&root, T1, true, old_audio);
+    with_raw_track(&root, T2, true, old_audio);
+    let seeded = read_raw(&root, T2);
+    assert_eq!(seeded.pregap, 576, "set up: the fields were stored");
+    assert_eq!(seeded.stoptime, 190_000, "set up");
+
+    let mut db = Database::open(&root).unwrap();
+    db.reset_replaced_audio(T2).unwrap();
+    db.write().unwrap();
+    drop(db);
+
+    let after = read_raw(&root, T2);
+    assert_eq!(
+        after,
+        Raw {
+            pregap: 0,
+            postgap: 0,
+            samplecount: 0,
+            gapless_data: 0,
+            gapless_track_flag: 0,
+            soundcheck: 0,
+            starttime: 0,
+            stoptime: 0,
+            bookmark_time: 0,
+            // Kept: the album's flag, the rate (set by set_track_audio, not
+            // here), plays, rating and dates.
+            gapless_album_flag: 1,
+            samplerate: 22_050,
+            playcount: 7,
+            skipcount: 2,
+            rating: 80,
+            time_added: 1_600_000_000,
+            time_played: 1_650_000_000,
+        }
+    );
+    // Another track is not touched.
+    assert_eq!(read_raw(&root, T1), seeded);
+}
+
+#[test]
+fn reset_replaced_audio_of_an_unknown_track_is_an_error_and_changes_nothing() {
+    let ipod = FakeIpod::from_manifest(MANIFEST);
+    let root = ipod.root();
+    with_raw_track(&root, T1, true, old_audio);
+    let seeded = read_raw(&root, T1);
+    let mut db = Database::open(&root).unwrap();
+    let before = snap(&db);
+    let e = db.reset_replaced_audio(0x99).unwrap_err();
+    assert!(matches!(e, Error::NoSuchTrack(0x99)), "{e}");
+    assert_eq!(snap(&db), before);
+    db.write().unwrap();
+    drop(db);
+    assert_eq!(read_raw(&root, T1), seeded);
+}

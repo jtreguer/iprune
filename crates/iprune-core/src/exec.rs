@@ -609,6 +609,7 @@ fn copy_one(
             ..audio
         };
         db.set_track_audio(c.dbid, &audio)?;
+        db.reset_replaced_audio(c.dbid)?;
         db.set_track_fields(c.dbid, &fields)?;
         return Ok(());
     }

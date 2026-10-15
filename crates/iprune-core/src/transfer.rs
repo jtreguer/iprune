@@ -293,7 +293,12 @@ pub fn track_work(
             path: t.path.clone(),
             dbid: r.old_dbid,
             replace: true,
-            fields: all_fields(t),
+            // Like a retag: a tag missing from the file leaves the iPod's,
+            // so no file name becomes the title of an existing track.
+            fields: Fields {
+                title: clean(&t.tags.title),
+                ..all_fields(t)
+            },
             audio: audio(t),
             tags_hash: t.tags_hash,
             duration_ms: t.info.duration_ms,

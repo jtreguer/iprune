@@ -215,7 +215,8 @@ CREATE TABLE tracks (
   added_at      INTEGER NOT NULL,
   missing_since INTEGER,                     -- set when the file disappears
   tag_error     TEXT,                        -- why the tags could not be read
-  drm           INTEGER NOT NULL DEFAULT 0   -- FairPlay protected
+  drm           INTEGER NOT NULL DEFAULT 0,  -- FairPlay protected
+  tags_version  INTEGER NOT NULL DEFAULT 0   -- tag reader version that read it
 );
 
 CREATE TABLE playlists (
@@ -314,6 +315,10 @@ existing mappings.
    files are skipped, so a rescan of 9,675 files takes about a second.
 3. New or changed files are read in parallel with `lofty` (tags, duration,
    codec, embedded picture presence). New files are also hashed with BLAKE3.
+   Every value of a multi-value text tag (ID3v2.4, Vorbis comments) is read,
+   trimmed, and joined with "/". Rows read by an older tag reader
+   (`tags_version`, migration 7) have their tags read again, not their
+   audio, whose hash is kept; the scan reports them as updated.
    The first full hash of 77 GB on a USB hard disk takes 10 to 15 minutes and
    runs once; progress is shown.
 4. Move detection: a new path is the same track as a path that disappeared
@@ -686,7 +691,13 @@ Order of operations:
    full or gone) takes its half-added track out and stops the sync as below.
    A replace copies the new file into the existing track and sets its audio
    facts and tags, keeping its date added; the old file is deleted after the
-   verified write. A file that is not marked as part of a compilation never
+   verified write. Its tags are set like a retag: a tag the file lacks keeps
+   the iPod's value, so a file with no title never puts its file name over
+   an iPod title (the file name stands in only for a new track). What
+   described the old file is cleared: gapless data (pregap, postgap,
+   sample count, the track's gapless flag), start and stop times, Sound
+   Check and the resume position. Play counts, rating, dates and the album's
+   gapless flag stay. A file that is not marked as part of a compilation never
    clears the iPod's mark. Copies run one at a time with progress in bytes;
    the USB link is the limit. Files sampled above 48 kHz, which the iPod
    Classic cannot play, are skipped by the planner like FairPlay files.

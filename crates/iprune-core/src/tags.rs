@@ -121,8 +121,26 @@ pub enum ReadError {
     Unreadable(String),
 }
 
-fn non_empty(s: Option<impl Into<String>>) -> Option<String> {
-    s.map(Into::into).filter(|s: &String| !s.trim().is_empty())
+/// The version of how tags are read, stored with each row: rows read by an
+/// older one have their tags read again (2: every value of a multi-value
+/// text tag, joined with "/"). Bump it with any change to what is read.
+pub const READER_VERSION: i64 = 2;
+
+/// Every value of a text tag (ID3v2.4 and MP4 hold several), trimmed,
+/// empty and repeated ones dropped (lofty reads an ID3v2.3 genre
+/// "(17)Rock" as "Rock" twice), joined with "/".
+fn joined(tag: &Tag, key: ItemKey) -> Option<String> {
+    let mut values: Vec<&str> = Vec::new();
+    for v in tag
+        .get_strings(key)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        if !values.iter().any(|seen| seen.eq_ignore_ascii_case(v)) {
+            values.push(v);
+        }
+    }
+    (!values.is_empty()).then(|| values.join("/"))
 }
 
 fn tags_from(tag: &Tag) -> Tags {
@@ -131,12 +149,12 @@ fn tags_from(tag: &Tag) -> Tags {
             .is_some_and(|v| matches!(v.trim(), "1" | "true" | "True" | "TRUE"))
     };
     Tags {
-        title: non_empty(tag.title()),
-        artist: non_empty(tag.artist()),
-        album: non_empty(tag.album()),
-        album_artist: non_empty(tag.get_string(ItemKey::AlbumArtist)),
-        composer: non_empty(tag.get_string(ItemKey::Composer)),
-        genre: non_empty(tag.genre()),
+        title: joined(tag, ItemKey::TrackTitle),
+        artist: joined(tag, ItemKey::TrackArtist),
+        album: joined(tag, ItemKey::AlbumTitle),
+        album_artist: joined(tag, ItemKey::AlbumArtist),
+        composer: joined(tag, ItemKey::Composer),
+        genre: joined(tag, ItemKey::Genre),
         year: tag.date().map(|d| u32::from(d.year)).filter(|&y| y > 0),
         track_no: tag.track().filter(|&n| n > 0),
         track_total: tag.track_total().filter(|&n| n > 0),

@@ -134,11 +134,15 @@ fn a_version_4_index_keeps_every_row_and_id_and_gets_an_id_that_is_never_reused(
     for row in mapped {
         assert_eq!(row.remove("synced_rating").as_deref(), Some("Null"));
     }
+    // Read by the first tag reader: their tags are read again.
+    for row in after.get_mut("tracks").unwrap() {
+        assert_eq!(row.remove("tags_version").as_deref(), Some("Integer(0)"));
+    }
     assert_eq!(after, before);
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 
     // The next id starts above the highest one used, also after that
     // highest row is deleted.
