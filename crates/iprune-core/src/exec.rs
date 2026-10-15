@@ -762,10 +762,20 @@ pub fn sync(
         .ok_or_else(|| Error::NotAdopted(prepared.guid.clone()))?;
     check_guards(prepared, work, opts)?;
     check_artwork(&db, mountpoint)?;
-    if device::signature(&device::itunesdb(mountpoint))?.0 != 0
-        && let Some(why) = device::unsigned_reason(mountpoint, prepared.ipod.model.as_deref())
-    {
-        return Err(Error::WouldNotSign(why));
+    if device::signature(&device::itunesdb(mountpoint))?.0 != 0 {
+        // The hash is made from the GUID libgpod reads in the device files;
+        // the USB serial that may have identified the iPod is not one of them.
+        let why = match db.firewire_guid() {
+            None => Some(
+                "it finds no FireWire GUID in SysInfo or SysInfoExtended; \
+                 run ipod-read-sysinfo-extended on the iPod"
+                    .to_owned(),
+            ),
+            Some(_) => device::unsigned_reason(mountpoint, prepared.ipod.model.as_deref()),
+        };
+        if let Some(why) = why {
+            return Err(Error::WouldNotSign(why));
+        }
     }
     if !work.tracks.copies.is_empty() && !prepared.plan.space.fits {
         return Err(Error::NoSpace);

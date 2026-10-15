@@ -284,8 +284,18 @@ pub fn normalize_guid(guid: &str) -> String {
 
 /// The FireWire GUID of the iPod at `mountpoint`, read from
 /// `SysInfoExtended` or `SysInfo` without parsing the database, so it works
-/// when the database is damaged. Upper-case hex without `0x`.
+/// when the database is damaged, else from the USB serial of the device
+/// mounted there. Upper-case hex without `0x`.
 pub fn firewire_guid(mountpoint: &Path) -> Option<String> {
+    firewire_guid_or(mountpoint, usb_guid)
+}
+
+/// [`firewire_guid`] with `serial` as the last resort in place of the USB
+/// serial lookup.
+pub fn firewire_guid_or(
+    mountpoint: &Path,
+    serial: impl FnOnce(&Path) -> Option<String>,
+) -> Option<String> {
     let dir = mountpoint.join("iPod_Control/Device");
     let clean = |s: &str| {
         let s = s.trim();
@@ -304,10 +314,44 @@ pub fn firewire_guid(mountpoint: &Path) -> Option<String> {
             return Some(g);
         }
     }
-    let text = std::fs::read_to_string(dir.join("SysInfo")).ok()?;
-    text.lines()
-        .find_map(|l| l.strip_prefix("FirewireGuid:"))
-        .and_then(clean)
+    let from_sysinfo = std::fs::read_to_string(dir.join("SysInfo"))
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|l| l.strip_prefix("FirewireGuid:"))
+                .and_then(clean)
+        });
+    from_sysinfo.or_else(|| serial(mountpoint))
+}
+
+/// The FireWire GUID of the iPod mounted at `mountpoint`, from its USB
+/// serial number, which is the same number: what identifies an iPod whose
+/// `SysInfo` is empty, as a restore leaves it. `None` for a folder.
+fn usb_guid(mountpoint: &Path) -> Option<String> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let dev = block_device(&mountinfo, mountpoint)?;
+    usb_guid_in(Path::new("/sys"), &dev)
+}
+
+/// [`usb_guid`] for the block device `dev` (`/dev/sdc2`) under the sysfs
+/// root `sys`: the serial of the USB device above it, if it is Apple's
+/// (vendor 05ac) and the serial is hex.
+pub fn usb_guid_in(sys: &Path, dev: &str) -> Option<String> {
+    let dev = std::fs::canonicalize(dev).unwrap_or_else(|_| PathBuf::from(dev));
+    let sys = std::fs::canonicalize(sys).ok()?;
+    let block = std::fs::canonicalize(sys.join("class/block").join(dev.file_name()?)).ok()?;
+    let usb = block
+        .ancestors()
+        .take_while(|p| p.starts_with(&sys))
+        .find(|p| p.join("idVendor").is_file())?;
+    let read = |name: &str| std::fs::read_to_string(usb.join(name)).ok();
+    if read("idVendor")?.trim() != "05ac" {
+        return None;
+    }
+    let serial = read("serial")?;
+    let serial = serial.trim();
+    (!serial.is_empty() && serial.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| serial.to_ascii_uppercase())
 }
 
 /// The iPod to use: `device.mountpoint` from the config when set, else the

@@ -79,9 +79,16 @@ pub fn prepare(conn: &Connection, cfg: &Config, db: &gpod::Database) -> Result<P
     let ipod = ipod::read(db);
     let guid = ipod.firewire_guid.clone().ok_or(Error::NoFirewireGuid)?;
     let device = match devices::device_id(conn, &guid)? {
-        Some(id) if devices::mapped_track_count(conn, id)? > 0 => id,
+        // An empty iPod, freshly restored, has nothing to copy twice.
+        Some(id) if ipod.tracks.is_empty() || devices::mapped_track_count(conn, id)? > 0 => id,
         // Without a mapping every track would be copied a second time.
-        _ => return Err(Error::NotAdopted(guid)),
+        Some(_) => {
+            return Err(Error::NothingMatched {
+                guid,
+                tracks: ipod.tracks.len(),
+            });
+        }
+        None => return Err(Error::NotAdopted(guid)),
     };
     if let Some(stamp) = devices::restoring(conn, device)? {
         return Err(Error::RestoreUnfinished(stamp));

@@ -34,13 +34,17 @@ pub enum Error {
     #[error("{} was changed by another program while iprune was editing it; nothing written, try again", .0.display())]
     ChangedOnDisk(PathBuf),
     #[error(
-        "the iPod has no FireWire GUID in iPod_Control/Device/SysInfo or SysInfoExtended, so it cannot be identified"
+        "the iPod has no FireWire GUID in iPod_Control/Device/SysInfo or SysInfoExtended, nor a USB serial, so it cannot be identified"
     )]
     NoFirewireGuid,
     #[error(
         "the iPod {0} has not been adopted; run `iprune adopt` first, or every track would be copied again"
     )]
     NotAdopted(String),
+    #[error(
+        "adopting the iPod {guid} matched none of its {tracks} tracks, so a sync would copy every track next to them; check that the library is scanned, then run `iprune adopt --force`"
+    )]
+    NothingMatched { guid: String, tracks: usize },
     #[error("no mounted iPod found; connect and mount it, or set device.mountpoint in the config")]
     NoIpod,
     #[error("several iPods are mounted ({0}); set device.mountpoint in the config")]

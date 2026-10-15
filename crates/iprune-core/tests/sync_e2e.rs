@@ -159,11 +159,58 @@ fn an_ipod_that_was_not_adopted_is_refused() {
     );
 }
 
-#[test]
-fn a_device_known_but_with_no_mapped_track_is_refused() {
-    let w = world(Some(SYSINFO), vec![]);
+/// The library of `world`, and an iPod with no track and no playlist.
+fn empty_world() -> World {
+    let mut w = world(Some(SYSINFO), vec![]);
+    let dir = tempfile::tempdir().unwrap();
+    w.root = fake_ipod(dir.path(), Some(SYSINFO), &[], &[]);
+    w._ipod_dir = dir;
+    assert!(
+        ipod::read(&w.open()).tracks.is_empty(),
+        "set up: empty iPod"
+    );
+    w
+}
+
+fn known_device(w: &World) {
     let guid = ipod::read(&w.open()).firewire_guid.unwrap();
     iprune_core::store::devices::upsert_device(w.env.store.conn(), &guid, None, None).unwrap();
+}
+
+// An iPod that holds tracks, was adopted and matched none of them: copying
+// the whole scope would duplicate every track, so it is refused.
+#[test]
+fn a_device_known_with_tracks_but_no_mapped_track_is_refused() {
+    let w = world(Some(SYSINFO), vec![]);
+    known_device(&w);
+    let err = w.prepare().err().expect("must be refused");
+    let Error::NothingMatched { guid, tracks } = &err else {
+        panic!("expected NothingMatched, got {err:?}")
+    };
+    assert!(guid.ends_with("000A27001234ABCD"), "{guid}");
+    assert_eq!(*tracks, 3);
+}
+
+// An empty iPod, freshly restored and adopted with nothing to match, takes
+// the whole scope.
+#[test]
+fn a_known_empty_ipod_plans_copies_of_the_whole_scope() {
+    let w = empty_world();
+    known_device(&w);
+    let p = w.prepare().expect("an empty adopted iPod is accepted");
+    assert_eq!(p.plan.copy.len(), 3, "{:?}", p.plan.copy);
+    let mut copied: Vec<i64> = p.plan.copy.iter().map(|c| c.track_id).collect();
+    copied.sort();
+    let mut all = vec![w.id("one"), w.id("two"), w.id("three")];
+    all.sort();
+    assert_eq!(copied, all);
+    assert!(p.plan.remove.is_empty() && p.plan.replace.is_empty());
+    assert!(p.tracks_map.is_empty());
+}
+
+#[test]
+fn an_empty_ipod_without_a_device_row_is_not_adopted() {
+    let w = empty_world();
     let err = w.prepare().err().expect("must be refused");
     assert!(matches!(err, Error::NotAdopted(_)), "{err:?}");
 }

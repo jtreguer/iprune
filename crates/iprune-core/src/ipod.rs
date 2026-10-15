@@ -153,7 +153,11 @@ pub fn read(db: &gpod::Database) -> Contents {
         name: db
             .master_playlist()
             .and_then(|p| p.name().map(|n| n.into_owned())),
-        firewire_guid: db.firewire_guid(),
+        // libgpod reads only the device files; a restored iPod has an empty
+        // SysInfo but still its USB serial.
+        firewire_guid: db
+            .firewire_guid()
+            .or_else(|| crate::device::firewire_guid(&db.mountpoint()?)),
         model,
         tracks,
         playlists,

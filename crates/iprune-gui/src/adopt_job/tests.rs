@@ -351,7 +351,10 @@ fn prepare_is_refused_on_an_adopted_ipod_and_writes_no_report() {
 fn prepare_needs_a_guid_to_identify_the_ipod() {
     let w = World::with_sysinfo(None);
     let err = w.prepare().err().expect("refused").to_string();
-    assert!(err.contains("FirewireGuid"), "{err}");
+    assert!(
+        err.contains("cannot be identified") && err.contains("USB serial"),
+        "{err}"
+    );
     assert!(!w.report().exists());
     assert_eq!(w.saved_mapping(), vec![]);
 }

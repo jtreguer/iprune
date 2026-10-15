@@ -367,7 +367,11 @@ fn an_ipod_without_a_firewire_guid_is_never_saved() {
         }
         let o = sb.run(&["adopt", "--accept-proposals", "--force"]);
         assert_code(&o, 1);
-        assert!(err(&o).contains("FirewireGuid"), "{}", err(&o));
+        let e = err(&o);
+        assert!(
+            e.contains("cannot be identified") && e.contains("USB serial"),
+            "{e}"
+        );
         assert_eq!(sb.saved(), (0, 0, 0));
         assert!(
             sb.report().contains("iPod"),

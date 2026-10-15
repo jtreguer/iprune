@@ -210,8 +210,9 @@ pub fn prepare(config: &Config, paths: &Paths, progress: &dyn Fn(usize, usize)) 
     let run = adoption::run(conn, &db, false, progress)?;
     let Some(guid) = run.ipod.firewire_guid.clone() else {
         bail!(
-            "the iPod has no FirewireGuid in iPod_Control/Device/SysInfo, so it cannot be \
-             identified; run ipod-read-sysinfo-extended on it first"
+            "the iPod has no FireWire GUID in iPod_Control/Device/SysInfo or SysInfoExtended, \
+             nor a USB serial, so it cannot be identified; run ipod-read-sysinfo-extended on \
+             it first"
         );
     };
     refuse_adopted(&store, &guid)?;

@@ -307,6 +307,42 @@ impl World {
     }
 }
 
+impl World {
+    /// `n` library files, an iPod with no track and no playlist, adopted
+    /// with nothing to match: a freshly restored iPod.
+    pub fn empty(n: usize) -> World {
+        let mut env = Env::new();
+        let files: Vec<PathBuf> = (1..=n)
+            .map(|i| env.add(&format!("s{i}.mp3"), Kind::Mp3, i as u32))
+            .collect();
+        env.scan();
+        let ipod_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let root = fake_ipod(ipod_dir.path(), Some(SYSINFO), &[], &[]);
+        let paths = Paths {
+            config_file: data_dir.path().join("config.toml"),
+            data_dir: data_dir.path().join("data"),
+        };
+        let w = World {
+            env,
+            files,
+            _ipod_dir: ipod_dir,
+            _data_dir: data_dir,
+            root,
+            paths,
+        };
+        w.write_list("Road", &w.files);
+        w.reload();
+        let conn = w.env.store.conn();
+        let db = w.open();
+        let run = adoption::run(conn, &db, false, &|_, _| {}).unwrap();
+        assert!(run.mapping.is_empty(), "nothing to match: {:?}", run.left);
+        adoption::save(conn, &run, &ipod::read(&db).firewire_guid.unwrap(), false).unwrap();
+        drop(db);
+        w
+    }
+}
+
 pub fn tree(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
         let Ok(rd) = fs::read_dir(dir) else { return };
@@ -4818,6 +4854,40 @@ mod step3 {
         assert!(why.contains("DBVersion 2"), "{why}");
     }
 
+    // Prevents a signed database being rewritten unsigned when the iPod was
+    // identified by its USB serial and libgpod has no GUID in the device
+    // files to sign with. The identity check is skipped (as for a prompt that
+    // saw the GUID before the files lost it) so the guard itself is reached.
+    #[test]
+    fn a_signed_database_is_not_written_when_libgpod_has_no_guid_to_sign_with() {
+        let w = signed_world();
+        nudge(&w, 2);
+        let mut p = w.prepare();
+        p.identity = None;
+        let work = exec::full_work(&p);
+        assert!(!work.is_empty(), "set up: there is something to write");
+        // A model but no GUID: what a restored iPod has.
+        fs::write(sysinfo_path(&w), "ModelNumStr: xC297\n").unwrap();
+        let _ = fs::remove_file(w.root.join("iPod_Control/Device/SysInfoExtended"));
+        assert_eq!(w.open().firewire_guid(), None, "set up: libgpod has none");
+        let before = state(&w);
+        let e = w
+            .run(
+                &p,
+                &work,
+                Options::default(),
+                &|_| {},
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+        let Error::WouldNotSign(why) = &e else {
+            panic!("expected WouldNotSign, got {e:?}")
+        };
+        assert!(why.contains("GUID"), "{why}");
+        assert_eq!(state(&w), before, "the refusal changed something");
+        assert_eq!(signature(&w), (1, true), "still signed");
+    }
+
     #[test]
     fn dbversion_3_in_sysinfoextended_is_allowed_to_write_a_signed_database() {
         let w = signed_world();
@@ -6140,4 +6210,38 @@ fn a_file_with_several_values_per_tag_puts_the_joined_values_on_the_ipod() {
         assert_eq!(t.genre().as_deref(), Some("Rock/Pop"), "{dbid:x}");
     }
     assert!(w.prepare().plan.is_empty(), "the second plan is empty");
+}
+
+// Prevents a freshly restored, empty iPod being refused as "not adopted":
+// the whole scope is copied to it, the mappings are recorded, and syncing
+// again plans nothing.
+#[test]
+fn an_empty_adopted_ipod_receives_the_library_and_then_has_an_empty_plan() {
+    let w = World::empty(3);
+    let p = w.prepare();
+    assert_eq!(p.plan.copy.len(), 3, "{:?}", p.plan.copy);
+    let work = exec::full_work(&p);
+    assert_eq!(work.tracks.copies.len(), 3);
+    w.sync().unwrap();
+
+    let c = w.contents();
+    assert_eq!(c.tracks.len(), 3, "{:?}", c.tracks);
+    let road = c
+        .playlists
+        .iter()
+        .find(|l| l.name == "Road")
+        .expect("Road created");
+    assert_eq!(road.members.len(), 3);
+    let on_disk = fs::read_dir(w.root.join("iPod_Control/Music"))
+        .unwrap()
+        .flat_map(|d| fs::read_dir(d.unwrap().path()).unwrap())
+        .count();
+    assert_eq!(on_disk, 3, "the three audio files were copied");
+    assert_eq!(w.mapping().len(), 3);
+
+    let again = w.prepare();
+    assert!(again.plan.is_empty(), "{:?}", again.plan);
+    let before = w.snapshot();
+    w.sync().unwrap();
+    assert_eq!(w.snapshot(), before);
 }

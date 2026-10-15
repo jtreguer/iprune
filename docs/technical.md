@@ -380,9 +380,17 @@ existing mappings.
 
 - Read `/proc/self/mountinfo` and keep mountpoints containing
   `iPod_Control/iTunes/iTunesDB`. With more than one, ask.
-- Identity is `itdb_device_get_sysinfo(device, "FirewireGuid")`. If missing,
-  stop with a message telling the user to run `ipod-read-sysinfo-extended`,
-  since libgpod cannot write a valid Classic database without it anyway.
+- Identity is `itdb_device_get_sysinfo(device, "FirewireGuid")`, else the
+  GUID in `SysInfoExtended` or `SysInfo` read directly, else the USB serial
+  number of the device mounted there, which is the same number: walk up
+  from `/sys/class/block/<dev>` to the first USB device and take its
+  `serial` if `idVendor` is Apple's `05ac` and the serial is hex. A
+  restored iPod has an empty `SysInfo` and no `SysInfoExtended`, so only
+  the serial identifies it. A folder has none. With no GUID at all, stop
+  with a message telling the user to run `ipod-read-sysinfo-extended`.
+- libgpod signs a database with the GUID it reads in the device files, not
+  the serial. A write to a signed database is refused before it starts
+  when libgpod finds no GUID there.
 - Before parsing, check the filesystem type. The supported iPod is FAT32
   (`vfat`); anything else is refused for writes, as is a read-only mount.
 - Every write (sync, `doctor --fix`, restore) needs the mountpoint to be
@@ -596,7 +604,9 @@ than a tenth of the managed tracks needs an explicit flag.
 summary of section 7.3 of the design (every change with `--verbose`, the
 plan as JSON with `--json`) and saves the plan to `plan.json` in the data
 folder. It refuses an iPod that has not been adopted, since every track
-would otherwise be copied again.
+would otherwise be copied again. An adopted iPod with no mapped track is
+refused too, unless it holds no track at all: an empty iPod, adopted
+with nothing to match, gets the whole sync scope copied to it.
 
 ### 11.2 Executor
 
