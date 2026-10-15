@@ -27,6 +27,7 @@ fn track(dbid: u64) -> Track {
         ipod_path: None,
         recent_plays: 0,
         recent_skips: 0,
+        skips: 0,
         rating: 0,
         last_played: 0,
     }

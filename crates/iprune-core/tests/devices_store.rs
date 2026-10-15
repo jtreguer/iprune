@@ -197,6 +197,7 @@ fn ipod_track(dbid: u64, size: u64, tags: Tags) -> ipod::Track {
         ipod_path: None,
         recent_plays: 0,
         recent_skips: 0,
+        skips: 0,
         rating: 0,
         last_played: 0,
     }
@@ -546,4 +547,93 @@ fn a_device_is_found_by_any_spelling_of_its_guid_and_upsert_adds_no_second_row()
     assert_eq!(devices::device_id(conn, "000A27001234ABCE").unwrap(), None);
     let b = devices::upsert_device(conn, "000A27001234ABCE", None, None).unwrap();
     assert_ne!(a, b);
+}
+
+// Prevents a forced re-adoption letting an older iPod rating overwrite a
+// newer stored one: adoption records the iPod's ratings as seen for tracks
+// that already have statistics.
+#[test]
+fn a_forced_readoption_keeps_a_stored_rating_and_a_track_without_stats_takes_the_ipods() {
+    let (env, t) = env_with_tracks(2);
+    let conn = env.store.conn();
+    let rated = |dbid: u64, rating: u32| {
+        let mut x = ipod_track(dbid, 10, tags("a", "b"));
+        x.rating = rating;
+        x
+    };
+    let pairs = [(1, 0), (2, 1)];
+    let first = run_of(&t, vec![rated(1, 0), rated(2, 0)], &pairs);
+    adoption::save(conn, &first, "G1", false).unwrap();
+    let dev = devices::device_id(conn, "G1").unwrap().unwrap();
+
+    // Track 0 is rated 80 on the iPod and pulled.
+    let maps = devices::track_mappings(conn, dev).unwrap();
+    let c = Contents {
+        tracks: vec![rated(1, 80), rated(2, 0)],
+        ..Contents::default()
+    };
+    iprune_core::stats::pull(conn, dev, &maps, &c, None).unwrap();
+    let rating = |id: i64| -> Option<i64> {
+        conn.query_row("SELECT rating FROM stats WHERE track_id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .ok()
+        .flatten()
+    };
+    assert_eq!(rating(t[0].id), Some(80), "set up");
+
+    // Adopted again with force while the iPod shows 40 and 60.
+    let again = run_of(&t, vec![rated(1, 40), rated(2, 60)], &pairs);
+    adoption::save(conn, &again, "G1", true).unwrap();
+    let maps = devices::track_mappings(conn, dev).unwrap();
+    let c = Contents {
+        tracks: vec![rated(1, 40), rated(2, 60)],
+        ..Contents::default()
+    };
+    iprune_core::stats::pull(conn, dev, &maps, &c, None).unwrap();
+    assert_eq!(rating(t[0].id), Some(80), "the stored rating stands");
+    assert_eq!(rating(t[1].id), Some(60), "no statistics: the iPod's");
+    assert_eq!(
+        devices::synced_ratings(conn, dev).unwrap().get(&1),
+        Some(&40),
+        "and a later change on the iPod is still news"
+    );
+}
+
+// A track with plays but no stored rating takes the iPod's rating when it is
+// adopted again: there is no rating to protect.
+#[test]
+fn a_forced_readoption_of_a_track_with_a_stats_row_but_no_rating_takes_the_ipods() {
+    let (env, t) = env_with_tracks(1);
+    let conn = env.store.conn();
+    let rated = |rating: u32| {
+        let mut x = ipod_track(1, 10, tags("a", "b"));
+        x.rating = rating;
+        x
+    };
+    let first = run_of(&t, vec![rated(0)], &[(1, 0)]);
+    adoption::save(conn, &first, "G1", false).unwrap();
+    let dev = devices::device_id(conn, "G1").unwrap().unwrap();
+    conn.execute(
+        "INSERT INTO stats (track_id, plays, skips, rating) VALUES (?1, 7, 0, NULL)",
+        [t[0].id],
+    )
+    .unwrap();
+
+    let again = run_of(&t, vec![rated(80)], &[(1, 0)]);
+    adoption::save(conn, &again, "G1", true).unwrap();
+    let maps = devices::track_mappings(conn, dev).unwrap();
+    let c = Contents {
+        tracks: vec![rated(80)],
+        ..Contents::default()
+    };
+    iprune_core::stats::pull(conn, dev, &maps, &c, None).unwrap();
+    let (plays, rating): (i64, Option<i64>) = conn
+        .query_row(
+            "SELECT plays, rating FROM stats WHERE track_id = ?1",
+            [t[0].id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((plays, rating), (7, Some(80)));
 }

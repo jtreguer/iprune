@@ -182,14 +182,16 @@ mountpoint = ""                  # empty means detect; absolute otherwise
 | Path | Content |
 |---|---|
 | `~/.local/share/iprune/iprune.sqlite` | library index, mappings, statistics |
-| `~/.local/share/iprune/stats.csv` | play statistics, rewritten after each sync |
-| `~/.local/share/iprune/backups/<guid>/<timestamp>/` | `iTunesDB`, `ArtworkDB`, `Play Counts` if present, `artwork.json`, `plan.json`, `snapshot.txt` |
+| `~/.local/share/iprune/stats.csv` | play statistics, rewritten after each sync; a previous file with more rows or plays is kept as `stats-<stamp>.csv` (the newest five), and each backup holds the one from before its sync |
+| `~/.local/share/iprune/backups/<guid>/<timestamp>/` | `iTunesDB`, `ArtworkDB`, `Play Counts` if present, `artwork.json`, `plan.json`, `work.json`, `snapshot.txt`, `mappings.json`, `stats.csv` |
 | `~/.local/share/iprune/backups/<guid>/.ithmb/<blake3>` | the iPod's `.ithmb` cover art files, one copy per content, shared by the backups that list them |
 | `<ipod>/iPod_Control/iprune/manifest.json` | copy of the device mapping, written after each sync |
 | `/mnt/seagate-1tb/Playlists/*.m3u8` | playlists, the source of truth |
 
-The manifest on the iPod lets iprune rebuild the mapping if the local database
-is lost, without running adoption again.
+The manifest on the iPod is a copy of the mapping for recovery by hand if the
+local database is lost; iprune does not read it yet, and a lost index is
+rebuilt by adopting again (whose first pull takes the iPod's lifetime
+counts).
 
 ## 6. Database schema
 
@@ -582,21 +584,45 @@ Order of operations:
    `--allow-mass-removal` is given: an emptied playlists folder is likelier
    than a decision.
 2. Pull statistics: for each mapped track add `recent_playcount` and
-   `recent_skipcount` to `stats`, copy `rating` and keep the latest
-   `time_played`. Commit to SQLite. This happens first because libgpod resets
+   `recent_skipcount` to `stats` and keep the latest `time_played`. A track
+   with no `stats` row yet starts from the iPod's lifetime `playcount` and
+   `skipcount` instead (libgpod folds the recent counts into them), so the
+   plays counted under iTunes before adoption are kept (design goal 6; the
+   owner's decision). The rating is taken only when it changed on the iPod:
+   `device_tracks.synced_rating` (migration 0006) holds the rating that iPod
+   track had at the last pull, and only a different value, a cleared one
+   included, changes `stats.rating`. With none recorded yet, a rating on the
+   iPod is taken and no rating is not. A new copy or re-copy (a new dbid)
+   starts with none recorded, and a restore, or a forced re-adoption of
+   tracks that have statistics, records the iPod's ratings as seen, so
+   neither erases or lowers a stored rating, nor does another iPod. A track
+   with no statistics row takes the iPod's rating whatever is recorded. A
+   database whose ratings were reset outside iprune (iTunes, by hand) reads
+   as every rating cleared on the iPod, and clears the stored ones.
+   Commit to SQLite. This happens first because libgpod resets
    the recent counts on the next write. The pull is recorded in
    `pending_pulls` with the hash of `Play Counts` (migration 0004). If
    anything fails before the write, the pull is undone, since the iPod still
-   holds the same counts. A sync that stops between the pull and the end of
-   the write (killed, or a write that failed part way) leaves the record,
-   and the next sync settles it before pulling again. libgpod renames `Play
-   Counts` to `Play Counts.bak` only once a write succeeds, so: a `.bak`
-   equal to the file pulled from means the write happened and the pull
-   stands; a `Play Counts` still present (the same, or grown with new plays)
-   means it did not, and the pull is undone; neither means a write removed
-   it, and the pull stands. A record that cannot be read is dropped with a
-   warning. Plays of tracks iprune
-   does not manage are not pulled, and the write resets them.
+   holds the same counts. Undoing takes back only this pull's part: its
+   plays and skips are subtracted, and the rating, last play and recorded
+   rating go back only where they still hold what this pull set, so a pull
+   of another iPod made since is kept. A sync that stops between the pull
+   and the end of the write (killed, or a write that failed part way) leaves
+   the record, and the next sync settles it before pulling again. Just
+   before the first write, iprune renames `Play Counts` to `Play Counts.bak`
+   itself (libgpod does it only after replacing `iTunesDB`, and a crash in
+   between would leave counts indexed by the old track order next to the new
+   database); a write that fails with the iPod unchanged gets it back. So: a
+   `.bak` equal to the file pulled from means the write was reached and the
+   pull stands; a `Play Counts` still present (the same, or grown with new
+   plays) means it was not, and the pull is undone; neither means a write
+   removed it, and the pull stands. A process killed after the rename and
+   before libgpod wrote leaves the pull standing while the iPod's own
+   database lacks those recent plays in its totals: iprune's counts are
+   right, the iPod's are short. A write refused with the iPod unchanged but
+   `Play Counts` impossible to put back keeps the pull and says so. A record
+   that cannot be read is dropped with a warning. Plays of tracks iprune does not manage are not pulled,
+   and the write resets them.
 3. Back up `iTunesDB`, `ArtworkDB`, `Play Counts` and `OTGPlaylistInfo`
    (each copy compared with the original) to
    `backups/<guid>/<YYYYMMDD-HHMMSS>/`, with `plan.json`, `work.json` (the

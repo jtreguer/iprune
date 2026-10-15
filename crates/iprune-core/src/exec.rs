@@ -444,22 +444,40 @@ impl Writer<'_> {
             .filter(|(_, p)| p.is_podcasts())
             .map(|(i, _)| i)
             .collect();
+        // libgpod renames `Play Counts` to `Play Counts.bak` only after the
+        // new `iTunesDB` is in place: a crash in between would leave counts
+        // indexed by the old track order next to the new database, and the
+        // next sync would credit them to the wrong tracks. Its plays are
+        // pulled and the file is in the backup, so it is renamed first.
+        let counts = self.mountpoint.join("iPod_Control/iTunes/Play Counts");
+        let counts_bak = self.mountpoint.join("iPod_Control/iTunes/Play Counts.bak");
+        let moved = !self.written && counts.is_file();
+        if moved {
+            std::fs::rename(&counts, &counts_bak).map_err(|source| {
+                self.undo(Error::Io {
+                    path: counts.clone(),
+                    source,
+                })
+            })?;
+        }
         progress(Progress::Writing);
         if let Err(e) = db.write() {
             // libgpod writes several files; a failure part way leaves some
-            // of them changed. Only an iPod still equal to the backup keeps
-            // its `Play Counts`, and only then is the pull undone; otherwise
-            // the next sync's recovery decides by the files.
-            return Err(
-                if !self.written && untouched(self.backup, self.mountpoint) {
-                    self.undo(e.into())
-                } else {
-                    Error::WriteIncomplete {
-                        cause: e.to_string(),
-                        stamp: self.backup.stamp.clone(),
-                    }
-                },
-            );
+            // of them changed. Only an iPod still equal to the backup gets
+            // its `Play Counts` back, and only then is the pull undone;
+            // otherwise the pull stands.
+            if !self.written && untouched(self.backup, self.mountpoint) {
+                if !moved || std::fs::rename(&counts_bak, &counts).is_ok() {
+                    return Err(self.undo(e.into()));
+                }
+                // Nothing changed, but its plays are counted and the iPod
+                // no longer offers them: the pull stands.
+                return Err(Error::WriteRefusedCountsKept(e.to_string()));
+            }
+            return Err(Error::WriteIncomplete {
+                cause: e.to_string(),
+                stamp: self.backup.stamp.clone(),
+            });
         }
         if !self.written {
             self.written = true;
@@ -693,6 +711,11 @@ pub fn sync(
             ),
             ("snapshot.txt", before_text.as_bytes()),
             ("mappings.json", &mappings),
+            // The statistics as they were, should a later export lose them.
+            (
+                "stats.csv",
+                &std::fs::read(paths.data_dir.join("stats.csv")).unwrap_or_default(),
+            ),
         ],
     )
     .map_err(undo_now)?;
@@ -1250,6 +1273,9 @@ pub fn restore(
         &verify::without_artwork(&snapshot(&reread)?),
         20,
     );
+    // The ratings the restored database holds, recorded as seen, so the
+    // next pull takes none of them as a change made on the iPod.
+    let ratings: Vec<(u64, u32)> = reread.tracks().map(|t| (t.dbid(), t.rating())).collect();
     drop(reread);
     if !diffs.is_empty() {
         return Err(Error::RestoreVerification {
@@ -1268,6 +1294,9 @@ pub fn restore(
             });
         }
         devices::replace_mappings(conn, device, &tracks, &all)?;
+        for (dbid, rating) in &ratings {
+            devices::set_synced_rating(conn, device, *dbid, Some(*rating))?;
+        }
         devices::set_restoring(conn, device, None)
     })?;
     Ok(Restored {

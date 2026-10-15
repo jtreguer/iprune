@@ -121,6 +121,38 @@ pub fn set_restoring(conn: &Connection, device_id: i64, stamp: Option<&str>) -> 
     Ok(())
 }
 
+/// The rating each mapped iPod track held at the last statistics pull, by
+/// dbid; tracks not known yet are left out.
+pub fn synced_ratings(
+    conn: &Connection,
+    device_id: i64,
+) -> Result<std::collections::HashMap<u64, u32>> {
+    let mut stmt = conn.prepare(
+        "SELECT dbid, synced_rating FROM device_tracks WHERE device_id = ?1 AND synced_rating IS NOT NULL",
+    )?;
+    let rows = stmt
+        .query_map([device_id], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, u32>(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// Records `rating` (or with `None`, forgets it) as what the iPod track
+/// `dbid` held at the last statistics pull.
+pub fn set_synced_rating(
+    conn: &Connection,
+    device_id: i64,
+    dbid: u64,
+    rating: Option<u32>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE device_tracks SET synced_rating = ?3 WHERE device_id = ?1 AND dbid = ?2",
+        params![device_id, dbid as i64, rating],
+    )?;
+    Ok(())
+}
+
 /// Replaces every mapping of `device_id` with the given ones.
 pub fn replace_mappings(
     conn: &Connection,
@@ -216,6 +248,7 @@ pub fn apply_track_changes(
     let mut stmt = conn.prepare(
         "INSERT INTO device_tracks (device_id, track_id, dbid, synced_tags_hash, synced_size, synced_duration_ms) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(device_id, track_id) DO UPDATE SET \
+         synced_rating = CASE WHEN dbid = excluded.dbid THEN synced_rating END, \
          dbid = excluded.dbid, synced_tags_hash = excluded.synced_tags_hash, \
          synced_size = excluded.synced_size, synced_duration_ms = excluded.synced_duration_ms",
     )?;

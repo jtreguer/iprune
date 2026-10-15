@@ -15,6 +15,8 @@ pub struct Track {
     /// Plays and skips since the last database write, from `Play Counts`.
     pub recent_plays: u32,
     pub recent_skips: u32,
+    /// Skips over the track's life, the recent ones included.
+    pub skips: u32,
     /// 0 to 100, in steps of 20 per star; 0 when unrated.
     pub rating: u32,
     /// Unix time of the last play, 0 when never played.
@@ -120,6 +122,7 @@ pub fn read(db: &gpod::Database) -> Contents {
                 ipod_path: t.ipod_path().map(|p| p.into_owned()),
                 recent_plays: t.recent_playcount(),
                 recent_skips: t.recent_skipcount(),
+                skips: t.skipcount(),
                 rating: t.rating(),
                 last_played: t.time_played(),
             }

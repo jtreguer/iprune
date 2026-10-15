@@ -215,7 +215,22 @@ pub fn save(conn: &Connection, r: &Run, guid: &str, force: bool) -> Result<()> {
                 ipod_name: m.ipod_name.clone(),
             })
             .collect();
-        devices::replace_mappings(conn, device, &tracks, &playlists)
+        devices::replace_mappings(conn, device, &tracks, &playlists)?;
+        // A track with a stored rating (a forced re-adoption, a second
+        // iPod) keeps it: the iPod's is recorded as seen, so only a later
+        // change on the iPod is taken. One without takes the iPod's at its
+        // first pull.
+        for m in &tracks {
+            let rated: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM stats WHERE track_id = ?1 AND rating IS NOT NULL)",
+                [m.track_id],
+                |r| r.get(0),
+            )?;
+            if rated {
+                devices::set_synced_rating(conn, device, m.dbid, Some(by_dbid[&m.dbid].rating))?;
+            }
+        }
+        Ok(())
     })
 }
 

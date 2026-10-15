@@ -66,6 +66,7 @@ fn ipod_track(dbid: u64) -> Track {
         ipod_path: Some(":iPod_Control:Music:F00:A.mp3".into()),
         recent_plays: 0,
         recent_skips: 0,
+        skips: 0,
         rating: 0,
         last_played: 0,
     }

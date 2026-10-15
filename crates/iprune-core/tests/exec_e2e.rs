@@ -942,6 +942,49 @@ impl Drop for ReadOnly {
     }
 }
 
+/// Syncs with the iTunes folder made read-only as the database write starts.
+/// By then iprune has moved `Play Counts` aside, so the write is the part
+/// that fails, as when an iPod is unplugged or goes read-only mid-sync.
+/// `None` when permissions do not block writes (running as root).
+#[cfg(unix)]
+fn sync_refused_at_the_write(w: &World) -> Option<iprune_core::Result<Outcome>> {
+    use std::cell::RefCell;
+    use std::sync::atomic::AtomicBool;
+    let itunes = w.root.join("iPod_Control/iTunes");
+    let guard: RefCell<Option<ReadOnly>> = RefCell::new(None);
+    let blocked = RefCell::new(true);
+    let prepared = w.prepare();
+    let work = exec::FullWork {
+        playlists: exec::playlist_work(&prepared.plan, &prepared.tracks_map, &prepared.ipod),
+        ..exec::FullWork::default()
+    };
+    let res = exec::sync(
+        w.env.store.conn(),
+        &w.env.cfg,
+        &w.paths,
+        &iprune_core::lock::ipod(&w.paths).unwrap(),
+        &w.root,
+        w.open(),
+        &prepared,
+        &work,
+        Options::default(),
+        &|p| {
+            if matches!(p, exec::Progress::Writing) {
+                match ReadOnly::new(&itunes) {
+                    Some(g) => *guard.borrow_mut() = Some(g),
+                    None => *blocked.borrow_mut() = false,
+                }
+            }
+        },
+        &AtomicBool::new(false),
+    );
+    drop(guard);
+    blocked.into_inner().then_some(res)
+}
+
+// With the iTunes folder read-only from the start, iprune cannot move `Play
+// Counts` aside, which it does before the write: the sync stops there with
+// the Io error, before libgpod is called, and undoes the pull.
 #[test]
 #[cfg(unix)]
 fn a_write_the_ipod_refuses_leaves_it_unchanged_and_undoes_the_stats() {
@@ -957,20 +1000,60 @@ fn a_write_the_ipod_refuses_leaves_it_unchanged_and_undoes_the_stats() {
     let res = w.sync();
     drop(guard);
     let e = res.unwrap_err();
-    assert!(
-        matches!(e, Error::Gpod(gpod::Error::Write(_))),
-        "an untouched iPod gives the plain write error: {e}"
-    );
+    match &e {
+        Error::Io { path, .. } => assert!(path.ends_with("iTunes/Play Counts"), "{e}"),
+        other => panic!("expected the Io error of the rename, got {other}"),
+    }
     assert_eq!(w.ipod_tree(), tree_before);
     assert!(w.stats_rows().is_empty(), "stats undone");
     assert_eq!(w.pending_pulls(), 0);
     assert_eq!(w.ipod_playlist("Road").unwrap().1, vec![D1, D2]);
 }
 
+// The folder turns read-only after `Play Counts` was moved aside, so libgpod
+// fails and the file cannot be put back, though the iPod is otherwise
+// unchanged. The pull must then stand: undoing it would lose the plays, as
+// the next pull finds no `Play Counts`. Reported as incomplete.
+#[test]
+#[cfg(unix)]
+fn a_refused_write_that_cannot_give_play_counts_back_keeps_the_pull_and_says_so() {
+    let w = world_with_old();
+    w.write_play_counts(&[(3, 1_700_000_000, 80, 1), (0, 0, 0, 0), (0, 0, 0, 0)]);
+    w.write_list("Road", &[D2]);
+    w.reload();
+    let mut expected = w.ipod_tree();
+    let counts = expected
+        .remove(&PathBuf::from("iPod_Control/iTunes/Play Counts"))
+        .unwrap();
+    expected.insert(PathBuf::from("iPod_Control/iTunes/Play Counts.bak"), counts);
+    let Some(res) = sync_refused_at_the_write(&w) else {
+        eprintln!("running as root: permissions do not block writes, test skipped");
+        return;
+    };
+    let e = res.unwrap_err();
+    assert!(
+        matches!(e, Error::WriteRefusedCountsKept(_)),
+        "not the plain write error nor an incomplete write: {e}"
+    );
+    assert_eq!(
+        w.ipod_tree(),
+        expected,
+        "nothing changed but the name of Play Counts"
+    );
+    assert_eq!(w.pending_pulls(), 1);
+    assert_eq!(w.stats_rows().iter().map(|r| r.1).sum::<i64>(), 3);
+    // The next sync counts them once.
+    let out = w.sync().unwrap();
+    assert_eq!((out.recovered, out.pulled.plays()), (0, 0));
+    assert_eq!(w.stats_rows().iter().map(|r| r.1).sum::<i64>(), 3);
+    assert_eq!(w.ipod_playlist("Road").unwrap().1, vec![D2]);
+}
+
 /// A sync whose write fails part way, for real: libgpod writes ArtworkDB
 /// before iTunesDB, so with artwork enabled and a read-only iTunes folder
-/// the ArtworkDB is rewritten and the iTunesDB is not. Returns `None` when
-/// permissions do not block writes (running as root).
+/// the ArtworkDB is rewritten and the iTunesDB is not. The folder is locked
+/// as the write starts, after iprune moved `Play Counts` aside. Returns
+/// `None` when permissions do not block writes (running as root).
 #[cfg(unix)]
 fn half_written() -> Option<(World, Error, BTreeMap<PathBuf, Vec<u8>>)> {
     let w = world_with_old();
@@ -979,9 +1062,7 @@ fn half_written() -> Option<(World, Error, BTreeMap<PathBuf, Vec<u8>>)> {
     w.write_list("Road", &[D2]);
     w.reload();
     let before = w.ipod_tree();
-    let guard = ReadOnly::new(&w.root.join("iPod_Control/iTunes"))?;
-    let res = w.sync();
-    drop(guard);
+    let res = sync_refused_at_the_write(&w)?;
     Some((w, res.unwrap_err(), before))
 }
 
@@ -1002,20 +1083,24 @@ fn a_write_that_fails_part_way_is_reported_as_incomplete_and_leaves_the_pull_pen
         other => panic!("{other}"),
     }
     assert!(e.is_check_failure(), "exit code 3");
-    // The iPod really is half written: ArtworkDB changed, iTunesDB and
-    // Play Counts did not.
+    // The iPod really is half written: ArtworkDB changed, iTunesDB did not,
+    // and Play Counts, which iprune moved aside before the write, is the
+    // same file under its new name.
     let after = w.ipod_tree();
     let key = |p: &str| PathBuf::from(p);
     assert_ne!(
         after.get(&key("iPod_Control/Artwork/ArtworkDB")),
         before.get(&key("iPod_Control/Artwork/ArtworkDB"))
     );
-    for same in [
-        "iPod_Control/iTunes/iTunesDB",
-        "iPod_Control/iTunes/Play Counts",
-    ] {
-        assert_eq!(after.get(&key(same)), before.get(&key(same)), "{same}");
-    }
+    assert_eq!(
+        after.get(&key("iPod_Control/iTunes/iTunesDB")),
+        before.get(&key("iPod_Control/iTunes/iTunesDB"))
+    );
+    assert_eq!(after.get(&key("iPod_Control/iTunes/Play Counts")), None);
+    assert_eq!(
+        after.get(&key("iPod_Control/iTunes/Play Counts.bak")),
+        before.get(&key("iPod_Control/iTunes/Play Counts"))
+    );
     // The pull is neither undone nor settled: the next sync decides.
     assert_eq!(w.pending_pulls(), 1);
     assert_eq!(w.stats_rows().iter().map(|r| r.1).sum::<i64>(), 3);
@@ -1034,13 +1119,14 @@ fn after_an_incomplete_write_the_next_sync_counts_every_play_once() {
         return;
     };
     let out = w.sync().unwrap();
-    // Play Counts is still there, so the write never happened: undone, and
-    // pulled again from the same file.
-    assert_eq!(out.recovered, 1);
-    assert_eq!(out.pulled.plays(), 3);
+    // iprune moved Play Counts aside before the failed write, and the `.bak`
+    // is the file the pull came from: the pull stands, and with no live
+    // Play Counts there is nothing to pull again.
+    assert_eq!(out.recovered, 0);
+    assert_eq!(out.pulled.plays(), 0);
     assert_eq!(w.stats_rows().iter().map(|r| r.1).sum::<i64>(), 3);
     assert_eq!(w.pending_pulls(), 0);
-    assert!(!w.play_counts().exists(), "this time libgpod renamed it");
+    assert!(!w.play_counts().exists());
     assert_eq!(w.ipod_playlist("Road").unwrap().1, vec![D2]);
 }
 
@@ -1052,15 +1138,16 @@ fn plays_added_after_an_incomplete_write_are_counted_once_not_twice() {
     let Some((w, _, _)) = half_written() else {
         return;
     };
-    // 3 plays were pulled and are pending; the iPod now says 5 in total.
-    w.write_play_counts(&[(5, 1_700_000_500, 80, 1), (0, 0, 0, 0), (0, 0, 0, 0)]);
+    // 3 plays were pulled and are pending, and their file was moved aside,
+    // so the iPod starts a new Play Counts: it holds the 2 plays since.
+    w.write_play_counts(&[(2, 1_700_000_500, 80, 0), (0, 0, 0, 0), (0, 0, 0, 0)]);
     let out = w.sync().unwrap();
-    assert_eq!(out.recovered, 1, "the earlier pull is undone");
-    assert_eq!(out.pulled.plays(), 5);
+    assert_eq!(out.recovered, 0, "the earlier pull stands");
+    assert_eq!(out.pulled.plays(), 2);
     assert_eq!(
         w.stats_rows().iter().map(|r| r.1).sum::<i64>(),
         5,
-        "not 3 + 5"
+        "3 + 2, each play once"
     );
     assert_eq!(w.pending_pulls(), 0);
 }
@@ -1817,4 +1904,174 @@ fn a_restore_whose_result_cannot_be_read_back_says_so_and_stays_marked() {
     assert!(w.backups().iter().any(|b| b.stamp == *saved));
     assert_eq!(restoring(&w).as_deref(), Some(&stamp[..]));
     // (A sync is refused for the mark, see the test of a stopped restore.)
+}
+
+// ---- statistics around a sync: ratings, stats.csv
+
+/// The only statistics row.
+fn only_stats_row(w: &World) -> StatsRow {
+    let rows = w.stats_rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    rows[0]
+}
+
+/// The `stats-<stamp>.csv` copies next to stats.csv.
+fn kept_stats_csvs(w: &World) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = fs::read_dir(&w.paths.data_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            let n = p.file_name().unwrap().to_string_lossy().into_owned();
+            n.starts_with("stats-") && n.ends_with(".csv")
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+// Prevents (audit H4) restoring an older database, whose track shows an older
+// rating, lowering the rating the user gave since.
+#[test]
+fn restoring_an_older_backup_does_not_lower_a_rating_given_since() {
+    let w = world_with_old();
+    // Rated 2 stars (40), synced.
+    w.write_play_counts(&[(1, 1_700_000_000, 40, 0), (0, 0, 0, 0), (0, 0, 0, 0)]);
+    w.write_list("Road", &[D2]);
+    w.reload();
+    w.sync().unwrap();
+    assert_eq!(only_stats_row(&w).3, Some(40), "set up");
+    // Rated 4 stars (80) and synced again: this backup holds the 40.
+    w.write_play_counts(&[(1, 1_700_000_100, 80, 0), (0, 0, 0, 0), (0, 0, 0, 0)]);
+    w.write_list("Road", &[D1]);
+    w.reload();
+    let second = w.sync().unwrap();
+    assert_eq!(only_stats_row(&w).3, Some(80), "set up");
+
+    restore(&w, &second.backup.stamp).unwrap();
+    let on_ipod = w.contents().tracks.iter().map(|t| t.rating).max();
+    assert_eq!(
+        on_ipod,
+        Some(40),
+        "set up: the restored database says 2 stars"
+    );
+
+    // The next sync reads the restored 2 stars as no news.
+    w.write_list("Road", &[D2]);
+    w.reload();
+    w.sync().unwrap();
+    assert_eq!(only_stats_row(&w).3, Some(80), "the later rating stands");
+
+    // A rating given on the iPod after the restore does count.
+    w.write_play_counts(&[(1, 1_700_000_200, 100, 0), (0, 0, 0, 0), (0, 0, 0, 0)]);
+    w.write_list("Road", &[D1]);
+    w.reload();
+    w.sync().unwrap();
+    assert_eq!(only_stats_row(&w).3, Some(100));
+}
+
+// Prevents (audit M4) the sync after an index loss replacing the fuller
+// stats.csv, the only other copy, with the rebuilt index's smaller one.
+#[test]
+fn a_sync_after_an_index_loss_keeps_the_fuller_stats_csv_beside_the_new_one() {
+    let w = world_with_old();
+    w.write_play_counts(&[
+        (3, 1_700_000_000, 80, 1),
+        (0, 0, 0, 0),
+        (2, 1_600_000_000, 0, 0),
+    ]);
+    w.write_list("Road", &[D2]);
+    w.reload();
+    w.sync().unwrap();
+    let csv_path = w.paths.data_dir.join("stats.csv");
+    let first = fs::read_to_string(&csv_path).unwrap();
+    assert!(first.contains(",3,1,80,"), "{first}");
+    assert!(kept_stats_csvs(&w).is_empty(), "set up: nothing kept yet");
+
+    // History only the index holds (what the iPod has since lost), exported
+    // by an ordinary sync: the file grows, so nothing is kept.
+    w.env
+        .store
+        .conn()
+        .execute("UPDATE stats SET plays = plays + 40", [])
+        .unwrap();
+    w.write_list("Road", &[D1]);
+    w.reload();
+    w.sync().unwrap();
+    let fuller = fs::read_to_string(&csv_path).unwrap();
+    assert!(fuller.contains(",43,1,80,"), "{fuller}");
+    assert!(
+        kept_stats_csvs(&w).is_empty(),
+        "a growing export keeps no copy"
+    );
+
+    // The index is lost; the next sync rebuilds it from the iPod alone. The
+    // ratings it had recorded as seen on the iPod go with it.
+    w.env.store.conn().execute("DELETE FROM stats", []).unwrap();
+    w.env
+        .store
+        .conn()
+        .execute("UPDATE device_tracks SET synced_rating = NULL", [])
+        .unwrap();
+    w.write_list("Road", &[D2]);
+    w.reload();
+    w.sync().unwrap();
+    let rebuilt = fs::read_to_string(&csv_path).unwrap();
+    assert!(rebuilt.contains(",3,1,80,"), "{rebuilt}");
+    assert!(!rebuilt.contains(",43,"), "{rebuilt}");
+    let kept = kept_stats_csvs(&w);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(fs::read_to_string(&kept[0]).unwrap(), fuller);
+}
+
+#[test]
+fn a_sync_that_adds_plays_replaces_stats_csv_and_keeps_no_copy() {
+    let w = world_with_old();
+    w.write_play_counts(&[(3, 1_700_000_000, 80, 1), (0, 0, 0, 0), (0, 0, 0, 0)]);
+    w.write_list("Road", &[D2]);
+    w.reload();
+    w.sync().unwrap();
+    w.write_play_counts(&[(2, 1_700_000_500, 80, 0), (0, 0, 0, 0), (0, 0, 0, 0)]);
+    w.write_list("Road", &[D1]);
+    w.reload();
+    w.sync().unwrap();
+    let csv = fs::read_to_string(w.paths.data_dir.join("stats.csv")).unwrap();
+    assert!(csv.contains(",5,1,80,"), "{csv}");
+    assert!(kept_stats_csvs(&w).is_empty(), "{:?}", kept_stats_csvs(&w));
+}
+
+// Prevents (audit M4) a bad export leaving no older generation: each backup
+// keeps the stats.csv as it was before its sync.
+#[test]
+fn each_backup_holds_the_stats_csv_from_before_its_sync() {
+    let w = world_with_old();
+    w.write_play_counts(&[(3, 1_700_000_000, 80, 1), (0, 0, 0, 0), (0, 0, 0, 0)]);
+    w.write_list("Road", &[D2]);
+    w.reload();
+    let first = w.sync().unwrap();
+    let csv_path = w.paths.data_dir.join("stats.csv");
+    let after_first = fs::read(&csv_path).unwrap();
+    assert!(
+        first.backup.dir.join("stats.csv").is_file(),
+        "even the first backup has the file"
+    );
+
+    w.write_play_counts(&[(2, 1_700_000_500, 80, 0), (0, 0, 0, 0), (0, 0, 0, 0)]);
+    w.write_list("Road", &[D1]);
+    w.reload();
+    let second = w.sync().unwrap();
+    let after_second = fs::read(&csv_path).unwrap();
+    assert_ne!(after_first, after_second, "set up: the sync changed it");
+    assert_eq!(
+        fs::read(second.backup.dir.join("stats.csv")).unwrap(),
+        after_first,
+        "the copy is the file from before this sync, not after"
+    );
+    // The first sync's backup is still the older state, and restoring a
+    // backup does not touch stats.csv.
+    assert_ne!(
+        fs::read(first.backup.dir.join("stats.csv")).unwrap(),
+        after_first
+    );
+    restore(&w, &first.backup.stamp).unwrap();
+    assert_eq!(fs::read(&csv_path).unwrap(), after_second);
 }

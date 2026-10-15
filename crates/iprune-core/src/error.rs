@@ -145,6 +145,10 @@ pub enum Error {
         "the iPod's database is signed, but libgpod would write it unsigned ({0}), and the iPod would then show no music; nothing was written"
     )]
     WouldNotSign(String),
+    #[error(
+        "writing the iPod database failed ({0}) and nothing on the iPod changed, but its Play Counts file could not be put back from Play Counts.bak; its plays are already counted, so leave it as it is"
+    )]
+    WriteRefusedCountsKept(String),
     #[error("the index cannot be upgraded: {0}")]
     Migration(String),
     #[error(

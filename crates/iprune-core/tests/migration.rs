@@ -123,16 +123,22 @@ fn a_version_4_index_keeps_every_row_and_id_and_gets_an_id_that_is_never_reused(
     let store = Store::open(&path).unwrap();
     let conn = store.conn();
 
-    // Rows and ids are kept, field for field. (`devices` gained a column.)
+    // Rows and ids are kept, field for field. (`devices` and `device_tracks`
+    // gained a column, unknown for the rows that were there.)
     let mut after = dump_all(conn);
     for row in after.get_mut("devices").unwrap() {
         assert_eq!(row.remove("restoring").as_deref(), Some("Null"));
+    }
+    let mapped = after.get_mut("device_tracks").unwrap();
+    assert_eq!(mapped.len(), 2, "set up");
+    for row in mapped {
+        assert_eq!(row.remove("synced_rating").as_deref(), Some("Null"));
     }
     assert_eq!(after, before);
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 
     // The next id starts above the highest one used, also after that
     // highest row is deleted.

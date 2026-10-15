@@ -18,6 +18,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0003_playlist_tombstones.sql"),
     include_str!("migrations/0004_pending_pulls.sql"),
     include_str!("migrations/0005_stable_ids.sql"),
+    include_str!("migrations/0006_synced_rating.sql"),
 ];
 
 /// First line of a migration that rebuilds tables: it runs with foreign

@@ -50,6 +50,12 @@ impl World {
     /// smart "Top" [1] and Podcasts. Track 1 has the album "Kept Album" on the
     /// iPod and none in the library. Adopted.
     pub fn new(n: usize) -> World {
+        World::new_with_plays(n, &[])
+    }
+
+    /// As `new`, with these `playcount`s in the iPod's iTunesDB for the first
+    /// tracks, as built up under iTunes before adoption.
+    pub fn new_with_plays(n: usize, plays: &[u32]) -> World {
         assert!((2..=40).contains(&n));
         let mut env = Env::new();
         let files: Vec<PathBuf> = (1..=n)
@@ -70,7 +76,7 @@ impl World {
                     title: Box::leak(format!("Title{}", k + 1).into_boxed_str()),
                     artist: Box::leak(format!("Artist{}", k + 1).into_boxed_str()),
                     album: if k == 0 { "Kept Album" } else { "" },
-                    plays: 0,
+                    plays: plays.get(k).copied().unwrap_or(0),
                 }
             })
             .collect();
@@ -2957,6 +2963,13 @@ mod artwork_tests {
     /// Removes the first managed track (its cover is first in the .ithmb
     /// files) from the library and syncs with removals allowed.
     fn sync_removing_the_first_track(w: &mut World) -> iprune_core::Result<Outcome> {
+        sync_removing_the_first_track_with(w, &|_| {})
+    }
+
+    fn sync_removing_the_first_track_with(
+        w: &mut World,
+        progress: &dyn Fn(Progress),
+    ) -> iprune_core::Result<Outcome> {
         fs::remove_file(&w.files[0]).unwrap();
         w.rescan();
         let p = w.prepare();
@@ -2967,7 +2980,7 @@ mod artwork_tests {
             Options {
                 allow_mass_removal: true,
             },
-            &|_| {},
+            progress,
             &AtomicBool::new(false),
         )
     }
@@ -3112,37 +3125,51 @@ mod artwork_tests {
             (0, 0, 0, 0),
             (0, 0, 0, 0),
         ]);
+        let counts_path = w.root.join("iPod_Control/iTunes/Play Counts");
+        let counts = fs::read(&counts_path).unwrap();
         // libgpod rewrites the .ithmb files first, then ArtworkDB, then
         // iTunesDB. ArtworkDB can be neither written in place (read-only
         // file) nor replaced (read-only folder) and libgpod does not fail for
         // that; the iTunes folder is read-only too, which makes the write
         // fail. Only the .ithmb files (rewritten in place) change.
-        let target = w.root.join("iPod_Control/Artwork/ArtworkDB");
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+        //
+        // The folders are locked as the write starts, not before: iprune
+        // moves `Play Counts` aside first, in the iTunes folder, and a sync
+        // that cannot do that never reaches libgpod.
         struct Restore(PathBuf, u32);
         impl Drop for Restore {
             fn drop(&mut self) {
                 let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
             }
         }
-        let _guard = Restore(target.clone(), 0o644);
+        let target = w.root.join("iPod_Control/Artwork/ArtworkDB");
         let itunes = w.root.join("iPod_Control/iTunes");
-        fs::set_permissions(&itunes, fs::Permissions::from_mode(0o555)).unwrap();
-        let _guard2 = Restore(itunes.clone(), 0o755);
         let art_dir = w.root.join("iPod_Control/Artwork");
-        fs::set_permissions(&art_dir, fs::Permissions::from_mode(0o555)).unwrap();
-        let _guard3 = Restore(art_dir, 0o755);
-        if fs::OpenOptions::new().append(true).open(&target).is_ok()
-            || fs::File::create(itunes.join(".probe")).is_ok()
-        {
-            let _ = fs::remove_file(itunes.join(".probe"));
+        let guards: RefCell<Vec<Restore>> = RefCell::new(Vec::new());
+        let blocked = RefCell::new(true);
+        let lock = |progress: Progress| {
+            if !matches!(progress, Progress::Writing) {
+                return;
+            }
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+            guards.borrow_mut().push(Restore(target.clone(), 0o644));
+            fs::set_permissions(&itunes, fs::Permissions::from_mode(0o555)).unwrap();
+            guards.borrow_mut().push(Restore(itunes.clone(), 0o755));
+            fs::set_permissions(&art_dir, fs::Permissions::from_mode(0o555)).unwrap();
+            guards.borrow_mut().push(Restore(art_dir.clone(), 0o755));
+            if fs::OpenOptions::new().append(true).open(&target).is_ok()
+                || fs::File::create(itunes.join(".probe")).is_ok()
+            {
+                let _ = fs::remove_file(itunes.join(".probe"));
+                *blocked.borrow_mut() = false;
+            }
+        };
+        let res = sync_removing_the_first_track_with(&mut w, &lock);
+        guards.borrow_mut().clear();
+        if !*blocked.borrow() {
             eprintln!("running as root: permissions do not block writes, test skipped");
             return;
         }
-        let res = sync_removing_the_first_track(&mut w);
-        drop(_guard3);
-        drop(_guard2);
-        drop(_guard);
 
         // Set up: ArtworkDB and iTunesDB did not change, the .ithmb files did.
         assert_eq!(
@@ -3161,8 +3188,15 @@ mod artwork_tests {
             Error::WriteIncomplete { stamp: s, .. } => assert_eq!(*s, stamp),
             other => panic!("expected WriteIncomplete, got {other}"),
         }
-        // The pull is left pending, not undone as for an untouched iPod.
+        // The pull is left pending, not undone as for an untouched iPod, and
+        // `Play Counts` stays where iprune moved it, so its plays are not
+        // pulled a second time.
         assert_eq!(w.pending_pulls(), 1);
+        assert!(!counts_path.exists());
+        assert_eq!(
+            fs::read(counts_path.with_file_name("Play Counts.bak")).unwrap(),
+            counts
+        );
     }
 
     // Prevents (audit H3) a sync reporting success when libgpod rearranged the
@@ -4239,4 +4273,338 @@ mod step3 {
         };
         assert_eq!(hashes(&second), hashes(&first), "the same covers");
     }
+}
+
+// ---- statistics: lifetime counts, ratings (audit M5, H4)
+
+fn full_stats_of(w: &World, file: &Path) -> Option<(i64, i64, Option<i64>, Option<i64>)> {
+    w.env
+        .store
+        .conn()
+        .query_row(
+            "SELECT plays, skips, rating, last_played FROM stats WHERE track_id = ?1",
+            [w.id_of(file)],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .ok()
+}
+
+// Prevents (audit M5) the plays made under iTunes before adoption being left
+// out of iprune's totals. libgpod folds the recent counts into the lifetime
+// ones it reads: 8 in the iTunesDB and 2 in Play Counts read as 10.
+#[test]
+fn an_adopted_ipods_lifetime_plays_are_imported_once_and_later_pulls_add_the_new_ones() {
+    let mut w = World::new_with_plays(3, &[8]);
+    w.write_play_counts(&[
+        (2, 1_700_000_000, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+    ]);
+    let t = w.track(dbid(1)).unwrap();
+    assert_eq!((t.adopt.playcount, t.recent_plays), (10, 2), "set up");
+    let file = w.files[0].clone();
+    assert_eq!(full_stats_of(&w, &file), None, "set up: no row yet");
+
+    w.add_new("n1.mp3", Kind::Mp3, 11);
+    w.sync().unwrap();
+    let (plays, ..) = full_stats_of(&w, &file).expect("a row");
+    assert_eq!(plays, 10, "the lifetime count, not 12 and not 2");
+    assert_eq!(w.track(dbid(1)).unwrap().adopt.playcount, 10, "set up");
+    let csv = fs::read_to_string(w.paths.data_dir.join("stats.csv")).unwrap();
+    let line = csv
+        .lines()
+        .find(|l| l.contains("s1.mp3"))
+        .unwrap_or_else(|| panic!("s1.mp3 is listed: {csv}"));
+    assert!(line.contains(",10,0,"), "{line}");
+
+    // Three more plays; the iPod starts a new Play Counts after the write.
+    w.write_play_counts(&[
+        (3, 1_700_001_000, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+    ]);
+    w.add_new("n2.mp3", Kind::Mp3, 12);
+    w.sync().unwrap();
+    assert_eq!(full_stats_of(&w, &file).unwrap().0, 13);
+    assert_eq!(w.track(dbid(1)).unwrap().adopt.playcount, 13, "set up");
+}
+
+// The reason for the import: the iPod track goes, its history must not.
+#[test]
+fn lifetime_plays_survive_the_removal_of_the_ipod_track() {
+    let mut w = World::new_with_plays(3, &[150]);
+    w.write_play_counts(&[
+        (3, 1_700_000_000, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+    ]);
+    let file = w.files[0].clone();
+    w.add_new("n1.mp3", Kind::Mp3, 11);
+    w.sync().unwrap();
+    assert_eq!(full_stats_of(&w, &file).unwrap().0, 153, "set up");
+
+    // The library file goes away; the next sync removes the iPod track.
+    fs::remove_file(&file).unwrap();
+    w.rescan();
+    w.sync().unwrap();
+    assert!(w.track(dbid(1)).is_none(), "set up: removed from the iPod");
+    assert_eq!(w.stats_total_plays(), 153);
+    let csv = fs::read_to_string(w.paths.data_dir.join("stats.csv")).unwrap();
+    assert!(csv.contains("s1.mp3,153,"), "{csv}");
+}
+
+// A track that already has a row (counted from an earlier pull) is not
+// started over from the lifetime count.
+#[test]
+fn a_track_with_a_row_gets_its_total_plus_the_recent_plays_only() {
+    let mut w = World::new_with_plays(3, &[8]);
+    w.write_play_counts(&[
+        (2, 1_700_000_000, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+    ]);
+    let file = w.files[0].clone();
+    let id = w.id_of(&file);
+    w.env
+        .store
+        .conn()
+        .execute(
+            "INSERT INTO stats (track_id, plays, skips) VALUES (?1, 5, 0)",
+            [id],
+        )
+        .unwrap();
+    w.add_new("n1.mp3", Kind::Mp3, 11);
+    w.sync().unwrap();
+    assert_eq!(full_stats_of(&w, &file).unwrap().0, 7, "5 + 2, not 10");
+}
+
+// Prevents (audit H4) a track copied again to the iPod, which starts with no
+// rating, wiping the rating pulled earlier.
+#[test]
+fn a_recopied_track_keeps_the_rating_pulled_earlier() {
+    let mut w = World::new(3);
+    let s1 = w.files[0].clone();
+    let id = w.id_of(&s1);
+    let rating = |w: &World| full_stats_of(w, &s1).and_then(|r| r.2);
+
+    // Sync 1: the user rated track 1 on the iPod (80 = 4 stars).
+    w.write_play_counts(&[
+        (2, 1_700_000_000, 80, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+    ]);
+    w.add_new("n1.mp3", Kind::Mp3, 11);
+    w.sync().unwrap();
+    assert_eq!(rating(&w), Some(80), "set up: rating pulled");
+    let first_dbid = w.mapping()[&id];
+
+    // Sync 2: the library file is briefly missing: the iPod track goes.
+    let bytes = fs::read(&s1).unwrap();
+    fs::remove_file(&s1).unwrap();
+    w.rescan();
+    assert_eq!(w.sync().unwrap().removed, 1, "set up");
+    assert_eq!(rating(&w), Some(80), "still in the index");
+
+    // Sync 3: the file is back and is copied again, unrated.
+    fs::write(&s1, &bytes).unwrap();
+    w.rescan();
+    assert_eq!(w.sync().unwrap().copied, 1, "set up");
+    let new_dbid = w.mapping()[&id];
+    assert_ne!(new_dbid, first_dbid, "set up: a new iPod track");
+    assert_eq!(w.track(new_dbid).unwrap().rating, 0, "set up: unrated");
+
+    // Sync 4: a later sync pulls statistics again.
+    w.add_new("n2.mp3", Kind::Mp3, 12);
+    w.sync().unwrap();
+    assert_eq!(rating(&w), Some(80), "the rating survives the re-copy");
+}
+
+// ---- Play Counts is moved aside before libgpod writes (audit M3)
+
+/// The state a sync is in when the database write starts.
+#[derive(Debug)]
+struct AtWrite {
+    live_counts: bool,
+    counts_bak: Option<Vec<u8>>,
+    itunesdb: Vec<u8>,
+}
+
+fn counts_files(root: &Path) -> (bool, Option<Vec<u8>>) {
+    let dir = root.join("iPod_Control/iTunes");
+    (
+        dir.join("Play Counts").exists(),
+        fs::read(dir.join("Play Counts.bak")).ok(),
+    )
+}
+
+/// A world with 4 tracks, plays on tracks 1 and 3, and track 1 gone from the
+/// library, so the sync removes it and every later track moves up.
+fn removal_world() -> (World, Vec<i64>) {
+    let mut w = World::new(4);
+    let ids: Vec<i64> = w.files.iter().map(|f| w.id_of(f)).collect();
+    w.write_play_counts(&[
+        (5, 1_700_000_000, 0, 0),
+        (0, 0, 0, 0),
+        (7, 1_700_000_100, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+    ]);
+    fs::remove_file(&w.files[0]).unwrap();
+    w.rescan();
+    (w, ids)
+}
+
+fn plays_by_track(w: &World) -> BTreeMap<i64, i64> {
+    let conn = w.env.store.conn();
+    let mut st = conn.prepare("SELECT track_id, plays FROM stats").unwrap();
+    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+// Prevents (audit M3) a crash between libgpod replacing iTunesDB and
+// renaming Play Counts leaving counts indexed by the old track order next to
+// the new database. iprune renames the file itself, before libgpod writes.
+#[test]
+fn play_counts_is_moved_aside_before_the_database_is_written_and_stays_aside() {
+    let (w, ids) = removal_world();
+    let counts_before = fs::read(w.root.join("iPod_Control/iTunes/Play Counts")).unwrap();
+    let itunesdb_before = fs::read(w.root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+    let seen: RefCell<Vec<AtWrite>> = RefCell::new(Vec::new());
+    let p = w.prepare();
+    let work = exec::full_work(&p);
+    let out = w
+        .run(
+            &p,
+            &work,
+            Options::default(),
+            &|e| {
+                if matches!(e, Progress::Writing) {
+                    let (live_counts, counts_bak) = counts_files(&w.root);
+                    seen.borrow_mut().push(AtWrite {
+                        live_counts,
+                        counts_bak,
+                        itunesdb: fs::read(w.root.join("iPod_Control/iTunes/iTunesDB")).unwrap(),
+                    });
+                }
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(out.removed, 1, "set up");
+    let seen = seen.into_inner();
+    assert!(!seen.is_empty(), "set up: the write was announced");
+    // Whenever a write starts, no live Play Counts sits next to the old or the
+    // new iTunesDB, and the first write starts from the old iTunesDB.
+    for at in &seen {
+        assert!(!at.live_counts, "{at:?}");
+    }
+    assert_eq!(
+        seen[0].itunesdb, itunesdb_before,
+        "the first write had not started"
+    );
+    assert_eq!(seen[0].counts_bak.as_ref(), Some(&counts_before));
+    // And after it.
+    let (live, bak) = counts_files(&w.root);
+    assert!(!live);
+    assert_eq!(bak.as_ref(), Some(&counts_before));
+    assert_ne!(
+        fs::read(w.root.join("iPod_Control/iTunes/iTunesDB")).unwrap(),
+        itunesdb_before,
+        "set up: the database was replaced"
+    );
+    let plays = plays_by_track(&w);
+    assert_eq!(
+        (plays.get(&ids[0]), plays.get(&ids[2]), plays.len()),
+        (Some(&5), Some(&7), 2),
+        "{plays:?}"
+    );
+}
+
+/// Every file under `root`, deleted, then `files` written back.
+fn put_tree_back(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>) {
+    for rel in tree(root).keys() {
+        fs::remove_file(root.join(rel)).unwrap();
+    }
+    for (rel, bytes) in files {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+}
+
+// A kill right after Play Counts was moved aside and the pull committed, before
+// libgpod wrote anything: the pull stands (its plays are in the index and the
+// file is in the backup), nothing is pulled twice, nothing is credited to a
+// track that moved up in the order.
+#[test]
+fn a_kill_after_play_counts_was_moved_aside_counts_every_play_once_on_the_next_sync() {
+    let (w, ids) = removal_world();
+    let at_write_ipod: RefCell<Option<BTreeMap<PathBuf, Vec<u8>>>> = RefCell::new(None);
+    let index = w.env.store.conn().path().unwrap().to_owned() + ".at-write";
+    let p = w.prepare();
+    let work = exec::full_work(&p);
+    w.run(
+        &p,
+        &work,
+        Options::default(),
+        &|e| {
+            if matches!(e, Progress::Writing) && at_write_ipod.borrow().is_none() {
+                *at_write_ipod.borrow_mut() = Some(w.tree());
+                w.env
+                    .store
+                    .conn()
+                    .execute("VACUUM INTO ?1", [&index])
+                    .unwrap();
+            }
+        },
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let clean_plays = plays_by_track(&w);
+
+    // The process died at that point: the iPod and the index are as they
+    // were when the write started.
+    let crashed_ipod = at_write_ipod.into_inner().unwrap();
+    assert!(
+        crashed_ipod.contains_key(Path::new("iPod_Control/iTunes/Play Counts.bak")),
+        "set up"
+    );
+    assert!(
+        !crashed_ipod.contains_key(Path::new("iPod_Control/iTunes/Play Counts")),
+        "set up"
+    );
+    put_tree_back(&w.root, &crashed_ipod);
+    {
+        let c = w.env.store.conn();
+        c.execute("ATTACH DATABASE ?1 AS snap", [&index]).unwrap();
+        for t in ["stats", "pending_pulls", "device_tracks"] {
+            c.execute_batch(&format!(
+                "DELETE FROM main.{t}; INSERT INTO main.{t} SELECT * FROM snap.{t};"
+            ))
+            .unwrap();
+        }
+        c.execute("DETACH DATABASE snap", []).unwrap();
+    }
+    assert_eq!(w.pending_pulls(), 1, "set up: the pull is pending");
+
+    let out = w.sync().unwrap();
+    assert_eq!(out.recovered, 0, "the pull stands");
+    assert_eq!(out.pulled.plays(), 0, "no live Play Counts to pull again");
+    assert_eq!(out.removed, 1);
+    assert_eq!(plays_by_track(&w), clean_plays);
+    let plays = plays_by_track(&w);
+    assert_eq!(
+        (plays.get(&ids[1]), plays.get(&ids[3])),
+        (None, None),
+        "tracks 2 and 4 never played"
+    );
+    assert_eq!(w.pending_pulls(), 0);
 }
