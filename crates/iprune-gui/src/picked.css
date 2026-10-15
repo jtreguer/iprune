@@ -1,0 +1,16 @@
+/* The palette for a picked background colour. `style.rs` defines, ahead of
+   this, @ip_bg, the colour picked; @ip_fg, black or white text, whichever
+   reads better on it; @ip_away, the other one; and @ip_grid_odd and
+   @ip_hover, the stripe and hover colours (see `stripes`). The surfaces
+   below move away from the text colour, so their text never has less
+   contrast than on @ip_bg. */
+
+@define-color ip_window @ip_bg;
+@define-color ip_sidebar mix(@ip_bg, @ip_away, 0.1);
+@define-color ip_grid @ip_bg;
+@define-color ip_titles mix(@ip_bg, @ip_away, 0.1);
+@define-color ip_line mix(@ip_bg, @ip_fg, 0.15);
+/* Selection from the pick, not the theme: a pick close to the theme's
+   selection colour would hide it. */
+@define-color ip_accent mix(@ip_bg, @ip_fg, 0.75);
+@define-color ip_accent_fg @ip_away;

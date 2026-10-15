@@ -1229,6 +1229,7 @@ fn complete_keeps_position_hidden_in_the_library_only() {
 #[test]
 fn layouts_round_trip_through_toml() {
     let layouts = Layouts {
+        background: None,
         library: Layout {
             columns: vec![cs("name", 310, true), cs("album_artist", 77, false)],
         },
@@ -1481,10 +1482,12 @@ fn parse_reads_back_what_serializing_wrote() {
     for layouts in [
         Layouts::default(),
         Layouts {
+            background: None,
             library: Layout::default_for(false),
             playlist: Layout::default_for(true),
         },
         Layouts {
+            background: None,
             library: Layout {
                 columns: vec![cs("album_artist", 24, false), cs("name", 4000, true)],
             },
@@ -1494,4 +1497,59 @@ fn parse_reads_back_what_serializing_wrote() {
         let text = toml::to_string(&layouts).unwrap();
         assert_eq!(Layouts::parse(&text), layouts, "{text}");
     }
+}
+
+// ------------------------------------------------------------ background
+
+#[test]
+fn background_round_trips_through_toml_with_columns() {
+    // the colour is a plain value and the columns are tables: saving must
+    // not fail on a value coming after a table
+    let layouts = Layouts {
+        background: Some("#2b1d4e".to_owned()),
+        library: Layout {
+            columns: vec![cs("name", 310, true)],
+        },
+        playlist: Layout::default_for(true),
+    };
+    let text = toml::to_string(&layouts).expect("saves");
+    assert!(text.contains("background = \"#2b1d4e\""), "{text}");
+    let back = Layouts::parse(&text);
+    assert_eq!(back.background.as_deref(), Some("#2b1d4e"));
+    assert_eq!(back.library, layouts.library);
+    assert_eq!(back.playlist, layouts.playlist);
+}
+
+#[test]
+fn no_background_is_not_written_and_reads_back_as_none() {
+    let layouts = Layouts {
+        background: None,
+        library: Layout {
+            columns: vec![cs("name", 310, true)],
+        },
+        playlist: Layout::default_for(false),
+    };
+    let text = toml::to_string(&layouts).unwrap();
+    assert!(!text.contains("background"), "{text}");
+    assert_eq!(Layouts::parse(&text).background, None);
+    // an old ui.toml without the key
+    assert_eq!(Layouts::parse("[library]\n").background, None);
+}
+
+#[test]
+fn parse_ignores_a_background_that_is_not_a_string() {
+    for text in [
+        "background = 5",
+        "background = true",
+        "background = [1]",
+        "background = { a = 1 }",
+    ] {
+        assert_eq!(Layouts::parse(text).background, None, "{text}");
+    }
+    // the columns next to it are still read
+    let l = Layouts::parse(
+        "background = 5\n[[library.columns]]\nid = \"name\"\nwidth = 120\nvisible = true\n",
+    );
+    assert_eq!(l.background, None);
+    assert_eq!(l.library.columns.len(), 1);
 }

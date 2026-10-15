@@ -1,0 +1,145 @@
+/* iprune's look, on top of the GTK theme. The colours come from
+   `palette.css`, or from `picked.css` once a background colour is picked
+   from the menu; `style.rs` puts one of them ahead of these rules. Text
+   takes @ip_fg wherever the background is ours. */
+
+window.background {
+  background-color: @ip_window;
+  color: @ip_fg;
+}
+
+headerbar {
+  background-color: @ip_titles;
+  background-image: none;
+  color: @ip_fg;
+  box-shadow: inset 0 -1px @ip_line;
+}
+
+/* Widgets that keep the theme's background keep its text colour too,
+   rather than inheriting @ip_fg from the window. */
+popover > contents,
+entry,
+tooltip {
+  color: @theme_fg_color;
+}
+
+/* The theme colours these for its own background, not ours. */
+headerbar windowcontrols button,
+.sidebar-pane button.flat {
+  color: @ip_fg;
+}
+
+paned > separator {
+  background-color: @ip_line;
+}
+
+/* Sidebar */
+
+.sidebar-pane,
+.sidebar-pane list.navigation-sidebar {
+  background-color: @ip_sidebar;
+  color: @ip_fg;
+}
+
+.sidebar-pane separator {
+  background-color: @ip_line;
+}
+
+.sidebar-pane .sidebar-heading {
+  color: alpha(@ip_fg, 0.55);
+  font-size: 0.8em;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.sidebar-pane list.navigation-sidebar > row {
+  border-radius: 6px;
+}
+
+.sidebar-pane list.navigation-sidebar > row.activatable:hover {
+  background-color: @ip_hover;
+}
+
+.sidebar-pane list.navigation-sidebar > row:selected {
+  background-image: linear-gradient(to bottom, shade(@ip_accent, 1.08), shade(@ip_accent, 0.92));
+  color: @ip_accent_fg;
+}
+
+/* Track grid */
+
+columnview.data-table {
+  background-color: @ip_grid;
+  color: @ip_fg;
+}
+
+columnview.data-table > header {
+  background-color: @ip_titles;
+  box-shadow: inset 0 -1px @ip_line;
+}
+
+columnview.data-table > header > button {
+  background-color: transparent;
+  background-image: none;
+  color: alpha(@ip_fg, 0.65);
+  font-weight: 700;
+  font-size: 0.9em;
+}
+
+columnview.data-table > header > button:hover {
+  background-color: @ip_hover;
+}
+
+columnview.data-table > listview {
+  background-color: @ip_grid;
+  color: @ip_fg;
+}
+
+/* Each cell's label fills its cell and carries the stripe: odd rows are
+   marked from the code by position in the list (see `stripe` in main.rs),
+   not with :nth-child, which follows the widgets GTK recycles. Only the
+   track grid has these labels; other data tables keep the theme's cells. */
+columnview.track-grid > listview > row > cell {
+  padding: 0;
+  border-color: @ip_line;
+}
+
+columnview.track-grid > listview > row > cell > .cell-label {
+  padding: 2px 6px;
+}
+
+columnview.track-grid > listview > row > cell > .cell-label.odd {
+  background-color: @ip_grid_odd;
+}
+
+columnview.track-grid > listview > row:hover > cell > .cell-label {
+  background-color: @ip_hover;
+}
+
+columnview.track-grid > listview > row:selected {
+  background-color: @ip_accent;
+  color: @ip_accent_fg;
+}
+
+columnview.track-grid > listview > row:selected > cell > .cell-label {
+  background-color: transparent;
+  color: @ip_accent_fg;
+}
+
+/* An entry with no file behind it: fainter text, by colour rather than
+   opacity, which would also fade the stripe and the hover tint. */
+columnview.track-grid > listview > row > cell > .cell-label.unresolved {
+  color: alpha(@ip_fg, 0.5);
+}
+
+columnview.track-grid > listview > row:selected > cell > .cell-label.unresolved {
+  color: alpha(@ip_accent_fg, 0.7);
+}
+
+/* Status line under the grid */
+
+.status-bar {
+  background-color: @ip_titles;
+  color: alpha(@ip_fg, 0.65);
+  font-size: 0.92em;
+  padding: 5px 0;
+}

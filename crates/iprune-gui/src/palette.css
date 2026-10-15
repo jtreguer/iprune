@@ -1,0 +1,16 @@
+/* The palette that follows the GTK theme, used until a background colour
+   is picked. Every colour is a tint of the theme's own, so the window
+   follows a light or dark theme without having to tell which one is
+   active: text keeps the theme's colour and contrast. */
+
+@define-color ip_tint #4a78d8;
+@define-color ip_fg @theme_fg_color;
+@define-color ip_window mix(@theme_bg_color, @ip_tint, 0.14);
+@define-color ip_sidebar shade(mix(@theme_bg_color, @ip_tint, 0.2), 0.92);
+@define-color ip_grid mix(@theme_base_color, @ip_tint, 0.09);
+@define-color ip_grid_odd mix(@ip_grid, @ip_fg, 0.15);
+@define-color ip_hover mix(@ip_grid, @ip_tint, 0.22);
+@define-color ip_titles mix(@theme_bg_color, @ip_tint, 0.17);
+@define-color ip_line mix(@borders, @ip_tint, 0.2);
+@define-color ip_accent @theme_selected_bg_color;
+@define-color ip_accent_fg @theme_selected_fg_color;

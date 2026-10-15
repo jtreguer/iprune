@@ -7,6 +7,7 @@ mod adopt_job;
 #[cfg(test)]
 mod close_tests;
 mod data;
+mod style;
 mod sync_job;
 mod view_model;
 
@@ -126,6 +127,7 @@ struct Ui {
 
 fn main() -> glib::ExitCode {
     let app = gtk::Application::builder().application_id(APP_ID).build();
+    app.connect_startup(|_| style::install());
     app.connect_activate(activate);
     // GTK does not see iprune's own arguments.
     app.run_with_args::<&str>(&[])
@@ -176,6 +178,7 @@ fn cell_label(numeric: bool) -> gtk::Label {
     l.set_xalign(if numeric { 1.0 } else { 0.0 });
     l.set_ellipsize(gtk::pango::EllipsizeMode::End);
     l.set_single_line_mode(true);
+    l.add_css_class("cell-label");
     l
 }
 
@@ -259,6 +262,15 @@ fn make_column(col: Column, slot: UiSlot) -> gtk::ColumnViewColumn {
         }
         label.add_controller(click);
         item.set_child(Some(&label));
+        // Rows above added, removed or sorted move this one without a rebind.
+        {
+            let label = label.downgrade();
+            item.connect_position_notify(move |item| {
+                if let Some(label) = label.upgrade() {
+                    stripe(item, &label);
+                }
+            });
+        }
     });
     factory.connect_bind(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().expect("a list item");
@@ -272,13 +284,14 @@ fn make_column(col: Column, slot: UiSlot) -> gtk::ColumnViewColumn {
         label.set_text(&text);
         // An entry with no file behind it is shown dimmed.
         if row.unresolved {
-            label.add_css_class("dim-label");
+            label.add_css_class("unresolved");
         } else {
-            label.remove_css_class("dim-label");
+            label.remove_css_class("unresolved");
         }
         if col == Column::Name {
             label.set_tooltip_text(Some(&row.path.to_string_lossy()));
         }
+        stripe(item, &label);
     });
     let column = gtk::ColumnViewColumn::new(Some(col.title()), Some(factory));
     column.set_id(Some(col.key()));
@@ -291,11 +304,23 @@ fn make_column(col: Column, slot: UiSlot) -> gtk::ColumnViewColumn {
     column
 }
 
+/// Shades every other grid row, by its position in the list. CSS
+/// `:nth-child` would follow the row widgets, which GTK recycles and
+/// reorders while scrolling, so the stripes would jump. The class goes on
+/// each cell's label, which fills its cell (see `style.css`): restyling
+/// GTK's own row widget while it binds leaves the grid empty.
+fn stripe(item: &gtk::ListItem, label: &gtk::Label) {
+    if style::is_odd_row(item.position()) {
+        label.add_css_class("odd");
+    } else {
+        label.remove_css_class("odd");
+    }
+}
+
 fn sidebar_header(text: &str) -> gtk::ListBoxRow {
     let label = gtk::Label::new(Some(text));
     label.set_xalign(0.0);
-    label.add_css_class("heading");
-    label.add_css_class("dim-label");
+    label.add_css_class("sidebar-heading");
     label.set_margin_top(12);
     label.set_margin_start(8);
     label.set_margin_bottom(4);
@@ -714,6 +739,40 @@ impl Ui {
         }
     }
 
+    /// The background colour picked from the menu, if any. A value the file
+    /// holds but that is not `#rrggbb` is ignored.
+    fn background(&self) -> Option<style::Rgb> {
+        let layouts = self.layouts.borrow();
+        layouts.background.as_deref().and_then(style::Rgb::parse)
+    }
+
+    fn choose_background(self: &Rc<Self>) {
+        let dialog = gtk::ColorDialog::new();
+        dialog.set_title("Background Colour");
+        dialog.set_with_alpha(false);
+        let current = self.background().map(style::Rgb::to_rgba);
+        let weak = Rc::downgrade(self);
+        dialog.choose_rgba(
+            Some(&self.window),
+            current.as_ref(),
+            None::<&gio::Cancellable>,
+            move |result| {
+                // Cancelled or closed: the background stays as it was.
+                if let (Some(ui), Ok(color)) = (weak.upgrade(), result) {
+                    ui.set_background(Some(style::Rgb::from_rgba(&color)));
+                }
+            },
+        );
+    }
+
+    /// Repaints the windows on `background` (None: the theme's colours)
+    /// and keeps it in `ui.toml` for the next start.
+    fn set_background(&self, background: Option<style::Rgb>) {
+        style::set_background(background);
+        self.layouts.borrow_mut().background = background.map(style::Rgb::hex);
+        self.save_layouts();
+    }
+
     fn show_in_folder(&self) {
         let Some(row) = self.selected_rows().into_iter().find(|r| !r.unresolved) else {
             return;
@@ -892,8 +951,7 @@ impl Ui {
         };
         let heading = gtk::Label::new(Some("Device"));
         heading.set_xalign(0.0);
-        heading.add_css_class("heading");
-        heading.add_css_class("dim-label");
+        heading.add_css_class("sidebar-heading");
         heading.set_margin_top(12);
         heading.set_margin_start(8);
         let label = gtk::Label::new(Some(&device_text(&d)));
@@ -1659,6 +1717,8 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     view.set_show_column_separators(true);
     // Compact rows, as a music grid needs (GTK 4.12).
     view.add_css_class("data-table");
+    // The stripes and cell padding of `style.css`.
+    view.add_css_class("track-grid");
     view.set_reorderable(true);
     let mut columns = Vec::new();
     for col in Column::ALL {
@@ -1727,7 +1787,7 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     header.pack_end(&search);
     window.set_titlebar(Some(&header));
 
-    let menu = gio::Menu::new();
+    let column_items = gio::Menu::new();
     let actions = gio::SimpleActionGroup::new();
     for (i, (col, c)) in columns.iter().enumerate() {
         let name = format!("column{i}");
@@ -1746,20 +1806,24 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
             c.connect_visible_notify(move |c| action.set_state(&c.is_visible().to_variant()));
         }
         actions.add_action(&action);
-        menu.append(Some(col.title()), Some(&format!("columns.{name}")));
+        column_items.append(Some(col.title()), Some(&format!("columns.{name}")));
     }
     window.insert_action_group("columns", Some(&actions));
+    let background_items = gio::Menu::new();
+    background_items.append(Some("Background Colour…"), Some("win.background"));
+    background_items.append(Some("Default Background"), Some("win.default-background"));
+    let menu = gio::Menu::new();
+    menu.append_section(Some("Columns"), &column_items);
+    menu.append_section(None, &background_items);
     let columns_button = gtk::MenuButton::new();
     columns_button.set_icon_name("view-more-symbolic");
-    columns_button.set_tooltip_text(Some("Columns"));
+    columns_button.set_tooltip_text(Some("Columns and Background"));
     columns_button.set_menu_model(Some(&menu));
     header.pack_start(&columns_button);
 
     let status = gtk::Label::new(None);
     status.set_xalign(0.5);
-    status.add_css_class("dim-label");
-    status.set_margin_top(4);
-    status.set_margin_bottom(4);
+    status.add_css_class("status-bar");
 
     // Sidebar, filled once the window state exists.
     let sidebar = gtk::ListBox::new();
@@ -1786,6 +1850,7 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     side_search.set_margin_top(8);
     side_search.set_margin_bottom(4);
     let side = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    side.add_css_class("sidebar-pane");
     side.append(&side_search);
     let side_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -1859,6 +1924,7 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     slot.set(Rc::downgrade(&ui)).expect("set once");
     let library_layout = ui.layouts.borrow().library.complete(false);
     ui.apply_layout(&library_layout);
+    style::set_background(ui.background());
 
     // Actions, also reachable from the keyboard and the context menus.
     let remove = action(window, "remove", &ui, |ui| ui.remove_selected());
@@ -1866,6 +1932,10 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     let down = action(window, "move-down", &ui, |ui| ui.nudge(1));
     action(window, "show-in-folder", &ui, |ui| ui.show_in_folder());
     action(window, "new-playlist", &ui, |ui| ui.new_playlist());
+    action(window, "background", &ui, |ui| ui.choose_background());
+    action(window, "default-background", &ui, |ui| {
+        ui.set_background(None)
+    });
     // F2 renames the playlist on screen; the sidebar menu acts on the
     // playlist it was opened on.
     action(window, "rename-playlist", &ui, |ui| {

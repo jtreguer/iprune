@@ -538,6 +538,10 @@ pub struct Layout {
 /// The saved layouts, `~/.local/state/iprune/ui.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Layouts {
+    /// The background colour picked from the menu, `#rrggbb`; None follows
+    /// the theme.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
     #[serde(default)]
     pub library: Layout,
     #[serde(default)]
@@ -630,6 +634,10 @@ impl Layouts {
             Layout { columns }
         };
         Layouts {
+            background: table
+                .get("background")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
             library: view("library"),
             playlist: view("playlist"),
         }
