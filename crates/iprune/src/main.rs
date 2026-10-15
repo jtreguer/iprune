@@ -467,9 +467,7 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
     let opts = exec::Options {
         allow_mass_removal: args.allow_mass_removal,
     };
-    exec::check_removals(&work.playlists, prepared.playlists_map.len(), opts)?;
-    exec::check_track_removals(&work.tracks, prepared.tracks_map.len(), opts)?;
-    exec::check_missing_files(&prepared.plan, prepared.tracks_map.len(), opts)?;
+    exec::check_guards(&prepared, &work, opts)?;
     if !work.tracks.copies.is_empty() && !prepared.plan.space.fits {
         bail!("the tracks to copy do not fit on the iPod; nothing was changed");
     }

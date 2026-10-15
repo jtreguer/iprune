@@ -547,6 +547,13 @@ Rules, in the order the planner applies them:
    that left the scope. Unmapped playlists in scope then match free iPod
    playlists by the three name passes of adoption (exact, NFC
    case-insensitive, file-name characters). Unmatched ones are created.
+   A free iPod playlist matched this way was not managed until now: when
+   it holds tracks and gets other members, the plan lists it as a takeover
+   (`Plan.takeovers`, with its track count and how many the sync takes out
+   of it), and one that takes tracks out is refused without
+   `--allow-mass-removal` (the window's "Apply it anyway"), since that list
+   exists only on the iPod (the owner's decision: matching by name stays,
+   and says so).
    A playlist still unmatched whose name matches an iPod smart playlist by
    one of those passes is an export of it: it goes to `playlists_skipped`
    and is not created. Remaining regular iPod playlists are unmanaged: kept,
@@ -711,7 +718,10 @@ Order of operations:
     writes several files; if it fails, the iPod's `iTunesDB`, `ArtworkDB`
     and `.ithmb` files are compared with the backup. Unchanged: the pull is undone and the error
     reported. Changed: the error names the backup to restore (exit code 3),
-    and the pull stays pending for the next sync to settle as above.
+    the latest checkpoint's when one was written, and the pull stays pending
+    for the next sync to settle as above. A checkpoint backup that cannot be
+    taken stops the sync before that write, saying the iPod holds the last
+    checkpoint.
 11. `itdb_stop_sync`.
 12. Verify (section 11.4).
 13. Record the playlist mappings (with the ids of created playlists), drop
@@ -734,7 +744,12 @@ or 10 minutes, after the checks of section 11.3 on what is done so far
 (removals and copies; playlists untouched, less the removed tracks), then
 verified, and the mappings of what it holds are recorded. An interrupted
 sync loses at most the copies since the last checkpoint, whose files
-`iprune doctor` finds.
+`iprune doctor` finds. Before each write after the first, what the iPod
+holds (the last verified checkpoint) is backed up with the mappings
+recorded for it, so a later write that fails names that backup rather than
+the one from before the sync, whose removed files are already deleted (the
+owner's rule: a backup before every write). Only the latest checkpoint's
+backup is kept, and it is deleted once the sync is written and verified.
 
 Ctrl+C, SIGTERM (logout, shutdown) or SIGHUP (the terminal closed) in the
 CLI, or the same signals or Stop (shown only while there are copies) in the

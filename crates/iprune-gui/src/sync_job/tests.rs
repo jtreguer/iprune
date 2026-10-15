@@ -280,6 +280,31 @@ fn plan_sets_mass_removal_only_for_many_deleted_playlists() {
     assert!(m.contains('7') && m.contains('9'), "{m}");
 }
 
+// Prevents (audit M9) the window syncing without a word a new playlist file
+// that empties an iPod playlist iprune never managed.
+#[test]
+fn plan_sets_mass_removal_for_a_takeover_that_drops_tracks_only() {
+    let w = World::new(&[]);
+    // "Stray" is on the iPod only, holding [D2]. A file of that name with
+    // D2 and one more track adds and drops nothing.
+    w.write_list("Stray", &[D2, D1]);
+    let p = w.plan();
+    assert_eq!(p.plan.takeovers.len(), 1, "{:?}", p.plan.takeovers);
+    assert_eq!(p.plan.takeovers[0].dropped, 0);
+    assert!(p.mass_removal.is_none(), "{:?}", p.mass_removal);
+
+    // Without D2 it drops the iPod playlist's only track.
+    w.write_list("Stray", &[D1, D3]);
+    let p = w.plan();
+    assert_eq!(p.plan.takeovers[0].dropped, 1);
+    let m = p.mass_removal.expect("a takeover that drops a track");
+    assert!(
+        m.contains("Stray") && m.contains("--allow-mass-removal"),
+        "{m}"
+    );
+    assert!(p.details.contains("takes over"), "{}", p.details);
+}
+
 #[test]
 fn plan_sees_playlist_files_deleted_from_disk() {
     // The scan inside `plan` reads the folder: files removed behind the

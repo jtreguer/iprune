@@ -272,6 +272,15 @@ pub fn describe(p: &Prepared, verbose: bool) -> String {
         w,
         "  playlists: {created} new, {changed} changed, {renamed} renamed, {deleted} removed"
     );
+    for t in &plan.takeovers {
+        let _ = writeln!(
+            w,
+            "  takes over iPod playlist {:?}, not managed until now: {} of its {} taken out",
+            t.name,
+            plural(t.dropped, "track", "tracks"),
+            t.before
+        );
+    }
     let _ = writeln!(
         w,
         "  unmanaged on the iPod, kept: {}, {}",

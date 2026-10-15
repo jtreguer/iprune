@@ -149,6 +149,15 @@ pub enum Error {
         "writing the iPod database failed ({0}) and nothing on the iPod changed, but its Play Counts file could not be put back from Play Counts.bak; its plays are already counted, so leave it as it is"
     )]
     WriteRefusedCountsKept(String),
+    #[error(
+        "new playlists take over iPod playlists iprune did not manage, taking tracks out of them: {}. Those lists exist only on the iPod; if that is intended, run again with --allow-mass-removal",
+        .0.join(", ")
+    )]
+    PlaylistTakeover(Vec<String>),
+    #[error(
+        "the iPod could not be backed up before the next write ({0}), so that write was not made. The iPod holds the last checkpoint, written and verified; the tracks copied since are files no database entry uses, which `iprune doctor` finds, and the next sync copies them again"
+    )]
+    CheckpointBackupFailed(String),
     #[error("the index cannot be upgraded: {0}")]
     Migration(String),
     #[error(

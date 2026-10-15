@@ -1740,6 +1740,412 @@ fn exactly_500_copies_are_one_write_not_two() {
     assert_eq!(w.playlist("Big").unwrap().len(), 500);
 }
 
+// ---- the backup before every write after the first (audit M8)
+
+/// The backups a checkpoint took (they hold `checkpoint.txt`), oldest first.
+fn checkpoint_backups(w: &World) -> Vec<backup::Backup> {
+    w.backups()
+        .into_iter()
+        .filter(|b| b.dir.join("checkpoint.txt").is_file())
+        .collect()
+}
+
+/// A world with 501 new files (a checkpoint after 500 copies) and the first
+/// library file deleted, so a sync writes three times: the removal, the
+/// checkpoint, the end. The removed file is gone from the iPod after the
+/// first write, which the backup taken before the sync cannot give back.
+fn removal_then_501_copies() -> World {
+    let (mut w, _) = with_many_new(501);
+    fs::remove_file(&w.files[0]).unwrap();
+    w.rescan();
+    w
+}
+
+// Prevents (audit M8) a sync that fails at its last write pointing to the
+// backup taken before the sync, whose removed files are already deleted,
+// instead of to the last verified checkpoint.
+#[test]
+#[cfg(unix)]
+fn a_final_write_that_fails_after_a_checkpoint_names_the_checkpoint_backup_and_it_restores() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = removal_then_501_copies();
+    let removed_file = w.file_of(dbid(1));
+    let p = w.prepare();
+    let work = exec::full_work(&p);
+    assert_eq!(work.tracks.copies.len(), 501);
+    assert_eq!(work.tracks.removes.len(), 1);
+    let itunes = w.root.join("iPod_Control/iTunes");
+    let db_path = itunes.join("iTunesDB");
+    struct Restore(PathBuf, u32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+        }
+    }
+    let guards: RefCell<Vec<Restore>> = RefCell::new(Vec::new());
+    let writes = RefCell::new(0);
+    // The database after the checkpoint write, read when the 501st copy
+    // starts.
+    let checkpointed: RefCell<Option<Vec<u8>>> = RefCell::new(None);
+    let blocked = RefCell::new(false);
+    let progress = |e: Progress| match e {
+        Progress::Copying { done: 500, .. } if checkpointed.borrow().is_none() => {
+            *checkpointed.borrow_mut() = Some(fs::read(&db_path).unwrap());
+        }
+        Progress::Writing => {
+            *writes.borrow_mut() += 1;
+            if *writes.borrow() == 3 {
+                for (path, mode) in [(&db_path, 0o444), (&itunes, 0o555)] {
+                    let old = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+                    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+                    guards.borrow_mut().push(Restore(path.clone(), old));
+                }
+                *blocked.borrow_mut() = fs::File::create(itunes.join(".probe")).is_err();
+                let _ = fs::remove_file(itunes.join(".probe"));
+            }
+        }
+        _ => {}
+    };
+    let res = w.run(
+        &p,
+        &work,
+        Options::default(),
+        &progress,
+        &AtomicBool::new(false),
+    );
+    guards.borrow_mut().clear();
+    if !*blocked.borrow() {
+        eprintln!("running as root: permissions do not block writes, test skipped");
+        return;
+    }
+    assert_eq!(*writes.borrow(), 3);
+    let e = res.unwrap_err();
+    let Error::WriteIncomplete { stamp, .. } = &e else {
+        panic!("expected WriteIncomplete, got {e}");
+    };
+
+    // Two backups: the one before the sync and the checkpoint's.
+    assert_eq!(w.backups().len(), 2);
+    let cps = checkpoint_backups(&w);
+    assert_eq!(cps.len(), 1);
+    let cp = &cps[0];
+    let pre = w
+        .backups()
+        .into_iter()
+        .find(|b| b.stamp != cp.stamp)
+        .unwrap();
+    assert_eq!(stamp, &cp.stamp, "the error names the checkpoint backup");
+    assert_ne!(stamp, &pre.stamp);
+    assert!(
+        fs::read_to_string(cp.dir.join("checkpoint.txt"))
+            .unwrap()
+            .contains(&pre.stamp),
+        "it names the backup taken before the sync"
+    );
+    // Its database is what the last verified write put on the iPod.
+    assert_eq!(
+        fs::read(cp.dir.join("iTunesDB")).unwrap(),
+        checkpointed.into_inner().unwrap()
+    );
+    // Its mappings are the recorded ones: the 3 adopted, minus the removed,
+    // plus 500 copies. Not the 3 of the backup before the sync.
+    let m: serde_json::Value =
+        serde_json::from_slice(&fs::read(cp.dir.join("mappings.json")).unwrap()).unwrap();
+    let saved: BTreeMap<i64, u64> = m["tracks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| (t["track_id"].as_i64().unwrap(), t["dbid"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(saved.len(), 2 + 500);
+    assert_eq!(saved, w.mapping());
+    assert!(
+        !fs::read_to_string(cp.dir.join("snapshot.txt"))
+            .unwrap()
+            .is_empty()
+    );
+    // The backup before the sync still lists the removed track, whose file
+    // is gone: that is why it is not the one to restore.
+    assert!(w.track(dbid(1)).is_none());
+    assert!(!removed_file.exists());
+
+    // Restoring the checkpoint gives a database whose every file exists.
+    restore(&w, &cp.stamp, false).unwrap();
+    let c = w.contents();
+    assert_eq!(c.tracks.len(), 2 + 1 + 500);
+    for t in &c.tracks {
+        let f = ipod::file_path(&w.root, t.ipod_path.as_deref().expect("a path")).unwrap();
+        assert!(
+            f.is_file(),
+            "{:x} has no file {}",
+            t.adopt.dbid,
+            f.display()
+        );
+    }
+}
+
+// Prevents (audit M8) a checkpoint backup that cannot be made (backups disk
+// full) being a bare I/O error, or the write going ahead without it, or the
+// pull being undone though the iPod holds the first writes.
+#[test]
+#[cfg(unix)]
+fn a_checkpoint_backup_that_fails_stops_before_the_write_and_the_next_sync_finishes() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = removal_then_501_copies();
+    w.write_play_counts(&[
+        (3, 1_700_000_000, 80, 1),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+    ]);
+    let p = w.prepare();
+    let work = exec::full_work(&p);
+    let db_path = w.root.join("iPod_Control/iTunes/iTunesDB");
+    let guid_dir = w.paths.data_dir.join("backups").join(GUID);
+    let at_checkpoint: RefCell<Option<Vec<u8>>> = RefCell::new(None);
+    let blocked = RefCell::new(false);
+    let progress = |e: Progress| {
+        if matches!(e, Progress::Copying { done: 500, .. }) && at_checkpoint.borrow().is_none() {
+            *at_checkpoint.borrow_mut() = Some(fs::read(&db_path).unwrap());
+            fs::set_permissions(&guid_dir, fs::Permissions::from_mode(0o555)).unwrap();
+            *blocked.borrow_mut() = fs::create_dir(guid_dir.join(".probe")).is_err();
+            let _ = fs::remove_dir(guid_dir.join(".probe"));
+        }
+    };
+    let res = w.run(
+        &p,
+        &work,
+        Options::default(),
+        &progress,
+        &AtomicBool::new(false),
+    );
+    fs::set_permissions(&guid_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    if !*blocked.borrow() {
+        eprintln!("running as root: permissions do not block writes, test skipped");
+        return;
+    }
+    let e = res.unwrap_err();
+    assert!(
+        matches!(e, Error::CheckpointBackupFailed(_)),
+        "expected CheckpointBackupFailed, got {e}"
+    );
+    assert!(!e.is_check_failure(), "exit 1, not 3");
+    // The iPod is as the last verified write left it; the pull stands.
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        at_checkpoint.into_inner().unwrap()
+    );
+    assert_eq!(w.contents().tracks.len(), 2 + 1 + 500);
+    assert_eq!(w.mapping().len(), 2 + 500);
+    assert_eq!(w.stats_total_plays(), 3);
+    assert_eq!(w.pending_pulls(), 0);
+
+    // The next sync copies the rest, plays counted once.
+    let p = w.prepare();
+    let work = exec::full_work(&p);
+    assert_eq!(
+        work.tracks.copies.len(),
+        1,
+        "{:?}",
+        work.tracks.copies.len()
+    );
+    let out = w
+        .run(
+            &p,
+            &work,
+            Options::default(),
+            &|_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(out.copied, 1);
+    assert_eq!(w.contents().tracks.len(), 2 + 1 + 501);
+    assert_eq!(w.mapping().len(), 2 + 501);
+    assert_eq!(w.stats_total_plays(), 3);
+    assert!(exec::full_work(&w.prepare()).is_empty());
+}
+
+// Prevents (audit M9) the pre-prompt guards applying to work that does not
+// copy or change playlists, as doctor's repair and a write of tracks only.
+#[test]
+fn check_guards_apply_each_guard_only_to_the_work_it_is_about() {
+    let w = World::new(8);
+    for k in 1..=6 {
+        fs::remove_file(w.file_of(dbid(k))).unwrap();
+    }
+    w.write_list("Stray", &[w.files[0].clone()]);
+    w.reload();
+    let p = w.prepare();
+    let opts = Options::default();
+    let full = exec::full_work(&p);
+    assert!(!full.tracks.copies.is_empty() && !full.playlists.ops.is_empty());
+    // With copies the missing files are caught first.
+    assert!(matches!(
+        exec::check_guards(&p, &full, opts).unwrap_err(),
+        Error::MassMissingFiles { .. }
+    ));
+    // With the copies gone from the work, the takeover is next.
+    let mut no_copies = exec::full_work(&p);
+    no_copies.tracks.copies.clear();
+    assert!(matches!(
+        exec::check_guards(&p, &no_copies, opts).unwrap_err(),
+        Error::PlaylistTakeover(_)
+    ));
+    // No copies and no playlist ops: neither guard applies.
+    no_copies.playlists.ops.clear();
+    exec::check_guards(&p, &no_copies, opts).unwrap();
+    // And the flag lifts both.
+    exec::check_guards(
+        &p,
+        &full,
+        Options {
+            allow_mass_removal: true,
+        },
+    )
+    .unwrap();
+}
+
+// Prevents (audit M8) checkpoint backups piling up, one per write.
+#[test]
+fn only_the_latest_checkpoint_backup_exists_and_none_is_left_after_a_good_sync() {
+    let w = removal_then_501_copies();
+    let p = w.prepare();
+    let work = exec::full_work(&p);
+    // Per write: the checkpoint backups there are as it starts, and their
+    // stamps.
+    let seen: RefCell<Vec<Vec<String>>> = RefCell::new(Vec::new());
+    let progress = |e: Progress| {
+        if matches!(e, Progress::Writing) {
+            seen.borrow_mut().push(
+                checkpoint_backups(&w)
+                    .into_iter()
+                    .map(|b| b.stamp)
+                    .collect(),
+            );
+        }
+    };
+    let out = w
+        .run(
+            &p,
+            &work,
+            Options::default(),
+            &progress,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    let seen = seen.into_inner();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert!(seen[0].is_empty(), "the first write takes none: {seen:?}");
+    assert_eq!(seen[1].len(), 1, "{seen:?}");
+    assert_eq!(seen[2].len(), 1, "the earlier one went: {seen:?}");
+    assert_ne!(seen[1], seen[2]);
+    // After the sync only the backup taken before it is left.
+    assert!(checkpoint_backups(&w).is_empty());
+    let left = w.backups();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].stamp, out.backup.stamp);
+    assert!(left[0].dir.join("work.json").is_file());
+    let dirs: Vec<_> = fs::read_dir(w.paths.data_dir.join("backups").join(GUID))
+        .unwrap()
+        .collect();
+    assert_eq!(dirs.len(), 1, "no stray folder: {dirs:?}");
+}
+
+// Prevents (audit M8) an extra backup for a sync with a single write.
+#[test]
+fn a_sync_with_one_write_takes_one_backup() {
+    let mut w = World::new(3);
+    w.add_new("one.mp3", Kind::Mp3, 21);
+    let p = w.prepare();
+    let work = exec::full_work(&p);
+    let during = RefCell::new(Vec::new());
+    let progress = |e: Progress| {
+        if matches!(e, Progress::Writing) {
+            during.borrow_mut().push(w.backups().len());
+        }
+    };
+    let out = w
+        .run(
+            &p,
+            &work,
+            Options::default(),
+            &progress,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(during.into_inner(), vec![1]);
+    assert_eq!(w.backups().len(), 1);
+    assert_eq!(w.backups()[0].stamp, out.backup.stamp);
+    assert!(checkpoint_backups(&w).is_empty());
+}
+
+// ---- playlist takeovers (audit M9)
+
+/// A file "Stray" for the iPod playlist of that name, which the iPod alone
+/// holds as [track 2]; the file has `files`.
+fn with_stray_file(w: &World, files: &[usize]) {
+    let list: Vec<PathBuf> = files.iter().map(|&i| w.files[i].clone()).collect();
+    w.write_list("Stray", &list);
+    w.reload();
+}
+
+// Prevents (audit M9) a new playlist file silently taking the tracks out of
+// an iPod playlist iprune never managed.
+#[test]
+fn a_takeover_that_drops_tracks_is_refused_before_anything_is_written_unless_allowed() {
+    let w = World::new(3);
+    with_stray_file(&w, &[0, 2]); // the iPod's has track 2 only
+    let p = w.prepare();
+    let work = exec::full_work(&p);
+    assert_eq!(p.plan.takeovers.len(), 1);
+    let tree = w.tree();
+    let e = w
+        .run(
+            &p,
+            &work,
+            Options::default(),
+            &|_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+    match &e {
+        Error::PlaylistTakeover(names) => {
+            assert_eq!(names.len(), 1, "{names:?}");
+            assert!(names[0].contains("Stray"), "{names:?}");
+        }
+        other => panic!("expected PlaylistTakeover, got {other}"),
+    }
+    assert_eq!(w.tree(), tree, "the iPod is as it was");
+    assert!(w.backups().is_empty(), "no backup: no write began");
+    assert_eq!(w.playlist("Stray"), Some(vec![dbid(2)]));
+
+    let out = w
+        .run(
+            &p,
+            &work,
+            Options {
+                allow_mass_removal: true,
+            },
+            &|_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert!(out.applied > 0);
+    assert_eq!(w.playlist("Stray"), Some(vec![dbid(1), dbid(3)]));
+}
+
+#[test]
+fn a_takeover_that_only_adds_tracks_is_not_refused() {
+    let w = World::new(3);
+    with_stray_file(&w, &[1, 0]); // track 2 kept, track 1 added
+    let p = w.prepare();
+    assert_eq!(p.plan.takeovers.len(), 1);
+    assert_eq!(p.plan.takeovers[0].dropped, 0);
+    exec::check_takeovers(&p.plan, Options::default()).unwrap();
+    w.sync().unwrap();
+    assert_eq!(w.playlist("Stray"), Some(vec![dbid(2), dbid(1)]));
+}
+
 // ---- the backup
 
 #[test]
@@ -2405,6 +2811,73 @@ mod doctor_tests {
             doctor::delete_orphans(&Report::default(), 0, false).unwrap(),
             0
         );
+    }
+
+    // Prevents (audit M9) doctor's repair, which copies nothing, being
+    // refused as a mass re-copy of tracks whose files look missing.
+    #[test]
+    fn a_repair_that_copies_nothing_is_not_blocked_by_many_missing_files_in_the_plan() {
+        let w = World::new(8);
+        for k in 1..=6 {
+            fs::remove_file(w.file_of(dbid(k))).unwrap();
+        }
+        fs::remove_file(w.file_of(ORPHAN)).unwrap();
+        let p = w.prepare();
+        assert_eq!(
+            p.plan.replace.iter().filter(|r| r.file_missing).count(),
+            6,
+            "set up: the plan would copy six tracks again"
+        );
+        assert!(
+            exec::check_missing_files(&p.plan, p.tracks_map.len(), Options::default()).is_err()
+        );
+        // The report names only the unmanaged entry: what doctor would remove
+        // without touching a managed track.
+        let mut report = examine(&w);
+        report.missing_files.retain(|(d, _)| *d == ORPHAN);
+        assert_eq!(report.missing_files.len(), 1);
+        let work = doctor::repair_work(&p, &report);
+        assert!(work.tracks.copies.is_empty());
+        let out = w
+            .run(
+                &p,
+                &work,
+                Options::default(),
+                &|_| {},
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(out.removed, 1);
+        assert!(w.track(ORPHAN).is_none());
+        assert!(w.track(dbid(1)).is_some(), "managed entries are kept");
+        assert_eq!(w.mapping().len(), 8);
+    }
+
+    // Prevents (audit M9) doctor's repair, which changes no playlist, being
+    // refused because the library has a playlist that would take one over.
+    #[test]
+    fn a_repair_is_not_blocked_by_a_takeover_pending_elsewhere_in_the_plan() {
+        let w = World::new(4);
+        // "Stray" [2] is only on the iPod; a file of that name would drop it.
+        w.write_list("Stray", &[w.files[2].clone()]);
+        w.reload();
+        fs::remove_file(w.file_of(ORPHAN)).unwrap();
+        let p = w.prepare();
+        assert_eq!(p.plan.takeovers.len(), 1, "set up: {:?}", p.plan.takeovers);
+        assert_eq!(p.plan.takeovers[0].dropped, 1);
+        let report = examine(&w);
+        let work = doctor::repair_work(&p, &report);
+        assert!(work.playlists.ops.is_empty());
+        w.run(
+            &p,
+            &work,
+            Options::default(),
+            &|_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(w.track(ORPHAN).is_none());
+        assert_eq!(w.playlist("Stray"), Some(vec![dbid(2)]), "not taken over");
     }
 
     #[test]

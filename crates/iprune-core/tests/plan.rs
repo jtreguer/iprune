@@ -2063,3 +2063,100 @@ fn a_stale_mapping_of_a_too_fast_file_is_skipped_not_copied() {
     assert_eq!(p.skipped.len(), 1);
     assert_eq!(p.skipped[0].reason, SkipReason::SampleRate);
 }
+
+// ---- takeovers of unmanaged iPod playlists (audit M9)
+
+// Prevents (audit M9) a new library playlist silently emptying an iPod
+// playlist that exists nowhere else.
+#[test]
+fn a_new_playlist_taking_over_a_free_ipod_playlist_by_name_reports_what_it_drops() {
+    let mut w = World::default();
+    w.synced(1, 0xA1).synced(2, 0xA2).synced(3, 0xA3);
+    // Another case, a repeated track: three entries, two distinct tracks.
+    w.ipod_playlist(7, "MIX", &[0xA2, 0xA3, 0xA3]);
+    w.playlist(10, "Mix", &ids(&[1, 2]), None);
+    let p = w.plan();
+    assert_eq!(
+        p.takeovers,
+        vec![plan::Takeover {
+            playlist_id: 10,
+            ipod_id: 7,
+            name: "MIX".into(),
+            before: 3,
+            dropped: 1,
+        }]
+    );
+    // The takeover is the change the plan makes, not an extra one.
+    assert!(
+        p.playlists
+            .iter()
+            .any(|o| matches!(o, PlaylistOp::SetMembers { ipod_id: 7, .. })),
+        "{:?}",
+        p.playlists
+    );
+}
+
+#[test]
+fn a_takeover_that_only_adds_tracks_drops_none() {
+    let mut w = World::default();
+    w.synced(1, 0xA1).synced(2, 0xA2);
+    w.ipod_playlist(7, "Mix", &[0xA2]);
+    w.playlist(10, "Mix", &ids(&[1, 2]), None);
+    let p = w.plan();
+    assert_eq!(p.takeovers.len(), 1, "{:?}", p.takeovers);
+    assert_eq!((p.takeovers[0].before, p.takeovers[0].dropped), (1, 0));
+}
+
+#[test]
+fn taking_over_an_empty_ipod_playlist_is_no_takeover() {
+    let mut w = World::default();
+    w.synced(1, 0xA1);
+    w.ipod_playlist(7, "Mix", &[]);
+    w.playlist(10, "Mix", &ids(&[1]), None);
+    let p = w.plan();
+    assert!(p.takeovers.is_empty(), "{:?}", p.takeovers);
+    assert!(
+        p.playlists
+            .iter()
+            .any(|o| matches!(o, PlaylistOp::SetMembers { ipod_id: 7, .. })),
+        "set up: the empty playlist is still filled: {:?}",
+        p.playlists
+    );
+}
+
+#[test]
+fn a_takeover_whose_members_are_the_same_is_none() {
+    let mut w = World::default();
+    w.synced(1, 0xA1);
+    w.ipod_playlist(7, "Mix", &[0xA1]);
+    w.playlist(10, "Mix", &ids(&[1]), None);
+    let p = w.plan();
+    assert!(p.takeovers.is_empty(), "{:?}", p.takeovers);
+    assert!(p.playlists.is_empty(), "{:?}", p.playlists);
+}
+
+#[test]
+fn a_playlist_matched_through_its_stored_mapping_is_not_a_takeover() {
+    let mut w = World::default();
+    w.synced(1, 0xA1).synced(2, 0xA2).synced(3, 0xA3);
+    w.ipod_playlist(7, "Mix", &[0xA2, 0xA3]);
+    w.playlist(10, "Mix", &ids(&[1]), Some("Mix"));
+    let p = w.plan();
+    assert!(p.takeovers.is_empty(), "{:?}", p.takeovers);
+    assert!(
+        p.playlists
+            .iter()
+            .any(|o| matches!(o, PlaylistOp::SetMembers { ipod_id: 7, .. })),
+        "set up: the members are replaced: {:?}",
+        p.playlists
+    );
+}
+
+#[test]
+fn a_new_playlist_with_no_ipod_namesake_is_no_takeover() {
+    let mut w = World::default();
+    w.synced(1, 0xA1).synced(2, 0xA2);
+    w.ipod_playlist(7, "Other", &[0xA2]);
+    w.playlist(10, "Mix", &ids(&[1]), None);
+    assert!(w.plan().takeovers.is_empty());
+}

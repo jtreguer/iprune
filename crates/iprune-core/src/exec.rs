@@ -289,6 +289,39 @@ pub fn check_missing_files(plan: &Plan, mapped: usize, opts: Options) -> Result<
     Ok(())
 }
 
+/// The guards against applying more than was likely meant: mass removals
+/// of playlists or tracks, mass copies of tracks whose iPod files seem
+/// gone, and playlists taking over unmanaged ones. Each only for the work
+/// done: doctor's repair copies nothing and changes no playlist. `sync`
+/// runs it, and the CLI and the window before asking.
+pub fn check_guards(prepared: &Prepared, work: &FullWork, opts: Options) -> Result<()> {
+    check_removals(&work.playlists, prepared.playlists_map.len(), opts)?;
+    check_track_removals(&work.tracks, prepared.tracks_map.len(), opts)?;
+    if !work.tracks.copies.is_empty() {
+        check_missing_files(&prepared.plan, prepared.tracks_map.len(), opts)?;
+    }
+    if !work.playlists.ops.is_empty() {
+        check_takeovers(&prepared.plan, opts)?;
+    }
+    Ok(())
+}
+
+/// Refuses a plan whose new library playlists take over iPod playlists
+/// iprune did not manage and take tracks out of them: those lists exist
+/// nowhere else.
+pub fn check_takeovers(plan: &Plan, opts: Options) -> Result<()> {
+    let names: Vec<String> = plan
+        .takeovers
+        .iter()
+        .filter(|t| t.dropped > 0)
+        .map(|t| format!("{:?} ({} of {} tracks)", t.name, t.dropped, t.before))
+        .collect();
+    if !opts.allow_mass_removal && !names.is_empty() {
+        return Err(Error::PlaylistTakeover(names));
+    }
+    Ok(())
+}
+
 /// Refuses to write a database whose artwork libgpod could not read. A
 /// missing or damaged `ArtworkDB` parses as tracks without thumbnails, and
 /// the write then deletes every `.ithmb` file no thumbnail refers to: all
@@ -394,7 +427,16 @@ struct Writer<'a> {
     conn: &'a Connection,
     mountpoint: &'a Path,
     device: i64,
-    backup: &'a Backup,
+    guid: &'a str,
+    /// The folder of all backups.
+    backups: &'a Path,
+    /// The backup taken before the sync.
+    pre: &'a Backup,
+    /// The backup of the last verified checkpoint, taken before the next
+    /// write; the one before it is deleted (see `checkpoint`).
+    latest: Option<Backup>,
+    /// The snapshot of what the last write put on the iPod.
+    last_written: Option<String>,
     before: &'a Contents,
     pulled: &'a Pulled,
     /// Set once a write reached the iPod: the pull stands from then on.
@@ -405,6 +447,45 @@ struct Writer<'a> {
 }
 
 impl Writer<'_> {
+    /// The backup of what the iPod holds now: the last checkpoint's, or
+    /// the one taken before the sync.
+    fn current(&self) -> &Backup {
+        self.latest.as_ref().unwrap_or(self.pre)
+    }
+
+    /// Before a write after the first: backs up what the iPod holds, the
+    /// last verified checkpoint, with the mappings recorded for it, so a
+    /// failed write can be undone to it rather than to before the sync,
+    /// whose removed files are already deleted. Only the latest is kept.
+    fn checkpoint(&mut self) -> Result<()> {
+        let tracks = devices::track_mappings(self.conn, self.device)?;
+        let playlists = devices::playlist_mappings(self.conn, self.device)?;
+        let mappings = json(&MappingsFile {
+            tracks: &tracks,
+            playlists: &playlists,
+        });
+        let snapshot = self.last_written.clone().unwrap_or_default();
+        let note = format!(
+            "The iPod after a checkpoint of the sync backed up as {}.\n",
+            self.pre.stamp
+        );
+        let b = backup::create(
+            self.backups,
+            self.guid,
+            self.mountpoint,
+            now_unix(),
+            &[
+                ("mappings.json", &mappings),
+                ("snapshot.txt", snapshot.as_bytes()),
+                ("checkpoint.txt", note.as_bytes()),
+            ],
+        )?;
+        if let Some(old) = self.latest.replace(b) {
+            let _ = std::fs::remove_dir_all(&old.dir);
+        }
+        Ok(())
+    }
+
     fn undo(&self, e: Error) -> Error {
         if self.written {
             return e;
@@ -451,6 +532,10 @@ impl Writer<'_> {
         // pulled and the file is in the backup, so it is renamed first.
         let counts = self.mountpoint.join("iPod_Control/iTunes/Play Counts");
         let counts_bak = self.mountpoint.join("iPod_Control/iTunes/Play Counts.bak");
+        if self.written {
+            self.checkpoint()
+                .map_err(|e| Error::CheckpointBackupFailed(e.to_string()))?;
+        }
         let moved = !self.written && counts.is_file();
         if moved {
             std::fs::rename(&counts, &counts_bak).map_err(|source| {
@@ -466,7 +551,7 @@ impl Writer<'_> {
             // of them changed. Only an iPod still equal to the backup gets
             // its `Play Counts` back, and only then is the pull undone;
             // otherwise the pull stands.
-            if !self.written && untouched(self.backup, self.mountpoint) {
+            if !self.written && untouched(self.current(), self.mountpoint) {
                 if !moved || std::fs::rename(&counts_bak, &counts).is_ok() {
                     return Err(self.undo(e.into()));
                 }
@@ -476,7 +561,7 @@ impl Writer<'_> {
             }
             return Err(Error::WriteIncomplete {
                 cause: e.to_string(),
-                stamp: self.backup.stamp.clone(),
+                stamp: self.current().stamp.clone(),
             });
         }
         if !self.written {
@@ -492,7 +577,7 @@ impl Writer<'_> {
         progress(Progress::Verifying);
         let failed = |problems: Vec<String>| Error::Verification {
             problems,
-            stamp: self.backup.stamp.clone(),
+            stamp: self.current().stamp.clone(),
         };
         let reread = gpod::Database::open(self.mountpoint)
             .map_err(|e| failed(vec![format!("the written database cannot be read: {e}")]))?;
@@ -513,10 +598,10 @@ impl Writer<'_> {
         drop(reread);
         // A database the iPod would reject shows no music: one that was
         // signed must still be, with the same scheme.
-        let was = device::signature(&self.backup.dir.join("iTunesDB"))?;
+        let was = device::signature(&self.current().dir.join("iTunesDB"))?;
         let now = device::signature(&device::itunesdb(self.mountpoint))?;
         diffs.extend(device::signature_lost(was, now));
-        if backup::artwork_left_behind(&self.backup.dir, self.mountpoint) {
+        if backup::artwork_left_behind(&self.current().dir, self.mountpoint) {
             diffs.push(
                 "the cover art files were rearranged but ArtworkDB was not rewritten".to_owned(),
             );
@@ -524,6 +609,7 @@ impl Writer<'_> {
         if !diffs.is_empty() {
             return Err(failed(diffs));
         }
+        self.last_written = Some(expected);
         for f in self.doomed.drain(..) {
             if let Err(why) = deletable(&f, self.mountpoint, &used) {
                 self.warnings.push(format!("kept {}: {why}", f.display()));
@@ -656,9 +742,7 @@ pub fn sync(
     }
     let device = devices::device_id(conn, &prepared.guid)?
         .ok_or_else(|| Error::NotAdopted(prepared.guid.clone()))?;
-    check_removals(&work.playlists, prepared.playlists_map.len(), opts)?;
-    check_track_removals(&work.tracks, prepared.tracks_map.len(), opts)?;
-    check_missing_files(&prepared.plan, prepared.tracks_map.len(), opts)?;
+    check_guards(prepared, work, opts)?;
     check_artwork(&db, mountpoint)?;
     if device::signature(&device::itunesdb(mountpoint))?.0 != 0
         && let Some(why) = device::unsigned_reason(mountpoint, prepared.ipod.model.as_deref())
@@ -725,7 +809,11 @@ pub fn sync(
         conn,
         mountpoint,
         device,
-        backup: &backup,
+        guid: &prepared.guid,
+        backups: &backups,
+        pre: &backup,
+        latest: None,
+        last_written: None,
         before: &prepared.ipod,
         pulled: &pulled,
         written: false,
@@ -932,6 +1020,11 @@ pub fn sync(
     db.stop_sync();
     drop(db);
     let (stopped, applied) = result?;
+    // The sync is written and verified: the backup taken before it is the
+    // one to go back to, and a checkpoint's is no longer needed.
+    if let Some(b) = w.latest.take() {
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
 
     // The sync is done; what follows only reports a warning on failure.
     let mut warnings = std::mem::take(&mut w.warnings);

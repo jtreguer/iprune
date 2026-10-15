@@ -70,10 +70,28 @@ pub struct Plan {
     /// Mappings whose iPod track is gone (deleted on the device, or the
     /// database was restored). In scope, the track is copied again.
     pub stale_mappings: Vec<StaleMapping>,
+    /// iPod playlists iprune did not manage that a library playlist of the
+    /// same name takes over, with members it changes.
+    pub takeovers: Vec<Takeover>,
     /// Mapped tracks with plays or skips since the last database write.
     pub stats_to_pull: usize,
     pub space: SpaceCheck,
     pub expected: Expected,
+}
+
+/// A library playlist taking over an iPod playlist iprune did not manage,
+/// matched by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Takeover {
+    pub playlist_id: i64,
+    pub ipod_id: u64,
+    /// The iPod playlist's name.
+    pub name: String,
+    /// Its tracks now.
+    pub before: usize,
+    /// Its tracks the library playlist does not hold, which the sync takes
+    /// out of it.
+    pub dropped: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -636,6 +654,8 @@ pub fn plan(input: &PlanInput) -> Plan {
         .copied()
         .filter(|p| synced(p) && !target.contains_key(&p.id))
         .collect();
+    // Matched by name: iPod playlists iprune did not manage until now.
+    let mut by_name: HashSet<i64> = HashSet::new();
     for key in NAME_PASSES {
         let mut next = Vec::new();
         for p in pending {
@@ -649,6 +669,7 @@ pub fn plan(input: &PlanInput) -> Plan {
                 Some(found) => {
                     claimed.insert(found.id);
                     target.insert(p.id, found);
+                    by_name.insert(p.id);
                 }
                 None => next.push(p),
             }
@@ -720,6 +741,23 @@ pub fn plan(input: &PlanInput) -> Plan {
                 }
                 let current: Vec<Member> =
                     found.members.iter().map(|&d| Member::Track(d)).collect();
+                if current != members && by_name.contains(&p.id) && !found.members.is_empty() {
+                    let kept: HashSet<u64> = members
+                        .iter()
+                        .filter_map(|m| match m {
+                            Member::Track(d) => Some(*d),
+                            _ => None,
+                        })
+                        .collect();
+                    let before: HashSet<u64> = found.members.iter().copied().collect();
+                    plan.takeovers.push(Takeover {
+                        playlist_id: p.id,
+                        ipod_id: found.id,
+                        name: found.name.clone(),
+                        before: found.members.len(),
+                        dropped: before.difference(&kept).count(),
+                    });
+                }
                 if current != members {
                     plan.playlists.push(PlaylistOp::SetMembers {
                         playlist_id: p.id,

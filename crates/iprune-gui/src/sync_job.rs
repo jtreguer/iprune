@@ -103,9 +103,7 @@ pub fn plan(config: &Config, paths: &Paths) -> Result<Planned> {
     let prepared = sync::prepare(store.conn(), config, &db)?;
     let work = exec::full_work(&prepared);
     let opts = exec::Options::default();
-    let mass_removal = exec::check_removals(&work.playlists, prepared.playlists_map.len(), opts)
-        .and_then(|()| exec::check_track_removals(&work.tracks, prepared.tracks_map.len(), opts))
-        .and_then(|()| exec::check_missing_files(&prepared.plan, prepared.tracks_map.len(), opts))
+    let mass_removal = exec::check_guards(&prepared, &work, opts)
         .err()
         .map(|e| e.to_string());
     Ok(Planned {

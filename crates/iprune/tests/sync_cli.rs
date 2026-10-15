@@ -2360,3 +2360,115 @@ fn a_signal_during_restore_or_doctor_fix_does_not_end_it_half_done() {
         "the entry is removed"
     );
 }
+
+// ---- a new playlist taking over an iPod playlist iprune never managed
+// (audit M9)
+
+/// An adopted iPod with Road managed and "Stray" [three, two] only on the
+/// iPod; then a new file Stray.m3u8 holding only one.mp3 appears, which
+/// would take Stray over and drop its two tracks.
+fn with_takeover() -> Sandbox {
+    let sb = Sandbox::new();
+    sb.library(&[
+        ("one.mp3", Kind::Mp3, 1),
+        ("two.m4a", Kind::Aac, 1),
+        ("three.wav", Kind::Wav, 3),
+    ]);
+    let tracks = [
+        sb.spec("one.mp3", u64::MAX - 1, "Title1", "Artist1"),
+        sb.spec("two.m4a", 2, "Title1", "Artist1"),
+        sb.spec("three.wav", 3, "Title3", "Artist3"),
+    ];
+    fake_ipod(
+        &sb.ipod,
+        Some(GUID_SYSINFO),
+        &tracks,
+        &[
+            ipod_playlist("Road", &[u64::MAX - 1, 2]),
+            ipod_playlist("Stray", &[3, 2]),
+        ],
+    );
+    let entry = |f: &str| format!("{}\n", sb.music.join(f).display());
+    fs::write(
+        sb.lists.join("Road.m3u8"),
+        entry("one.mp3") + &entry("two.m4a"),
+    )
+    .unwrap();
+    sb.ok(&["adopt"]);
+    assert_eq!(sb.ipod_playlist("Stray"), Some(vec![3, 2]), "set up");
+    fs::write(sb.lists.join("Stray.m3u8"), entry("one.mp3")).unwrap();
+    sb
+}
+
+#[test]
+fn the_plan_text_names_the_playlist_a_new_file_takes_over() {
+    let sb = with_takeover();
+    let before = sb.tree(&sb.ipod);
+    let o = sb.ok(&["sync", "--plan-only"]);
+    let text = out(&o);
+    let line = text
+        .lines()
+        .find(|l| l.contains("takes over"))
+        .unwrap_or_else(|| panic!("no takeover line: {text}"));
+    assert!(line.contains("Stray") && line.contains('2'), "{line}");
+    assert_eq!(sb.tree(&sb.ipod), before);
+}
+
+#[test]
+fn a_takeover_that_drops_tracks_is_refused_until_allowed() {
+    let sb = with_takeover();
+    let before = sb.tree(&sb.ipod);
+    let o = sb.run(&["sync", "--yes"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("--allow-mass-removal"), "{}", err(&o));
+    assert!(err(&o).contains("Stray"), "{}", err(&o));
+    assert_eq!(sb.tree(&sb.ipod), before, "nothing written");
+    assert!(!sb.backups_dir().exists(), "no backup, so no write began");
+
+    sb.ok(&["sync", "--yes", "--allow-mass-removal"]);
+    assert_eq!(sb.ipod_playlist("Stray"), Some(vec![u64::MAX - 1]));
+    assert_eq!(sb.ipod_playlist("Road"), Some(vec![u64::MAX - 1, 2]));
+}
+
+#[test]
+fn a_takeover_that_only_adds_tracks_needs_no_flag() {
+    let sb = with_takeover();
+    let entry = |f: &str| format!("{}\n", sb.music.join(f).display());
+    fs::write(
+        sb.lists.join("Stray.m3u8"),
+        entry("three.wav") + &entry("two.m4a") + &entry("one.mp3"),
+    )
+    .unwrap();
+    sb.ok(&["sync", "--yes"]);
+    assert_eq!(sb.ipod_playlist("Stray"), Some(vec![3, 2, u64::MAX - 1]));
+}
+
+// Prevents the takeover check blocking doctor's repair, which changes no
+// playlist, because the library has a playlist that would take one over.
+#[test]
+fn doctor_fix_is_not_blocked_by_a_takeover_elsewhere_in_the_plan() {
+    let sb = with_takeover();
+    sb.lose_files([2]); // three.wav's entry has no file
+    let o = sb.ok(&["doctor", "--fix", "--yes"]);
+    assert!(
+        out(&o).contains("removed 1 database entries"),
+        "{}",
+        out(&o)
+    );
+    // Stray was not taken over by the repair.
+    assert_eq!(sb.ipod_playlist("Stray"), Some(vec![2]));
+    let db = gpod::Database::open(&sb.ipod).unwrap();
+    assert!(db.track_by_dbid(3).is_none());
+}
+
+// The refusal comes before the question, so nobody confirms a plan that
+// then fails.
+#[test]
+fn a_takeover_that_drops_tracks_is_refused_before_the_prompt() {
+    let sb = with_takeover();
+    let o = sb.run(&["sync"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("--allow-mass-removal"), "{}", err(&o));
+    assert!(err(&o).contains("Stray"), "{}", err(&o));
+    assert!(!sb.backups_dir().exists());
+}
