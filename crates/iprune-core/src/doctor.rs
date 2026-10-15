@@ -241,13 +241,48 @@ fn too_many(n: usize, tracks: usize) -> bool {
     n > 5 && n * 10 > tracks
 }
 
-/// Deletes the orphan files, after [`check_orphans`]. Returns how many were
-/// deleted.
+/// The folder orphan files are moved to, on the iPod itself: a rename, no
+/// copy. Nothing reads it; deleting it frees the space.
+pub const ORPHANS: &str = "iPod_Control/iprune/orphans";
+
+/// Moves the orphan files, after [`check_orphans`], to
+/// `iPod_Control/iprune/orphans/<stamp>/<folder>/<file>` on the same iPod:
+/// a file the database lost may be music that exists nowhere else. Returns
+/// how many were moved.
 pub fn delete_orphans(report: &Report, tracks: usize, allow_mass_removal: bool) -> Result<usize> {
     check_orphans(report, tracks, allow_mass_removal)?;
-    let n = report.orphan_files.len();
+    // A folder of its own, so a second run in the same second never moves
+    // a file onto an earlier one.
+    let first = crate::backup::stamp(crate::now_unix());
+    let taken = |s: &str| {
+        report.orphan_files.iter().any(|f| {
+            f.ancestors()
+                .nth(4)
+                .is_some_and(|ipod| ipod.join(ORPHANS).join(s).exists())
+        })
+    };
+    let stamp = (1..)
+        .map(|k| match k {
+            1 => first.clone(),
+            k => format!("{first}-{k}"),
+        })
+        .find(|s| !taken(s))
+        .expect("a free name");
+    let mut n = 0;
     for f in &report.orphan_files {
-        std::fs::remove_file(f).at(f)?;
+        // `<mountpoint>/iPod_Control/Music/<folder>/<file>`.
+        let (Some(folder), Some(name), Some(ipod)) = (
+            f.parent().and_then(Path::file_name),
+            f.file_name(),
+            f.ancestors().nth(4),
+        ) else {
+            continue;
+        };
+        let dir = ipod.join(ORPHANS).join(&stamp).join(folder);
+        std::fs::create_dir_all(&dir).at(&dir)?;
+        let to = dir.join(name);
+        std::fs::rename(f, &to).at(&to)?;
+        n += 1;
     }
     Ok(n)
 }

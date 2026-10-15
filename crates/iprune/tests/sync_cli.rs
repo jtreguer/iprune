@@ -975,11 +975,46 @@ impl Sandbox {
                 let f = self
                     .ipod
                     .join(format!("iPod_Control/Music/F20/LOST{i}.mp3"));
-                fs::write(&f, b"x").unwrap();
+                fs::write(&f, orphan_bytes(&f)).unwrap();
                 f
             })
             .collect()
     }
+
+    /// The quarantine folders (one per `doctor --fix` that moved something).
+    fn orphan_stamps(&self) -> Vec<PathBuf> {
+        let mut v: Vec<_> = fs::read_dir(self.ipod.join(iprune_core::doctor::ORPHANS))
+            .into_iter()
+            .flatten()
+            .map(|e| e.unwrap().path())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The orphans are gone from Music and sit, with their own bytes, under
+    /// exactly one stamp folder, in the folder they came from.
+    fn assert_quarantined(&self, orphans: &[PathBuf]) {
+        let stamps = self.orphan_stamps();
+        assert_eq!(stamps.len(), 1, "{stamps:?}");
+        for f in orphans {
+            assert!(!f.exists(), "{} was left in Music", f.display());
+            let moved = stamps[0].join("F20").join(f.file_name().unwrap());
+            assert_eq!(
+                fs::read(&moved).unwrap_or_else(|e| panic!("{}: {e}", moved.display())),
+                orphan_bytes(f),
+                "{}",
+                moved.display()
+            );
+        }
+        let held: Vec<_> = fs::read_dir(stamps[0].join("F20")).unwrap().collect();
+        assert_eq!(held.len(), orphans.len(), "nothing else was moved");
+    }
+}
+
+/// Distinct, recognisable bytes for each orphan.
+fn orphan_bytes(f: &Path) -> Vec<u8> {
+    format!("lost music {}", f.file_name().unwrap().to_string_lossy()).into_bytes()
 }
 
 #[test]
@@ -1032,7 +1067,8 @@ fn doctor_fix_repairs_the_entries_the_orphans_and_keeps_the_playlist_mappings() 
     let o = sb.ok(&["doctor", "--fix", "--yes"]);
     let text = out(&o);
     assert!(text.contains("removed 1 database entries"), "{text}");
-    assert!(text.contains("deleted 2 orphan files"), "{text}");
+    assert!(text.contains("moved 2 orphan files"), "{text}");
+    assert!(text.contains("iPod_Control/iprune/orphans"), "{text}");
 
     let db = gpod::Database::open(&sb.ipod).unwrap();
     assert!(
@@ -1041,9 +1077,7 @@ fn doctor_fix_repairs_the_entries_the_orphans_and_keeps_the_playlist_mappings() 
     );
     assert!(db.track_by_dbid(2).is_some() && db.track_by_dbid(u64::MAX - 1).is_some());
     drop(db);
-    for f in orphans {
-        assert!(!f.exists(), "{}", f.display());
-    }
+    sb.assert_quarantined(&orphans);
     // The two files that belong to entries are still there.
     assert!(sb.ipod.join("iPod_Control/Music/F00/T0000.mp3").is_file());
     assert!(sb.ipod.join("iPod_Control/Music/F01/T0001.mp3").is_file());
@@ -1067,8 +1101,8 @@ fn doctor_fix_deletes_orphans_after_its_own_sync_and_leaves_the_lock_free() {
     sb.lose_files([2]); // track 3 has no file: a sync runs, then the orphans go
     let orphans = sb.orphans(2);
     let o = sb.ok(&["doctor", "--fix", "--yes"]);
-    assert!(out(&o).contains("deleted 2 orphan files"), "{}", out(&o));
-    assert!(orphans.iter().all(|f| !f.exists()));
+    assert!(out(&o).contains("moved 2 orphan files"), "{}", out(&o));
+    sb.assert_quarantined(&orphans);
     drop(sb.hold_ipod_lock());
 }
 
@@ -1087,7 +1121,8 @@ fn doctor_fix_will_not_delete_orphans_while_the_ipod_lock_is_held() {
 
     drop(lock);
     let o = sb.ok(&["doctor", "--fix", "--yes"]);
-    assert!(out(&o).contains("deleted 2 orphan files"), "{}", out(&o));
+    assert!(out(&o).contains("moved 2 orphan files"), "{}", out(&o));
+    sb.assert_quarantined(&orphans);
 }
 
 #[test]
@@ -1098,11 +1133,36 @@ fn many_orphans_are_refused_until_allowed() {
     let o = sb.run(&["doctor", "--fix", "--yes"]);
     assert_code(&o, 1);
     assert!(err(&o).contains("--allow-mass-removal"), "{}", err(&o));
-    assert_eq!(sb.tree(&sb.ipod), before, "nothing deleted");
+    assert_eq!(sb.tree(&sb.ipod), before, "nothing moved");
+    assert!(sb.orphan_stamps().is_empty());
 
     let o = sb.ok(&["doctor", "--fix", "--yes", "--allow-mass-removal"]);
-    assert!(out(&o).contains("deleted 6 orphan files"), "{}", out(&o));
-    assert!(orphans.iter().all(|f| !f.exists()));
+    assert!(out(&o).contains("moved 6 orphan files"), "{}", out(&o));
+    sb.assert_quarantined(&orphans);
+}
+
+// Prevents (audit L16) doctor reporting the files it set aside as orphans
+// again, and so moving them over and over.
+#[test]
+fn a_second_doctor_run_does_not_report_the_quarantined_files() {
+    let sb = adopted();
+    let orphans = sb.orphans(2);
+    sb.ok(&["doctor", "--fix", "--yes"]);
+    let kept = sb.tree(&sb.ipod.join(iprune_core::doctor::ORPHANS));
+
+    let o = sb.ok(&["doctor"]);
+    assert!(out(&o).contains("nothing to repair"), "{}", out(&o));
+    assert!(!out(&o).contains("LOST"), "{}", out(&o));
+    let o = sb.ok(&["doctor", "--fix", "--yes"]);
+    assert!(!out(&o).contains("moved"), "{}", out(&o));
+    assert_eq!(
+        sb.tree(&sb.ipod.join(iprune_core::doctor::ORPHANS)),
+        kept,
+        "the quarantine is as it was"
+    );
+    // And what was set aside is all there still.
+    assert_eq!(kept.len(), 2);
+    sb.assert_quarantined(&orphans);
 }
 
 // Prevents a mass-orphan refusal coming after the database repair: with
@@ -1171,6 +1231,53 @@ fn adopted_with_extras(extra: usize) -> Sandbox {
     sb
 }
 
+// Prevents (audit L19) a test run finding the real iPod through the mounts:
+// with `device.mountpoint` empty and IPRUNE_NO_DETECT set (cargo's config),
+// every command that needs the iPod says detection is off and does nothing.
+#[test]
+fn an_empty_mountpoint_gives_the_detection_off_error_and_never_an_ipod() {
+    assert!(
+        std::env::var_os("IPRUNE_NO_DETECT").is_some(),
+        "run through cargo (.cargo/config.toml): this test must not scan the mounts"
+    );
+    let sb = Sandbox::new();
+    sb.ok(&[
+        "init",
+        "--library",
+        sb.music.to_str().unwrap(),
+        "--playlists",
+        sb.lists.to_str().unwrap(),
+    ]);
+    let cfg = fs::read_to_string(sb.base().join("config/iprune/config.toml")).unwrap();
+    assert!(cfg.contains("mountpoint = \"\""), "set up: {cfg}");
+    let before = sb.tree(&sb.base());
+    for args in [
+        &["doctor"][..],
+        &["sync", "--plan-only"],
+        &["sync", "--yes"],
+        &["adopt"],
+        &["eject"],
+    ] {
+        let o = sb.run(args);
+        assert_code(&o, 1);
+        let e = err(&o);
+        assert!(e.contains("IPRUNE_NO_DETECT"), "{args:?}: {e}");
+        assert!(!e.contains("several iPods"), "{args:?}: {e}");
+    }
+    // Nothing was created (no plan, backup or stray file); only the index
+    // database, which a scan may touch, differs.
+    assert!(!sb.plan_json().exists());
+    assert!(sb.stamps().is_empty());
+    let after = sb.tree(&sb.base());
+    let changed: Vec<_> = after
+        .iter()
+        .filter(|(k, v)| before.get(*k) != Some(*v))
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .filter(|k| !k.starts_with("data/iprune/iprune.sqlite"))
+        .collect();
+    assert!(changed.is_empty(), "{changed:?}");
+}
+
 // Prevents `doctor --fix` removing most of the database because the music
 // folder looked empty: refused before any prompt, backup or write.
 #[test]
@@ -1206,6 +1313,55 @@ fn many_missing_entries_are_refused_until_allowed() {
     drop(db);
     assert_eq!(sb.stamps().len(), 1, "a backup was taken");
     assert_eq!(sb.mappings().0, 3, "managed tracks keep their mappings");
+}
+
+// Prevents (audit L5) `sync.remove_unmanaged` deleting most of the iPod, with
+// their statistics unpulled, without the flag that guards mass removals.
+#[test]
+fn removing_many_unmanaged_tracks_is_refused_unless_allowed() {
+    let sb = adopted_with_extras(6); // 9 tracks, 6 of them unmanaged
+    sb.edit_config("remove_unmanaged = false", "remove_unmanaged = true");
+    let before = sb.tree(&sb.ipod);
+    let mappings_before = sb.mappings();
+    let o = sb.run(&["sync", "--yes"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("--allow-mass-removal"), "{}", err(&o));
+    assert!(err(&o).contains("not manage"), "{}", err(&o));
+    assert_eq!(sb.tree(&sb.ipod), before, "iTunesDB and files untouched");
+    assert!(sb.stamps().is_empty(), "no backup, so no write began");
+    assert_eq!(sb.mappings(), mappings_before);
+    let db = gpod::Database::open(&sb.ipod).unwrap();
+    assert!((0..6).all(|k| db.track_by_dbid(100 + k).is_some()));
+    drop(db);
+
+    sb.ok(&["sync", "--yes", "--allow-mass-removal"]);
+    let db = gpod::Database::open(&sb.ipod).unwrap();
+    assert!((0..6).all(|k| db.track_by_dbid(100 + k).is_none()));
+    assert!(
+        [u64::MAX - 1, 2, 3]
+            .iter()
+            .all(|d| db.track_by_dbid(*d).is_some())
+    );
+}
+
+// Five unmanaged removals is the most that pass without the flag.
+#[test]
+fn removing_five_unmanaged_tracks_needs_no_flag() {
+    let sb = adopted_with_extras(5);
+    sb.edit_config("remove_unmanaged = false", "remove_unmanaged = true");
+    sb.ok(&["sync", "--yes"]);
+    let db = gpod::Database::open(&sb.ipod).unwrap();
+    assert!((0..5).all(|k| db.track_by_dbid(100 + k).is_none()));
+    assert_eq!(db.track_count(), 3);
+}
+
+// Without remove_unmanaged the extras are kept, however many there are.
+#[test]
+fn many_unmanaged_tracks_are_kept_when_remove_unmanaged_is_off() {
+    let sb = adopted_with_extras(8);
+    let o = sb.ok(&["sync", "--yes"]);
+    assert!(!err(&o).contains("--allow-mass-removal"), "{}", err(&o));
+    assert_eq!(gpod::Database::open(&sb.ipod).unwrap().track_count(), 11);
 }
 
 // Five missing entries is the largest number that passes without the flag.
@@ -1964,8 +2120,13 @@ const NEW: usize = 24;
 
 /// The adopted world (3 tracks) plus `NEW` new wav files, all to be copied.
 fn with_new_files() -> Sandbox {
+    with_new_files_n(NEW)
+}
+
+/// [`with_new_files`] with `n` new files.
+fn with_new_files_n(n: usize) -> Sandbox {
     let sb = adopted();
-    for i in 0..NEW {
+    for i in 0..n {
         fs::copy(
             common::fixture_secs(Kind::Wav, 10 + i as u32, 10),
             sb.music.join(format!("new{i:02}.wav")),
@@ -1980,11 +2141,16 @@ fn with_new_files() -> Sandbox {
 /// recorded and verified, and that the next sync copies the rest. Returns the
 /// number of copies made before the stop.
 fn assert_stopped_then_continued(sb: &Sandbox, o: &Output, ctx: &str) -> usize {
+    assert_stopped_then_continued_of(sb, o, ctx, NEW)
+}
+
+/// [`assert_stopped_then_continued`] for a sync of `new` copies.
+fn assert_stopped_then_continued_of(sb: &Sandbox, o: &Output, ctx: &str, new: usize) -> usize {
     assert_code(o, 1);
     assert!(err(o).contains("stopped early"), "{ctx}: {}", err(o));
     assert!(out(o).contains("verified"), "{ctx}: {}", out(o));
     let done = sb.music_files().len() - 3;
-    assert!(done < NEW, "{ctx}: nothing was stopped, all {done} copied");
+    assert!(done < new, "{ctx}: nothing was stopped, all {done} copied");
     assert_eq!(sb.stamps().len(), 1, "{ctx}: a backup, so a checkpoint");
     // Every copy is in the database with its file, and mapped: the next
     // plan holds exactly the rest.
@@ -1995,22 +2161,22 @@ fn assert_stopped_then_continued(sb: &Sandbox, o: &Output, ctx: &str) -> usize {
     let plan: serde_json::Value = serde_json::from_str(&out(&plan)).unwrap();
     assert_eq!(
         plan["copy"].as_array().map(Vec::len).unwrap_or(0),
-        NEW - done,
+        new - done,
         "{ctx}: {plan}"
     );
 
     let o = sb.ok(&["sync", "--yes"]);
     assert!(
-        out(&o).contains(&format!("copied {} tracks", NEW - done)),
+        out(&o).contains(&format!("copied {} tracks", new - done)),
         "{ctx}: {}",
         out(&o)
     );
     assert_eq!(
         gpod::Database::open(&sb.ipod).unwrap().track_count(),
-        3 + NEW,
+        3 + new,
         "{ctx}"
     );
-    assert_eq!(sb.music_files().len(), 3 + NEW, "{ctx}");
+    assert_eq!(sb.music_files().len(), 3 + new, "{ctx}");
     assert!(out(&sb.ok(&["sync", "--yes"])).contains("Nothing to apply"));
     done
 }
@@ -2036,10 +2202,14 @@ fn sigterm_and_sighup_once_a_sync_applies_stop_it_cleanly_and_the_next_sync_cont
 
 // The same stop, with the signal sent from outside once the first copy is on
 // the iPod: a stop after at least one copy, so the checkpoint holds copies.
+// The signal is sent by a polling thread, so how many copies land before it
+// does depends on the machine's load; with a hundred copies behind the first
+// it lands before the end even when that thread is starved for a while.
 #[test]
 fn a_signal_after_the_first_copy_keeps_the_copies_made_and_the_next_sync_finishes() {
+    const MANY: usize = 100;
     for signal in ["TERM", "HUP"] {
-        let sb = with_new_files();
+        let sb = with_new_files_n(MANY);
         let before = sb.music_files().len();
         let child = sb
             .command(&["sync", "--yes"])
@@ -2067,7 +2237,7 @@ fn a_signal_after_the_first_copy_keeps_the_copies_made_and_the_next_sync_finishe
         let o = child.wait_with_output().unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         poller.join().unwrap();
-        let done = assert_stopped_then_continued(&sb, &o, signal);
+        let done = assert_stopped_then_continued_of(&sb, &o, signal, MANY);
         assert!(done >= 1, "{signal}: the signal came after a copy");
     }
 }

@@ -349,10 +349,18 @@ existing mappings.
 
 ## 8. Playlists
 
-- Read: UTF-8, `#EXTM3U` header optional, `#EXTINF` lines ignored on read,
-  other `#` lines ignored, blank lines skipped. Relative entries resolve
-  against the playlist's folder. Paths are NFC normalized before lookup.
-- Write: always `#EXTM3U`, then `#EXTINF:<seconds>,<artist> - <title>` and
+- Read: UTF-8, `#EXTM3U` header optional, lines ending in LF, CRLF or a
+  lone CR, blank lines skipped. Each entry keeps its `#EXTINF` line. The
+  other `#` lines (`#PLAYLIST`, `#EXTGRP`, comments) are kept where they are
+  in the file whatever an edit does to the entries: those before the n-th
+  entry stay before the n-th, the others at the end, and a file with no
+  entry keeps them after the header. No line is lost, but a line meant for
+  one track (`#EXTVLCOPT`, `#EXTGRP`) can end up next to another after a
+  move or a removal. An `#EXTINF` stays with its location across other `#`
+  lines between them. Relative entries resolve against the
+  playlist's folder. Paths are NFC normalized before lookup.
+- Write: always `#EXTM3U`, each entry's other `#` lines as they were, then
+  `#EXTINF:<seconds>,<artist> - <title>` and
   the path for each entry, LF line endings. Written to a temporary file in the
   same folder, `fsync`ed, then renamed over the original.
 - External edits are detected by `mtime`. Every edit records the file's mtime
@@ -772,9 +780,16 @@ checkpoint, that write is not made and the checkpoint stands. Playlists and tag
 updates are then left for the next sync, which plans them again. A plan
 whose copies do not fit is refused before anything is written, and so is
 one removing more than five managed tracks when that is more than a tenth
-of them, unless `--allow-mass-removal` is given.
+of them, or more than five tracks iprune does not manage
+(`remove_unmanaged`) when that is more than a tenth of the iPod's tracks,
+unless `--allow-mass-removal` is given (`exec::check_guards`).
 
 ### 11.3 Pre-write checks
+
+The file of each track copied or copied again must exist and have the
+library file's size, or the write is not made: a USB error can leave a
+short file, and the old file of a replaced track would be deleted on its
+strength.
 
 `verify::check`, on the in-memory database after the changes, against an
 `Expect` of what was meant to change:
@@ -869,14 +884,17 @@ older than a sync that removed many tracks it is expected, and the flag is
 the way through. Ratings pulled from the
 replaced database are overwritten by the restored database's own on the
 next sync. Files added after the backup become orphans
-until `doctor --fix` deletes them.
+until `doctor --fix` moves them aside.
 
 ## 12. Doctor
 
 `iprune doctor [--fix] [--yes] [--allow-mass-removal]` reports, and with
 `--fix` repairs (asking first):
 
-- files under `iPod_Control/Music` with no database entry (delete),
+- files under `iPod_Control/Music` with no database entry (moved to
+  `iPod_Control/iprune/orphans/<stamp>/` on the iPod, by rename: a file the
+  database lost may be music that exists nowhere else; deleting that folder
+  frees the space),
 - database entries whose file is missing (remove entry),
 - database entries whose iPod path is not a plain path under the iPod
   (`..`, empty parts): reported only, never repaired, so nothing is
@@ -890,7 +908,7 @@ until `doctor --fix` deletes them.
 
 Database entries are removed through the sync's executor (statistics pull,
 backup, checks, write, verification), with the playlist mappings left as
-they are. Orphan files are deleted after that. More than five orphans that
+they are. Orphan files are moved aside after that. More than five orphans that
 are over a tenth of the iPod's tracks more likely mean a damaged database
 than leftovers (restoring a backup is the better answer), and as many
 entries without a file more likely mean an unreadable music folder than lost
@@ -1050,6 +1068,11 @@ the running one's window to the front.
 
 Property test with `proptest`: random library and playlist edits, plan,
 apply to a fake iPod, plan again; the second plan is always empty.
+
+Everything cargo runs has `IPRUNE_NO_DETECT=1` (`.cargo/config.toml`): iPod
+detection refuses, so no test can find the real iPod through the mounts.
+Every test names its fake iPod in `device.mountpoint`. `cargo run` needs a
+mountpoint set too; the installed binaries are not affected.
 
 ## 17. Milestones
 

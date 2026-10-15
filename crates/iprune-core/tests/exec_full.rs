@@ -736,6 +736,9 @@ fn a_few_removals_pass_the_guard_even_when_they_are_most_of_the_tracks() {
     assert_eq!(out.removed, 5);
 }
 
+// One unmanaged removal among four tracks is under both guards' thresholds
+// (the managed one, and the unmanaged one of audit L5: over five and over a
+// tenth), so it goes through unasked.
 #[test]
 fn removing_unmanaged_tracks_on_request_is_not_held_by_the_managed_guard() {
     let mut w = World::new(3);
@@ -746,6 +749,245 @@ fn removing_unmanaged_tracks_on_request_is_not_held_by_the_managed_guard() {
     assert!(w.track(ORPHAN).is_none());
     assert!(!orphan_file.exists());
     assert_eq!(w.mapping().len(), 3, "managed mappings are untouched");
+}
+
+// Prevents (audit L5) the unmanaged removals escaping every mass-removal
+// guard: more than five and more than a tenth of ALL the iPod's tracks is
+// refused; exactly five, or exactly a tenth, is not.
+#[test]
+fn unmanaged_removals_are_refused_over_five_and_over_a_tenth_of_the_ipod() {
+    use iprune_core::transfer::{Remove, TrackWork};
+    let work = |unmanaged: usize, managed: usize| TrackWork {
+        removes: (0..unmanaged)
+            .map(|i| Remove {
+                dbid: 0x7000 + i as u64,
+                track_id: None,
+                size: 1,
+            })
+            .chain((0..managed).map(|i| Remove {
+                dbid: 0x8000 + i as u64,
+                track_id: Some(i as i64),
+                size: 1,
+            }))
+            .collect(),
+        ..TrackWork::default()
+    };
+    let strict = Options::default();
+    let refused = |w: &TrackWork, on_ipod: usize, o: Options| {
+        matches!(
+            exec::check_unmanaged_removals(w, on_ipod, o),
+            Err(Error::MassUnmanagedRemoval { .. })
+        )
+    };
+    // Over five and over a tenth.
+    let e = exec::check_unmanaged_removals(&work(6, 0), 10, strict).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            Error::MassUnmanagedRemoval {
+                removes: 6,
+                on_ipod: 10
+            }
+        ),
+        "{e}"
+    );
+    // Five of five: not over five.
+    assert!(!refused(&work(5, 0), 5, strict));
+    // Six of sixty: exactly a tenth; six of fifty-nine is over it.
+    assert!(!refused(&work(6, 0), 60, strict));
+    assert!(refused(&work(6, 0), 59, strict));
+    // The flag lifts it.
+    let allow = Options {
+        allow_mass_removal: true,
+    };
+    assert!(!refused(&work(6, 0), 10, allow));
+    // Managed removals are the other guard's: they do not count here, and
+    // do not hide unmanaged ones either.
+    assert!(!refused(&work(0, 9), 10, strict));
+    assert!(!refused(&work(5, 9), 14, strict));
+    assert!(refused(&work(6, 9), 15, strict));
+    assert!(!refused(&TrackWork::default(), 0, strict));
+}
+
+// The refusal reaches `check_guards` (and so a sync and the window), counted
+// against every track on the iPod, before anything is written.
+#[test]
+fn check_guards_refuses_many_unmanaged_removals() {
+    let mut w = World::new(2);
+    w.env.cfg.sync.remove_unmanaged = true;
+    // Leave the unmanaged Orphan + five more: six, of eight.
+    let mut db = w.open();
+    for k in 0..5u64 {
+        let fields = gpod::TrackFields {
+            title: Some(format!("Extra{k}")),
+            ..Default::default()
+        };
+        let audio = gpod::AudioFields {
+            size: 10,
+            tracklen: 1000,
+            bitrate: 128,
+            samplerate: 44100,
+            filetype: "MPEG audio file".into(),
+            time_added: 0,
+            time_modified: 0,
+        };
+        db.add_track(0x5000 + k, &fields, &audio).unwrap();
+    }
+    db.write().unwrap();
+    drop(db);
+    w.reload();
+    let p = w.prepare();
+    let work = exec::full_work(&p);
+    assert_eq!(work.tracks.removes.len(), 6, "{:?}", work.tracks.removes);
+    assert!(matches!(
+        exec::check_guards(&p, &work, Options::default()).unwrap_err(),
+        Error::MassUnmanagedRemoval {
+            removes: 6,
+            on_ipod: 8
+        }
+    ));
+    exec::check_guards(
+        &p,
+        &work,
+        Options {
+            allow_mass_removal: true,
+        },
+    )
+    .unwrap();
+}
+
+// ---- the copy is checked before the write (audit L22)
+
+/// Every file under the iPod's Music folder.
+fn music_files(w: &World) -> std::collections::BTreeSet<PathBuf> {
+    tree(&w.root.join("iPod_Control/Music"))
+        .into_keys()
+        .collect()
+}
+
+/// Runs the plan, cutting each file that appeared under Music in half once
+/// the last copy is done: the iPod's USB link losing the end of the write.
+/// (`Progress::Writing` comes after the checks, so too late for this; the
+/// closing `Copying` event, with no name, comes before them.)
+fn run_with_short_copies(w: &World, p: &Prepared, work: &FullWork) -> iprune_core::Result<Outcome> {
+    let known = music_files(w);
+    let cut = |e: Progress| {
+        if let Progress::Copying { name, .. } = &e
+            && name.is_empty()
+        {
+            for f in music_files(w).difference(&known) {
+                let path = w.root.join("iPod_Control/Music").join(f);
+                let len = fs::metadata(&path).unwrap().len();
+                assert!(len > 1, "set up: a real copy");
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(len / 2)
+                    .unwrap();
+            }
+        }
+    };
+    w.run(p, work, Options::default(), &cut, &AtomicBool::new(false))
+}
+
+// Prevents (audit L22) a short file on the iPod being written into the
+// database as a good track (and, for a replaced track, the old file being
+// deleted on its strength). A copy cut short is a PreWriteCheck problem
+// naming both sizes; the database, the statistics pull and the mappings are
+// as before, and the next sync copies it again.
+#[test]
+fn a_new_track_whose_file_is_short_is_a_prewrite_problem_and_nothing_is_written() {
+    let mut w = World::new(3);
+    let new = w.add_new("fresh.mp3", Kind::Mp3, 7);
+    let want = fs::metadata(&new).unwrap().len();
+    w.write_play_counts(&[
+        (3, 1_700_000_000, 80, 1),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+    ]);
+    let p = w.prepare();
+    let work = exec::full_work(&p);
+    assert_eq!(work.tracks.copies.len(), 1);
+    let db_before = fs::read(w.root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+    let counts_before = fs::read(w.root.join("iPod_Control/iTunes/Play Counts")).unwrap();
+    let music_before = music_files(&w);
+    let mapping_before = w.mapping();
+
+    let e = run_with_short_copies(&w, &p, &work).unwrap_err();
+    let Error::PreWriteCheck(problems) = &e else {
+        panic!("expected PreWriteCheck, got {e}");
+    };
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains(&(want / 2).to_string()) && problems[0].contains(&want.to_string()),
+        "both sizes are named: {problems:?}"
+    );
+    // Nothing written: the database and Play Counts are as they were, the
+    // pull is undone, and no mapping was recorded.
+    assert_eq!(
+        fs::read(w.root.join("iPod_Control/iTunes/iTunesDB")).unwrap(),
+        db_before
+    );
+    assert_eq!(
+        fs::read(w.root.join("iPod_Control/iTunes/Play Counts")).unwrap(),
+        counts_before
+    );
+    assert_eq!(w.stats_total_plays(), 0, "the pull is undone");
+    assert_eq!(w.pending_pulls(), 0);
+    assert_eq!(w.mapping(), mapping_before);
+    assert_eq!(w.contents().tracks.len(), 4);
+    // Only the cut file is new on the iPod.
+    assert_eq!(music_files(&w).difference(&music_before).count(), 1);
+
+    // The next sync copies the track again, whole.
+    let out = w.sync().unwrap();
+    assert_eq!(out.copied, 1);
+    let id = w.id_of(&new);
+    let file = w.file_of(w.mapping()[&id]);
+    assert_eq!(fs::metadata(file).unwrap().len(), want);
+    assert_eq!(w.stats_total_plays(), 3, "the plays are pulled once");
+}
+
+// The same for new audio replacing a track's: the old file is not deleted and
+// the track keeps pointing at it.
+#[test]
+fn a_replacement_whose_file_is_short_keeps_the_old_file_and_the_old_entry() {
+    let mut w = World::new(3);
+    let src = w.files[2].clone();
+    fs::copy(fixture_secs(Kind::Mp3, 3, 3), &src).unwrap();
+    w.rescan();
+    let want = fs::metadata(&src).unwrap().len();
+    let old_file = w.file_of(dbid(3));
+    let old_bytes = fs::read(&old_file).unwrap();
+    let p = w.prepare();
+    let work = exec::full_work(&p);
+    assert_eq!(work.tracks.copies.len(), 1);
+    assert!(work.tracks.copies[0].replace, "set up: a replacement");
+    let db_before = fs::read(w.root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+
+    let e = run_with_short_copies(&w, &p, &work).unwrap_err();
+    let Error::PreWriteCheck(problems) = &e else {
+        panic!("expected PreWriteCheck, got {e}");
+    };
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains(&want.to_string()), "{problems:?}");
+    assert_eq!(
+        fs::read(w.root.join("iPod_Control/iTunes/iTunesDB")).unwrap(),
+        db_before
+    );
+    assert_eq!(
+        fs::read(&old_file).unwrap(),
+        old_bytes,
+        "the old file stays"
+    );
+    assert_eq!(w.file_of(dbid(3)), old_file, "the track still points at it");
+
+    // Once a whole copy is made the track has the new audio.
+    let out = w.sync().unwrap();
+    assert_eq!(out.recopied, 1);
+    assert_eq!(fs::metadata(w.file_of(dbid(3))).unwrap().len(), want);
 }
 
 // ---- new audio
@@ -2766,14 +3008,23 @@ mod doctor_tests {
     }
 
     #[test]
-    fn orphans_are_deleted_unless_there_are_many_compared_with_the_tracks() {
+    fn orphans_are_moved_aside_unless_there_are_many_compared_with_the_tracks() {
+        // A fake iPod: only the Music layout matters to the move.
         let dir = tempfile::tempdir().unwrap();
+        let ipod = dir.path();
+        let folder = ipod.join("iPod_Control/Music/F07");
+        fs::create_dir_all(&folder).unwrap();
+        let content = |n: usize, i: usize| format!("bytes of orphan {n}-{i}").into_bytes();
+        let round = std::cell::Cell::new(0);
         let make = |n: usize| -> Report {
+            round.set(round.get() + 1);
             Report {
                 orphan_files: (0..n)
                     .map(|i| {
-                        let f = dir.path().join(format!("o{n}-{i}.mp3"));
-                        fs::write(&f, b"x").unwrap();
+                        // Names differ per round: two moves in the same
+                        // second share a stamp folder.
+                        let f = folder.join(format!("o{n}-{i}-r{}.mp3", round.get()));
+                        fs::write(&f, content(n, i)).unwrap();
                         f
                     })
                     .collect(),
@@ -2781,6 +3032,27 @@ mod doctor_tests {
             }
         };
         let gone = |r: &Report| r.orphan_files.iter().filter(|f| !f.exists()).count();
+        // Every file under the quarantine folder, by name, with its bytes and
+        // the folder it sits in relative to the stamp.
+        let quarantined = || -> Vec<(String, String, Vec<u8>)> {
+            let mut out = Vec::new();
+            let root = ipod.join(doctor::ORPHANS);
+            for stamp in fs::read_dir(&root).into_iter().flatten() {
+                for fold in fs::read_dir(stamp.unwrap().path()).unwrap() {
+                    let fold = fold.unwrap().path();
+                    for f in fs::read_dir(&fold).unwrap() {
+                        let f = f.unwrap().path();
+                        out.push((
+                            fold.file_name().unwrap().to_string_lossy().into_owned(),
+                            f.file_name().unwrap().to_string_lossy().into_owned(),
+                            fs::read(&f).unwrap(),
+                        ));
+                    }
+                }
+            }
+            out.sort();
+            out
+        };
         // Six orphans among ten tracks: over five and over a tenth.
         let r = make(6);
         let e = doctor::delete_orphans(&r, 10, false).unwrap_err();
@@ -2794,23 +3066,124 @@ mod doctor_tests {
             ),
             "{e}"
         );
-        assert_eq!(gone(&r), 0, "nothing deleted when refused");
-        // Allowed, they all go.
+        assert_eq!(gone(&r), 0, "nothing moved when refused");
+        assert!(!ipod.join(doctor::ORPHANS).exists(), "no folder made");
+        // Allowed, they all move, keeping their bytes and their folder name.
         assert_eq!(doctor::delete_orphans(&r, 10, true).unwrap(), 6);
         assert_eq!(gone(&r), 6);
+        let want: Vec<_> = (0..6)
+            .map(|i| ("F07".to_owned(), format!("o6-{i}-r1.mp3"), content(6, i)))
+            .collect();
+        assert_eq!(quarantined(), want);
         // Six among a hundred: under a tenth.
         let r = make(7);
         assert_eq!(doctor::delete_orphans(&r, 100, false).unwrap(), 7);
+        assert_eq!(gone(&r), 7);
         // Five among two: not over five.
         let r = make(5);
         assert_eq!(doctor::delete_orphans(&r, 2, false).unwrap(), 5);
+        assert_eq!(gone(&r), 5);
         // Exactly a tenth is not over it.
         let r = make(6);
         assert_eq!(doctor::delete_orphans(&r, 60, false).unwrap(), 6);
+        assert_eq!(gone(&r), 6);
+        assert_eq!(quarantined().len(), 6 + 7 + 5 + 6, "none lost on the way");
         assert_eq!(
             doctor::delete_orphans(&Report::default(), 0, false).unwrap(),
             0
         );
+    }
+
+    // Prevents (audit L16) orphan files being deleted outright, and the
+    // files set aside being reported (and moved again) by the next run.
+    #[test]
+    fn moved_orphans_keep_their_bytes_and_are_not_orphans_again() {
+        let w = World::new(3);
+        fs::write(music(&w, "F05/LOST.mp3"), b"lost one").unwrap();
+        fs::write(music(&w, "F49/also lost.m4a"), b"lost two").unwrap();
+        let used = w.file_of(dbid(2));
+        let used_bytes = fs::read(&used).unwrap();
+        let r = examine(&w);
+        assert_eq!(r.orphan_files.len(), 2, "{r:?}");
+
+        let tracks = w.contents().tracks.len();
+        assert_eq!(doctor::delete_orphans(&r, tracks, false).unwrap(), 2);
+
+        assert!(!music(&w, "F05/LOST.mp3").exists());
+        assert!(!music(&w, "F49/also lost.m4a").exists());
+        let stamps: Vec<_> = fs::read_dir(w.root.join(doctor::ORPHANS))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(stamps.len(), 1, "{stamps:?}");
+        assert_eq!(
+            fs::read(stamps[0].join("F05/LOST.mp3")).unwrap(),
+            b"lost one"
+        );
+        assert_eq!(
+            fs::read(stamps[0].join("F49/also lost.m4a")).unwrap(),
+            b"lost two"
+        );
+        // A file a track uses is not touched.
+        assert_eq!(fs::read(&used).unwrap(), used_bytes);
+        // And the next run finds nothing more to move.
+        let again = examine(&w);
+        assert!(again.orphan_files.is_empty(), "{again:?}");
+        assert_eq!(doctor::delete_orphans(&again, tracks, false).unwrap(), 0);
+        assert_eq!(
+            fs::read_dir(w.root.join(doctor::ORPHANS)).unwrap().count(),
+            1
+        );
+    }
+
+    // Prevents (audit L16) two moves in the same second sharing a folder, the
+    // second renaming over the first's file of the same name.
+    #[test]
+    fn moves_in_the_same_second_go_to_different_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let ipod = dir.path();
+        let folder = ipod.join("iPod_Control/Music/F07");
+        fs::create_dir_all(&folder).unwrap();
+        const ROUNDS: usize = 20; // well inside one second, most of the time
+        for i in 0..ROUNDS {
+            let f = folder.join("same.mp3");
+            fs::write(&f, format!("round {i}")).unwrap();
+            let r = Report {
+                orphan_files: vec![f],
+                ..Report::default()
+            };
+            assert_eq!(doctor::delete_orphans(&r, 1, false).unwrap(), 1);
+        }
+        let mut seen = Vec::new();
+        for stamp in fs::read_dir(ipod.join(doctor::ORPHANS)).unwrap() {
+            let f = stamp.unwrap().path().join("F07/same.mp3");
+            seen.push(String::from_utf8(fs::read(&f).unwrap()).unwrap());
+        }
+        seen.sort();
+        let mut want: Vec<String> = (0..ROUNDS).map(|i| format!("round {i}")).collect();
+        want.sort();
+        assert_eq!(seen, want, "every round kept in a folder of its own");
+    }
+
+    // Prevents (audit L16) a file counted as moved that was not.
+    #[test]
+    fn an_orphan_with_an_unexpected_path_is_neither_moved_nor_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let ipod = dir.path();
+        let folder = ipod.join("iPod_Control/Music/F07");
+        fs::create_dir_all(&folder).unwrap();
+        let good = folder.join("good.mp3");
+        fs::write(&good, b"good").unwrap();
+        // Not under <mountpoint>/iPod_Control/Music/<folder>/.
+        let odd = ipod.join("odd.mp3");
+        fs::write(&odd, b"odd").unwrap();
+        let r = Report {
+            orphan_files: vec![odd.clone(), good.clone()],
+            ..Report::default()
+        };
+        assert_eq!(doctor::delete_orphans(&r, 2, false).unwrap(), 1);
+        assert_eq!(fs::read(&odd).unwrap(), b"odd", "left where it was");
+        assert!(!good.exists());
     }
 
     // Prevents (audit M9) doctor's repair, which copies nothing, being

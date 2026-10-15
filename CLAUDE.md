@@ -87,6 +87,8 @@ cargo test                                  # needs gcc (C snapshot tool) and ff
 cargo test -p gpod -- --include-ignored     # also compares against the real backup, read only
 cargo clippy --all-targets -- -D warnings
 cargo fmt
+# cargo sets IPRUNE_NO_DETECT (.cargo/config.toml): nothing it runs finds the
+# real iPod by itself, `cargo run` included; set device.mountpoint for that
 packaging/install.sh                        # install both binaries and the desktop entry
 ```
 

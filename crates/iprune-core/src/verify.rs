@@ -33,6 +33,9 @@ pub struct Expect {
     pub deleted: Vec<u64>,
     /// Playlists created.
     pub created: usize,
+    /// The library file's size, for each track copied or copied again: its
+    /// file on the iPod must have it (a USB error can leave it short).
+    pub sizes: HashMap<u64, u64>,
 }
 
 /// Problems found in the changed database `after` before it is written.
@@ -102,11 +105,24 @@ pub fn check(
         };
         match (&t.ipod_path, files) {
             (None, _) => problems.push(format!("track {dbid:016x} has no file")),
-            (Some(p), Some(root)) => {
-                if !ipod::file_path(root, p).is_some_and(|f| f.is_file()) {
-                    problems.push(format!("the file of track {dbid:016x} is missing"));
+            (Some(p), Some(root)) => match ipod::file_path(root, p).map(std::fs::metadata) {
+                None | Some(Err(_)) => {
+                    problems.push(format!("the file of track {dbid:016x} is missing"))
                 }
-            }
+                Some(Ok(m)) if !m.is_file() => {
+                    problems.push(format!("the file of track {dbid:016x} is missing"))
+                }
+                Some(Ok(m)) => {
+                    let len = m.len();
+                    if let Some(&want) = expect.sizes.get(dbid)
+                        && len != want
+                    {
+                        problems.push(format!(
+                            "the file of track {dbid:016x} has {len} bytes, the library file {want}"
+                        ));
+                    }
+                }
+            },
             (Some(_), None) => {}
         }
     }

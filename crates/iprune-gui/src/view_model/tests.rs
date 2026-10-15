@@ -258,7 +258,7 @@ fn item(location: &str, t: Option<TrackRow>) -> Item {
     Item {
         entry: Entry {
             location: location.into(),
-            extinf: None,
+            ..Default::default()
         },
         track: t,
     }

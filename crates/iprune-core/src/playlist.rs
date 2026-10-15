@@ -2,7 +2,10 @@
 //!
 //! Reading keeps every location line verbatim, with the `#EXTINF` line just
 //! before it, so an entry iprune cannot resolve is written back unchanged.
-//! Other `#` lines and blank lines are dropped.
+//! Other `#` lines (`#PLAYLIST`, `#EXTGRP`, comments) are kept with the entry
+//! they come before, or after the last one, and written back as they were.
+//! Blank lines and the `#EXTM3U` header are not kept; the header is always
+//! written. Lines may end with LF, CRLF or a lone CR.
 
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -11,44 +14,95 @@ use std::path::{Component, Path, PathBuf};
 use crate::error::IoContext;
 use crate::{Error, Result};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Entry {
     /// The location line exactly as in the file.
     pub location: String,
     /// The `#EXTINF` line that preceded it, if any.
     pub extinf: Option<String>,
+    /// Other `#` lines just before it, in order.
+    pub comments: Vec<String>,
+    /// `#` lines after it, for the last entry of the file.
+    pub trailing: Vec<String>,
 }
 
 pub fn parse(text: &str) -> Vec<Entry> {
+    parse_all(text).0
+}
+
+/// The entries, and the `#` lines of a file that has no entry to keep them
+/// with.
+pub fn parse_all(text: &str) -> (Vec<Entry>, Vec<String>) {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut entries = Vec::new();
-    let mut extinf = None;
-    for line in text.split('\n') {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if line.trim().is_empty() {
+    let mut entries: Vec<Entry> = Vec::new();
+    // The pending `#EXTINF`, and where it stood among the lines since the
+    // last location, should it turn out to have none.
+    let mut extinf: Option<(String, usize)> = None;
+    let mut comments: Vec<String> = Vec::new();
+    // LF, CRLF (its empty piece is skipped as blank) and a lone CR.
+    for line in text.split(['\n', '\r']) {
+        if line.trim().is_empty() || line.starts_with("#EXTM3U") {
             continue;
         }
         if line.starts_with("#EXTINF:") {
-            extinf = Some(line.to_owned());
-        } else if !line.starts_with('#') {
+            // One with no location after it is kept as a plain line, where
+            // it stood.
+            if let Some((x, at)) = extinf.take() {
+                comments.insert(at, x);
+            }
+            extinf = Some((line.to_owned(), comments.len()));
+        } else if line.starts_with('#') {
+            // A directive between an `#EXTINF` and its location (VLC's
+            // `#EXTVLCOPT`) leaves the `#EXTINF` with that location.
+            comments.push(line.to_owned());
+        } else {
             entries.push(Entry {
                 location: line.to_owned(),
-                extinf: extinf.take(),
+                extinf: extinf.take().map(|(x, _)| x),
+                comments: std::mem::take(&mut comments),
+                trailing: Vec::new(),
             });
         }
     }
-    entries
+    if let Some((x, at)) = extinf {
+        comments.insert(at, x);
+    }
+    match entries.last_mut() {
+        Some(last) => {
+            last.trailing = comments;
+            (entries, Vec::new())
+        }
+        None => (entries, comments),
+    }
 }
 
 pub fn render(entries: &[Entry]) -> String {
+    render_all(entries, &[])
+}
+
+/// [`render`], with `loose` lines, those of a file with no entry, after the
+/// header.
+pub fn render_all(entries: &[Entry], loose: &[String]) -> String {
     let mut out = String::from("#EXTM3U\n");
+    for l in loose {
+        out.push_str(l);
+        out.push('\n');
+    }
     for e in entries {
+        for c in &e.comments {
+            out.push_str(c);
+            out.push('\n');
+        }
         if let Some(x) = &e.extinf {
             out.push_str(x);
             out.push('\n');
         }
         out.push_str(&e.location);
         out.push('\n');
+        for c in &e.trailing {
+            out.push_str(c);
+            out.push('\n');
+        }
     }
     out
 }
@@ -64,9 +118,14 @@ pub fn extinf(duration_ms: Option<u32>, artist: Option<&str>, title: &str) -> St
 }
 
 pub fn read(path: &Path) -> Result<Vec<Entry>> {
+    Ok(read_all(path)?.0)
+}
+
+/// [`read`] with the loose lines of [`parse_all`].
+pub fn read_all(path: &Path) -> Result<(Vec<Entry>, Vec<String>)> {
     let bytes = std::fs::read(path).at(path)?;
     let text = String::from_utf8(bytes).map_err(|_| Error::NotUtf8(path.to_owned()))?;
-    Ok(parse(&text))
+    Ok(parse_all(&text))
 }
 
 /// How [`write_atomic`] may treat an existing file.
@@ -146,14 +205,17 @@ mod tests {
             e[0],
             Entry {
                 location: "/m/a.mp3".into(),
-                extinf: Some("#EXTINF:513,A - B".into())
+                extinf: Some("#EXTINF:513,A - B".into()),
+                ..Default::default()
             }
         );
         assert_eq!(
             e[1],
             Entry {
                 location: "rel/b.mp3".into(),
-                extinf: None
+                extinf: None,
+                comments: vec!["#PLAYLIST:x".into()],
+                trailing: Vec::new(),
             }
         );
         assert_eq!(e[2].location, "http://x y");
@@ -165,10 +227,12 @@ mod tests {
             Entry {
                 location: "/m/a.mp3".into(),
                 extinf: Some(extinf(Some(512_600), Some("A"), "B")),
+                ..Default::default()
             },
             Entry {
                 location: "  odd entry ".into(),
                 extinf: None,
+                ..Default::default()
             },
         ];
         let text = render(&e);

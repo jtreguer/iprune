@@ -133,6 +133,7 @@ fn location(cfg: &Config, t: &TrackRow) -> String {
 fn render_item(cfg: &Config, item: &Item) -> Entry {
     match &item.track {
         None => item.entry.clone(),
+        // Lines of its own the file had around it are kept.
         Some(t) => Entry {
             location: location(cfg, t),
             extinf: Some(playlist::extinf(
@@ -140,6 +141,7 @@ fn render_item(cfg: &Config, item: &Item) -> Entry {
                 t.tags.artist.as_deref(),
                 &t.display_title(),
             )),
+            ..item.entry.clone()
         },
     }
 }
@@ -161,11 +163,24 @@ fn write(
     items: &mut [Item],
     mode: WriteMode,
 ) -> Result<()> {
+    write_with(conn, cfg, name, file, items, &[], mode)
+}
+
+/// [`write`], with `loose` lines for a playlist left with no entry.
+fn write_with(
+    conn: &Connection,
+    cfg: &Config,
+    name: &str,
+    file: &Path,
+    items: &mut [Item],
+    loose: &[String],
+    mode: WriteMode,
+) -> Result<()> {
     for item in items.iter_mut() {
         item.entry = render_item(cfg, item);
     }
     let entries: Vec<Entry> = items.iter().map(|i| i.entry.clone()).collect();
-    playlist::write_atomic(file, &playlist::render(&entries), mode)?;
+    playlist::write_atomic(file, &playlist::render_all(&entries, loose), mode)?;
     store_items(conn, name, file, items)
 }
 
@@ -178,14 +193,44 @@ fn edit(
 ) -> Result<()> {
     let file = existing_file(cfg, name)?;
     let mtime = mtime_ns(&file)?;
-    let mut items = resolve(conn, cfg, playlist::read(&file)?)?;
+    let (entries, loose) = playlist::read_all(&file)?;
+    let mut items = resolve(conn, cfg, entries)?;
+    // Lines other than entries stay where they are in the file, whatever
+    // the edit does to the entries: those before the n-th entry stay before
+    // the n-th, the others at the end.
+    let mut slots: Vec<Vec<String>> = items
+        .iter_mut()
+        .map(|i| std::mem::take(&mut i.entry.comments))
+        .collect();
+    let mut tail: Vec<String> = items
+        .iter_mut()
+        .flat_map(|i| std::mem::take(&mut i.entry.trailing))
+        .collect();
+    // A file with no entry (only then are there loose lines): its lines go
+    // first.
+    if slots.is_empty() {
+        slots.push(loose);
+    }
     f(&mut items)?;
-    write(
+    for (item, slot) in items.iter_mut().zip(slots.iter_mut()) {
+        item.entry.comments = std::mem::take(slot);
+    }
+    let mut rest: Vec<String> = slots.into_iter().skip(items.len()).flatten().collect();
+    rest.append(&mut tail);
+    let loose = match items.last_mut() {
+        Some(last) => {
+            last.entry.trailing = rest;
+            Vec::new()
+        }
+        None => rest,
+    };
+    write_with(
         conn,
         cfg,
         name,
         &file,
         &mut items,
+        &loose,
         WriteMode::Replace { mtime_ns: mtime },
     )
 }
@@ -352,10 +397,7 @@ pub fn add(
             Some(p) => check_position(p, items.len() + 1)?,
         };
         let new = tracks.into_iter().map(|t| Item {
-            entry: Entry {
-                location: String::new(),
-                extinf: None,
-            },
+            entry: Entry::default(),
             track: Some(t),
         });
         items.splice(at..at, new);

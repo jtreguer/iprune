@@ -78,6 +78,20 @@ fn device_is_none_when_nothing_is_adopted_or_mounted() {
     assert!(d.device().unwrap().is_none());
 }
 
+// Prevents (audit L19) a test of the window finding the real iPod: with no
+// mountpoint set, detection is what would run, and it refuses under cargo.
+#[test]
+fn with_no_mountpoint_set_the_device_is_not_looked_for_under_cargo() {
+    assert!(
+        std::env::var_os("IPRUNE_NO_DETECT").is_some(),
+        "run through cargo (.cargo/config.toml): this test must not scan the mounts"
+    );
+    let mut d = data_with_mount(Path::new("/unused"));
+    d.config.device.mountpoint = PathBuf::new();
+    let e = d.device().unwrap_err();
+    assert!(e.to_string().contains("IPRUNE_NO_DETECT"), "{e}");
+}
+
 #[test]
 fn an_adopted_ipod_that_is_not_mounted_is_shown_disconnected() {
     let tmp = tempfile::tempdir().unwrap();

@@ -275,6 +275,18 @@ pub fn check_track_removals(work: &TrackWork, mapped: usize, opts: Options) -> R
     Ok(())
 }
 
+/// Refuses removing many tracks iprune does not manage (`remove_unmanaged`)
+/// at once, counted against every track on the iPod: their statistics are
+/// not pulled, and many may exist nowhere else. More likely an adoption
+/// gone wrong than a decision.
+pub fn check_unmanaged_removals(work: &TrackWork, on_ipod: usize, opts: Options) -> Result<()> {
+    let removes = work.removes.iter().filter(|r| r.track_id.is_none()).count();
+    if !opts.allow_mass_removal && removes > 5 && removes * 10 > on_ipod {
+        return Err(Error::MassUnmanagedRemoval { removes, on_ipod });
+    }
+    Ok(())
+}
+
 /// Refuses copying again many managed tracks because their files seem
 /// missing on the iPod, which more likely means its music folder reads badly
 /// than files lost.
@@ -297,6 +309,7 @@ pub fn check_missing_files(plan: &Plan, mapped: usize, opts: Options) -> Result<
 pub fn check_guards(prepared: &Prepared, work: &FullWork, opts: Options) -> Result<()> {
     check_removals(&work.playlists, prepared.playlists_map.len(), opts)?;
     check_track_removals(&work.tracks, prepared.tracks_map.len(), opts)?;
+    check_unmanaged_removals(&work.tracks, prepared.ipod.tracks.len(), opts)?;
     if !work.tracks.copies.is_empty() {
         check_missing_files(&prepared.plan, prepared.tracks_map.len(), opts)?;
     }
@@ -903,6 +916,7 @@ pub fn sync(
             } else {
                 expect.added.push(c.dbid);
             }
+            expect.sizes.insert(c.dbid, c.audio.size);
             upserts.push(copied_mapping(c));
             bytes += c.audio.size;
             since += 1;

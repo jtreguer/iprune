@@ -335,6 +335,11 @@ fn pick(found: &[Mount]) -> Result<std::path::PathBuf> {
 
 /// Mounted filesystems that hold an iPod database.
 pub fn find_ipods() -> Result<Vec<Mount>> {
+    // Set for everything cargo runs (.cargo/config.toml): a test must never
+    // find the real iPod.
+    if std::env::var_os("IPRUNE_NO_DETECT").is_some_and(|v| !v.is_empty()) {
+        return Err(Error::DetectionOff);
+    }
     let path = Path::new("/proc/self/mountinfo");
     let text = std::fs::read_to_string(path).at(path)?;
     Ok(parse_mountinfo(&text)

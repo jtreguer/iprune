@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use common::{Env, Kind};
-use iprune_core::{Error, playlists};
+use iprune_core::{Error, playlist, playlists};
 
 /// An env with three indexed tracks: Title1..Title3 (a, b, c).
 fn env3() -> (Env, [PathBuf; 3]) {
@@ -905,4 +905,383 @@ fn move_entries_carries_unresolved_entries_verbatim_with_their_extinf() {
         idx.iter().map(|i| i.1.is_some()).collect::<Vec<_>>(),
         [true, false, false, false]
     );
+}
+
+// ---- lines iprune does not understand (audit L9, L10)
+
+/// Writes `text` as the playlist `name` and loads it into the index.
+fn load(env: &Env, name: &str, text: &str) {
+    env.write_playlist(name, text);
+    playlists::sync_from_disk(env.store.conn(), &env.cfg, true).unwrap();
+}
+
+/// The lines of `text` that are not `#EXTINF` (those of resolved entries are
+/// rewritten from the tags, so their text is not the point).
+fn without_extinf(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|l| !l.starts_with("#EXTINF:"))
+        .collect()
+}
+
+// Prevents (audit L9) a rewrite dropping #PLAYLIST, #EXTGRP, #EXTALB, plain
+// comments and a trailing #EXTINF with no location. The lines stay where they
+// are in the file whatever an edit does to the entries: the ones before the
+// n-th entry stay before the n-th, the rest at the end.
+#[test]
+fn other_lines_survive_an_add_and_a_remove_in_their_place() {
+    let (env, t) = env3();
+    let original = format!(
+        "#EXTM3U\n#PLAYLIST:Road trip\n#EXTGRP:Rock\n#EXTALB:Some Album\n# a bare comment\n\
+         #EXTINF:100,A - Title1\n{a}\n\
+         #EXTINF:200,B - Title2\n# about b\n{b}\n\
+         {c}\n# trailing comment\n#EXTINF:5,Dangling\n# the last line\n#EXTINF:6,Truly last\n",
+        a = t[0].display(),
+        b = t[1].display(),
+        c = t[2].display()
+    );
+    load(&env, "mix", &original);
+
+    playlists::add(env.store.conn(), &env.cfg, "mix", &[t[1].clone()], Some(2)).unwrap();
+    let text = env.read_playlist("mix");
+    // The new entry takes the place of the second: "about b" now sits
+    // before it, and b (twice) follows.
+    let want = format!(
+        "#EXTM3U\n#PLAYLIST:Road trip\n#EXTGRP:Rock\n#EXTALB:Some Album\n# a bare comment\n{a}\n\
+         # about b\n{b}\n{b}\n{c}\n# trailing comment\n# the last line\n",
+        a = t[0].display(),
+        b = t[1].display(),
+        c = t[2].display()
+    );
+    assert_eq!(without_extinf(&text), without_extinf(&want), "{text}");
+    assert!(
+        text.ends_with("#EXTINF:5,Dangling\n# the last line\n#EXTINF:6,Truly last\n"),
+        "{text}"
+    );
+    // The #EXTINF that had a comment between it and its location is that
+    // entry's own again: written right before the location, after the
+    // comment, and once. 4 entries and the two dangling ones at the end.
+    assert!(
+        text.contains(&format!(
+            "# about b\n#EXTINF:1,Artist2 - Title2\n{}\n",
+            t[1].display()
+        )),
+        "{text}"
+    );
+    assert_eq!(text.matches("#EXTINF:").count(), 6, "{text}");
+
+    // Removing the two middle entries leaves every other line in its place.
+    playlists::remove(env.store.conn(), &env.cfg, "mix", &[2, 3]).unwrap();
+    let text = env.read_playlist("mix");
+    let want = format!(
+        "#EXTM3U\n#PLAYLIST:Road trip\n#EXTGRP:Rock\n#EXTALB:Some Album\n# a bare comment\n{a}\n\
+         # about b\n{c}\n# trailing comment\n# the last line\n",
+        a = t[0].display(),
+        c = t[2].display()
+    );
+    assert_eq!(without_extinf(&text), without_extinf(&want), "{text}");
+    assert!(
+        text.ends_with("#EXTINF:5,Dangling\n# the last line\n#EXTINF:6,Truly last\n"),
+        "{text}"
+    );
+    assert_eq!(env.indexed_items("mix").len(), 2);
+}
+
+// A second rewrite changes nothing: what was kept is read back as it was.
+#[test]
+fn a_rewrite_with_kept_lines_is_stable_when_repeated() {
+    let (env, t) = env3();
+    load(
+        &env,
+        "mix",
+        &format!(
+            "#PLAYLIST:x\n#EXTGRP:g\n{a}\n# note\n{b}\n# tail\n#EXTINF:3,dangling\n",
+            a = t[0].display(),
+            b = t[1].display()
+        ),
+    );
+    let conn = env.store.conn();
+    playlists::add(conn, &env.cfg, "mix", &[t[2].clone()], Some(1)).unwrap();
+    playlists::move_entry(conn, &env.cfg, "mix", 1, 3).unwrap();
+    playlists::move_entry(conn, &env.cfg, "mix", 3, 1).unwrap();
+    let first = env.read_playlist("mix");
+    let again = playlist::parse(&first);
+    assert_eq!(playlist::render(&again), first);
+    assert!(
+        first.contains("#PLAYLIST:x\n") && first.contains("# note\n"),
+        "{first}"
+    );
+    assert!(first.contains("# tail\n#EXTINF:3,dangling\n"), "{first}");
+}
+
+// Prevents (audit L10) a playlist saved with Mac classic line endings reading
+// as empty: the next edit then wrote an empty file, and a sync emptied the
+// iPod playlist.
+#[test]
+fn a_cr_only_playlist_reads_its_entries_and_an_edit_keeps_them() {
+    let (env, t) = env3();
+    load(
+        &env,
+        "mac",
+        &format!(
+            "#EXTM3U\r#EXTINF:1,A - Title1\r{}\r{}\r# note\r",
+            t[0].display(),
+            t[1].display()
+        ),
+    );
+    assert_eq!(titles(&env, "mac"), ["Title1", "Title2"]);
+    assert_eq!(env.indexed_items("mac").len(), 2);
+
+    playlists::add(env.store.conn(), &env.cfg, "mac", &[t[2].clone()], None).unwrap();
+    let text = env.read_playlist("mac");
+    assert!(!text.contains('\r'), "{text:?}");
+    assert_eq!(titles(&env, "mac"), ["Title1", "Title2", "Title3"]);
+    assert_eq!(env.locations("mac"), [s(&t[0]), s(&t[1]), s(&t[2])]);
+    assert!(text.contains("# note\n"), "{text}");
+}
+
+#[test]
+fn a_file_mixing_crlf_lf_and_cr_reads_every_line_once() {
+    let (env, t) = env3();
+    load(
+        &env,
+        "mixed",
+        &format!(
+            "#EXTM3U\r\n{a}\n{b}\r\n# note\r{c}\n\r\n",
+            a = t[0].display(),
+            b = t[1].display(),
+            c = t[2].display()
+        ),
+    );
+    assert_eq!(titles(&env, "mixed"), ["Title1", "Title2", "Title3"]);
+    // No blank entries from the CR LF pairs, and the note kept before c.
+    playlists::remove(env.store.conn(), &env.cfg, "mixed", &[1]).unwrap();
+    let text = env.read_playlist("mixed");
+    // The note was before c (the third); with a removed it stays after the
+    // last entry, the same place in the file.
+    assert_eq!(
+        without_extinf(&text),
+        [
+            "#EXTM3U".to_owned(),
+            s(&t[1]),
+            s(&t[2]),
+            "# note".to_owned()
+        ],
+        "{text}"
+    );
+    assert_eq!(env.locations("mixed"), [s(&t[1]), s(&t[2])]);
+}
+
+#[test]
+fn a_byte_order_mark_is_not_part_of_the_first_line() {
+    let (env, t) = env3();
+    // Before the header, and before an entry when there is no header.
+    load(
+        &env,
+        "with",
+        &format!("\u{feff}#EXTM3U\n{}\n", t[0].display()),
+    );
+    load(&env, "without", &format!("\u{feff}{}\n", t[1].display()));
+    assert_eq!(titles(&env, "with"), ["Title1"]);
+    assert_eq!(titles(&env, "without"), ["Title2"]);
+    // Rewritten without it, and the header is not kept as a comment.
+    playlists::add(env.store.conn(), &env.cfg, "with", &[t[2].clone()], None).unwrap();
+    playlists::add(env.store.conn(), &env.cfg, "without", &[t[2].clone()], None).unwrap();
+    for name in ["with", "without"] {
+        let text = env.read_playlist(name);
+        assert!(text.starts_with("#EXTM3U\n#EXTINF:"), "{name}: {text:?}");
+        assert!(!text.contains('\u{feff}'), "{name}: {text:?}");
+        assert_eq!(text.matches("#EXTM3U").count(), 1, "{name}: {text}");
+    }
+}
+
+// Pure reading: the header is skipped wherever it is, and nothing but
+// comments reads as no entries (and does not panic).
+#[test]
+fn parse_skips_the_header_anywhere_and_a_file_of_comments_has_no_entries() {
+    let e = playlist::parse("#EXTM3U\n/a.mp3\n#EXTM3U\n/b.mp3\n");
+    assert_eq!(
+        e.iter().map(|e| e.location.as_str()).collect::<Vec<_>>(),
+        ["/a.mp3", "/b.mp3"]
+    );
+    assert!(
+        e.iter()
+            .all(|e| e.comments.is_empty() && e.trailing.is_empty())
+    );
+    assert!(playlist::parse("#EXTM3U\n#PLAYLIST:x\n# note\n#EXTINF:1,y\n").is_empty());
+    assert!(playlist::parse("").is_empty());
+    assert!(playlist::parse("\r\n\r\n\r").is_empty());
+}
+
+// Prevents (audit L9) the header lines going with the first entry when it is
+// removed, and the closing lines going with the last.
+#[test]
+fn removing_the_first_or_the_last_entry_keeps_the_lines_around_them() {
+    let (env, t) = env3();
+    let body = format!(
+        "#PLAYLIST:x\n{a}\n{b}\n# tail\n",
+        a = t[0].display(),
+        b = t[1].display()
+    );
+    load(&env, "first", &body);
+    load(&env, "last", &body);
+    playlists::remove(env.store.conn(), &env.cfg, "first", &[1]).unwrap();
+    playlists::remove(env.store.conn(), &env.cfg, "last", &[2]).unwrap();
+    assert_eq!(
+        without_extinf(&env.read_playlist("first")),
+        [
+            "#EXTM3U".to_owned(),
+            "#PLAYLIST:x".to_owned(),
+            s(&t[1]),
+            "# tail".to_owned()
+        ]
+    );
+    assert_eq!(
+        without_extinf(&env.read_playlist("last")),
+        [
+            "#EXTM3U".to_owned(),
+            "#PLAYLIST:x".to_owned(),
+            s(&t[0]),
+            "# tail".to_owned()
+        ]
+    );
+}
+
+// A move changes the order of the entries and nothing else in the file.
+#[test]
+fn a_move_leaves_the_other_lines_where_they_are() {
+    let (env, t) = env3();
+    load(
+        &env,
+        "mv",
+        &format!(
+            "#PLAYLIST:x\n{a}\n# mid\n{b}\n# tail\n",
+            a = t[0].display(),
+            b = t[1].display()
+        ),
+    );
+    playlists::move_entry(env.store.conn(), &env.cfg, "mv", 1, 2).unwrap();
+    let want = [
+        "#EXTM3U".to_owned(),
+        "#PLAYLIST:x".to_owned(),
+        s(&t[1]),
+        "# mid".to_owned(),
+        s(&t[0]),
+        "# tail".to_owned(),
+    ];
+    assert_eq!(without_extinf(&env.read_playlist("mv")), want);
+    playlists::move_entries(env.store.conn(), &env.cfg, "mv", &[2], 1).unwrap();
+    let want = [
+        "#EXTM3U".to_owned(),
+        "#PLAYLIST:x".to_owned(),
+        s(&t[0]),
+        "# mid".to_owned(),
+        s(&t[1]),
+        "# tail".to_owned(),
+    ];
+    assert_eq!(without_extinf(&env.read_playlist("mv")), want);
+}
+
+// A file of only comments keeps them through an add, and gets them back when
+// every entry is removed again.
+#[test]
+fn a_comment_only_file_keeps_its_lines_through_an_add_and_a_removal_of_all_entries() {
+    let (env, t) = env3();
+    load(&env, "only", "#EXTM3U\n#PLAYLIST:x\n# note\n");
+    let (entries, loose) = playlist::parse_all(&env.read_playlist("only"));
+    assert!(entries.is_empty());
+    assert_eq!(loose, ["#PLAYLIST:x", "# note"]);
+
+    playlists::add(env.store.conn(), &env.cfg, "only", &[t[0].clone()], None).unwrap();
+    assert_eq!(
+        without_extinf(&env.read_playlist("only")),
+        [
+            "#EXTM3U".to_owned(),
+            "#PLAYLIST:x".to_owned(),
+            "# note".to_owned(),
+            s(&t[0])
+        ]
+    );
+    playlists::remove(env.store.conn(), &env.cfg, "only", &[1]).unwrap();
+    assert_eq!(env.read_playlist("only"), "#EXTM3U\n#PLAYLIST:x\n# note\n");
+    // And once more round: nothing is lost or doubled.
+    playlists::add(env.store.conn(), &env.cfg, "only", &[t[1].clone()], None).unwrap();
+    playlists::remove(env.store.conn(), &env.cfg, "only", &[1]).unwrap();
+    assert_eq!(env.read_playlist("only"), "#EXTM3U\n#PLAYLIST:x\n# note\n");
+}
+
+// ---- a directive between an #EXTINF and its location
+
+#[test]
+fn an_extinf_followed_by_a_directive_stays_the_extinf_of_its_location() {
+    let e = playlist::parse("#EXTM3U\n#EXTINF:1,A\n#EXTVLCOPT:x\n/a.mp3\n/b.mp3\n");
+    assert_eq!(e.len(), 2);
+    assert_eq!(e[0].location, "/a.mp3");
+    assert_eq!(e[0].extinf.as_deref(), Some("#EXTINF:1,A"));
+    assert_eq!(e[0].comments, ["#EXTVLCOPT:x"]);
+    assert_eq!(e[1].extinf, None);
+    assert!(e[1].comments.is_empty() && e[1].trailing.is_empty());
+}
+
+// Prevents an edit writing a second #EXTINF for a track whose own was parted
+// from its location by a directive: the kept one as a plain line plus the
+// fresh one.
+#[test]
+fn an_edit_writes_exactly_one_extinf_for_a_track_with_a_directive_and_is_stable() {
+    let (env, t) = env3();
+    load(
+        &env,
+        "vlc",
+        &format!(
+            "#EXTM3U\n#EXTINF:100,Old name\n#EXTVLCOPT:x\n{a}\n#EXTINF:7,Odd\n#EXTVLCOPT:y\nhttp://example.com/s\n",
+            a = t[0].display()
+        ),
+    );
+    let conn = env.store.conn();
+    playlists::add(conn, &env.cfg, "vlc", &[t[1].clone()], None).unwrap();
+    let first = env.read_playlist("vlc");
+    assert_eq!(first.matches("#EXTINF:").count(), 3, "{first}");
+    assert!(
+        !first.contains("Old name"),
+        "rewritten from the tags: {first}"
+    );
+    assert!(
+        first.contains(&format!(
+            "#EXTVLCOPT:x\n#EXTINF:1,Artist1 - Title1\n{}\n",
+            t[0].display()
+        )),
+        "{first}"
+    );
+    // The unresolved entry is written back as it was.
+    assert!(
+        first.contains("#EXTINF:7,Odd\n#EXTVLCOPT:y\nhttp://example.com/s\n")
+            || first.contains("#EXTVLCOPT:y\n#EXTINF:7,Odd\nhttp://example.com/s\n"),
+        "{first}"
+    );
+    // Rewriting twice more changes nothing.
+    playlists::move_entry(conn, &env.cfg, "vlc", 1, 1).unwrap();
+    assert_eq!(env.read_playlist("vlc"), first);
+    playlists::move_entry(conn, &env.cfg, "vlc", 1, 1).unwrap();
+    assert_eq!(env.read_playlist("vlc"), first);
+    assert_eq!(playlist::render(&playlist::parse(&first)), first);
+}
+
+// Prevents (audit L9) a displaced #EXTINF moving after the lines that
+// followed it: it is kept as a plain line where it stood.
+#[test]
+fn a_displaced_extinf_keeps_its_place_among_the_lines() {
+    // Displaced by another #EXTINF.
+    let e = playlist::parse("#EXTINF:5,D\n# c\n#EXTINF:6,T\n/a.mp3\n");
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].extinf.as_deref(), Some("#EXTINF:6,T"));
+    assert_eq!(e[0].comments, ["#EXTINF:5,D", "# c"]);
+    // At the end of the file, after an entry.
+    let e = playlist::parse("/a.mp3\n#EXTINF:5,D\n# c\n");
+    assert_eq!(e[0].trailing, ["#EXTINF:5,D", "# c"]);
+    // At the end of a file with no entry.
+    let (e, loose) = playlist::parse_all("#EXTINF:5,D\n# c\n");
+    assert!(e.is_empty());
+    assert_eq!(loose, ["#EXTINF:5,D", "# c"]);
+    // And a rewrite keeps the file order.
+    let text = "#EXTM3U\n#EXTINF:5,D\n# c\n#EXTINF:6,T\n/a.mp3\n#EXTINF:7,E\n# d\n";
+    assert_eq!(playlist::render(&playlist::parse(text)), text);
 }

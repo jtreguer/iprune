@@ -692,7 +692,10 @@ fn run_doctor(fix: bool, yes: bool, allow_mass_removal: bool) -> Result<Outcome>
     }
     let deleted = doctor::delete_orphans(&report, contents.tracks.len(), allow_mass_removal)?;
     if deleted > 0 {
-        say!("deleted {deleted} orphan files");
+        say!(
+            "moved {deleted} orphan files to {} on the iPod: delete that folder once you are sure",
+            doctor::ORPHANS
+        );
     }
     doctor::fix_index(conn, device, &report)?;
     if !report.stale_mappings.is_empty() || !report.forgotten.is_empty() {

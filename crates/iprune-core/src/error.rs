@@ -158,6 +158,14 @@ pub enum Error {
         "the iPod could not be backed up before the next write ({0}), so that write was not made. The iPod holds the last checkpoint, written and verified; the tracks copied since are files no database entry uses, which `iprune doctor` finds, and the next sync copies them again"
     )]
     CheckpointBackupFailed(String),
+    #[error(
+        "the plan removes {removes} of the {on_ipod} tracks on the iPod that iprune does not manage (sync.remove_unmanaged): their play counts are not kept, and they may exist nowhere else. If that is intended, run again with --allow-mass-removal"
+    )]
+    MassUnmanagedRemoval { removes: usize, on_ipod: usize },
+    #[error(
+        "iPod detection is off (IPRUNE_NO_DETECT is set, as for everything cargo runs); set device.mountpoint in the config, or use the installed iprune"
+    )]
+    DetectionOff,
     #[error("the index cannot be upgraded: {0}")]
     Migration(String),
     #[error(

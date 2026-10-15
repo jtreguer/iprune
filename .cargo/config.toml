@@ -1,0 +1,5 @@
+# Tests must never find the real iPod by looking at the mounts: everything
+# cargo runs (tests, the binaries they start, `cargo run`) has iPod
+# detection off. Set `device.mountpoint`, or use the installed binaries.
+[env]
+IPRUNE_NO_DETECT = "1"
