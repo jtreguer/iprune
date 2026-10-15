@@ -1100,7 +1100,20 @@ fn an_unreadable_pending_pull_is_dropped_with_a_warning_and_the_sync_goes_on() {
 // ---- restore
 
 fn restore(w: &World, stamp: &str) -> iprune_core::Result<exec::Restored> {
-    exec::restore(w.env.store.conn(), &w.paths, &w.root, GUID, stamp)
+    exec::restore(w.env.store.conn(), &w.paths, &w.root, GUID, stamp, false)
+}
+
+/// Like `exec::restore`, trying again while the iPod lock reports busy. The
+/// tests start helper programs from other threads; one forked at the wrong
+/// moment holds a copy of a just released lock file for a few milliseconds.
+fn restore_with(w: &World, stamp: &str, discard: bool) -> iprune_core::Result<exec::Restored> {
+    for _ in 0..200 {
+        match exec::restore(w.env.store.conn(), &w.paths, &w.root, GUID, stamp, discard) {
+            Err(Error::IpodBusy) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            other => return other,
+        }
+    }
+    unreachable!("the iPod lock stayed busy")
 }
 
 fn mapping_view(w: &World) -> MappingView {
@@ -1137,16 +1150,20 @@ fn restore_puts_back_the_database_and_the_mappings_and_drops_what_is_gone() {
     assert_eq!(r.files, vec!["iTunesDB"]);
     assert_eq!(fs::read(&db_path).unwrap(), db_before);
     assert_eq!(w.snapshot(), snap_before);
-    // Old's playlist row is gone from the index, so its mapping is dropped;
-    // Mix is now called Mixed in the index, but the row is the same.
-    assert_eq!((r.tracks, r.dropped_tracks, r.dropped_playlists), (3, 0, 1));
+    // Old's playlist row is gone from the index, so its iPod playlist,
+    // back on the iPod, is mapped to a tombstone for the next sync to
+    // delete; Mix is now called Mixed in the index, but the row is the same.
+    assert_eq!(
+        (r.tracks, r.dropped_tracks, r.playlists_to_delete),
+        (3, 0, 1)
+    );
     let (t, p) = mapping_view(&w);
     assert_eq!(t, maps_before.0);
-    assert_eq!(p.len(), 2);
+    assert_eq!(p.len(), 3);
     assert_eq!(r.playlists, 2);
     let names: Vec<&str> = p.iter().map(|m| m.2.as_str()).collect();
     assert!(
-        names.contains(&"Road") && names.contains(&"Mix"),
+        names.contains(&"Road") && names.contains(&"Mix") && names.contains(&"Old"),
         "{names:?}"
     );
     // Backups stay.
@@ -1199,18 +1216,20 @@ fn backup_guid_matches_the_folder_without_regard_to_case_or_prefix() {
     for g in [BARE_GUID, GUID, "000a27001234abcd", " 0X000a27001234abcd "] {
         assert_eq!(find(Some(g)).unwrap(), GUID, "{g}");
     }
-    assert_eq!(find(None).unwrap(), GUID, "the only iPod with backups");
+    // Without a GUID the iPod cannot be told from another one, even when
+    // only one iPod has backups.
+    assert!(matches!(find(None), Err(Error::RestoreNeedsGuid)));
     assert!(matches!(
         find(Some("000A270000000000")),
         Err(Error::NoSuchBackup(_))
     ));
-    // A second iPod's folder makes "no GUID" ambiguous, and a hidden
-    // folder does not count.
+    // A hidden folder does not count, and a second iPod's folder does not
+    // confuse the lookup by GUID.
     let root = w.paths.data_dir.join("backups");
     fs::create_dir(root.join(".partial-x")).unwrap();
-    assert_eq!(find(None).unwrap(), GUID);
+    assert_eq!(find(Some(GUID)).unwrap(), GUID);
     fs::create_dir(root.join("OTHER")).unwrap();
-    assert!(matches!(find(None), Err(Error::NoSuchBackup(_))));
+    assert!(matches!(find(None), Err(Error::RestoreNeedsGuid)));
     assert_eq!(find(Some("0xother")).unwrap(), "OTHER");
     assert_eq!(find(Some(GUID)).unwrap(), GUID);
 }
@@ -1224,7 +1243,7 @@ fn backup_guid_without_any_backup_is_an_error() {
     };
     assert!(matches!(
         exec::backup_guid(&paths, None),
-        Err(Error::NoSuchBackup(_))
+        Err(Error::RestoreNeedsGuid)
     ));
     assert!(matches!(
         exec::backup_guid(&paths, Some(GUID)),
@@ -1332,4 +1351,463 @@ fn a_restore_while_the_ipod_lock_is_held_is_refused_and_changes_nothing() {
         fs::read(w.root.join("iPod_Control/iTunes/iTunesDB")).unwrap(),
         db_before
     );
+}
+
+// ---- restore: what it keeps, refuses and marks
+
+fn db_path(w: &World) -> PathBuf {
+    w.root.join("iPod_Control/iTunes/iTunesDB")
+}
+
+fn restoring(w: &World) -> Option<String> {
+    devices::restoring(w.env.store.conn(), w.device()).unwrap()
+}
+
+/// Road reduced to one track and synced: the backup of that sync holds the
+/// iPod as `world_with_old` made it.
+fn synced_once() -> (World, String) {
+    let w = world_with_old();
+    w.write_list("Road", &[D2]);
+    w.reload();
+    let out = w.sync().unwrap();
+    (w, out.backup.stamp)
+}
+
+fn prepare_result(w: &World) -> iprune_core::Result<Prepared> {
+    sync::prepare(w.env.store.conn(), &w.env.cfg, &w.open())
+}
+
+// Prevents (audit M2) a restore throwing away the database it replaces.
+#[test]
+fn restore_keeps_a_copy_of_the_database_it_replaces_with_the_mappings_and_a_snapshot() {
+    let (w, stamp) = synced_once();
+    let after_sync = fs::read(db_path(&w)).unwrap();
+    let snap_after_sync = w.snapshot();
+    let maps_after_sync = mapping_view(&w);
+
+    let r = restore_with(&w, &stamp, false).unwrap();
+
+    assert_ne!(r.saved.stamp, stamp);
+    assert_eq!(
+        fs::read(r.saved.dir.join("iTunesDB")).unwrap(),
+        after_sync,
+        "the replaced database"
+    );
+    assert_eq!(
+        verify::normalize(&fs::read_to_string(r.saved.dir.join("snapshot.txt")).unwrap()),
+        snap_after_sync
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(r.saved.dir.join("mappings.json")).unwrap()).unwrap();
+    assert_eq!(
+        saved["tracks"].as_array().unwrap().len(),
+        maps_after_sync.0.len()
+    );
+    assert_eq!(
+        saved["playlists"].as_array().unwrap().len(),
+        maps_after_sync.1.len()
+    );
+    // It is a backup like the others: listed, and it can be restored.
+    assert!(w.backups().iter().any(|b| b.stamp == r.saved.stamp));
+    assert_ne!(w.snapshot(), snap_after_sync, "the restore did replace it");
+    restore_with(&w, &r.saved.stamp, false).unwrap();
+    assert_eq!(w.snapshot(), snap_after_sync);
+    assert_eq!(mapping_view(&w), maps_after_sync);
+}
+
+// Prevents (audit M2) a restore of a backup that cannot be read replacing a
+// working database with a broken one.
+#[test]
+fn restoring_a_backup_that_cannot_be_read_is_refused_and_changes_nothing() {
+    type Damage = fn(&backup::Backup);
+    let damages: [(&str, Damage); 4] = [
+        ("garbage iTunesDB", |b| {
+            fs::write(b.dir.join("iTunesDB"), b"not an iTunesDB").unwrap()
+        }),
+        ("empty iTunesDB", |b| {
+            fs::write(b.dir.join("iTunesDB"), b"").unwrap()
+        }),
+        ("garbage mappings.json", |b| {
+            fs::write(b.dir.join("mappings.json"), b"{").unwrap()
+        }),
+        ("no mappings.json", |b| {
+            fs::remove_file(b.dir.join("mappings.json")).unwrap()
+        }),
+    ];
+    for (what, damage) in damages {
+        let (w, stamp) = synced_once();
+        let bad = w.backups().into_iter().find(|b| b.stamp == stamp).unwrap();
+        damage(&bad);
+        let tree_before = w.ipod_tree();
+        let maps = mapping_view(&w);
+        let backups = tree(&w.paths.data_dir.join("backups"));
+
+        let e = restore_with(&w, &stamp, false).expect_err(what);
+        assert!(
+            matches!(&e, Error::BadBackup { stamp: s, .. } if *s == stamp),
+            "{what}: {e:?}"
+        );
+        assert_eq!(w.ipod_tree(), tree_before, "{what}: the iPod");
+        assert_eq!(mapping_view(&w), maps, "{what}: the mappings");
+        assert_eq!(
+            tree(&w.paths.data_dir.join("backups")),
+            backups,
+            "{what}: no backup of the iPod was taken"
+        );
+        assert_eq!(restoring(&w), None, "{what}: nothing was started");
+        assert!(prepare_result(&w).is_ok(), "{what}: a sync is not refused");
+    }
+}
+
+// Prevents (audit H7) a deleted playlist's row id being given to a new
+// playlist, which a restored mapping would then attach to the old iPod list.
+// With the id never reused, the old list is recognised as the removed one and
+// the next sync deletes it, leaving the new playlist its own list.
+#[test]
+fn a_new_playlist_does_not_inherit_the_ipod_list_of_a_deleted_one_with_its_row_id() {
+    // Zold is the newest row, so its id is the highest.
+    let w = World::new(&[("Zold", vec![D1])]);
+    let conn = w.env.store.conn();
+    let zold_id = playlist_id(&w, "Zold").unwrap();
+    let max: i64 = conn
+        .query_row("SELECT MAX(id) FROM playlists", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(zold_id, max, "set up: Zold holds the highest row id");
+    let (zold_ipod, zold_members) = w.ipod_playlist("Zold").unwrap();
+    assert_eq!(zold_members, vec![D1]);
+
+    // The backup of this sync still maps zold_id to Zold's iPod list.
+    playlists::delete(conn, &w.env.cfg, "Zold").unwrap();
+    w.reload();
+    let out = w.sync().unwrap();
+    assert!(w.ipod_playlist("Zold").is_none());
+    assert_eq!(playlist_id(&w, "Zold"), None, "tombstone dropped");
+
+    w.write_list("Fresh", &[D3]);
+    w.reload();
+    let fresh_id = playlist_id(&w, "Fresh").unwrap();
+    assert_ne!(fresh_id, zold_id, "a freed id is not handed out again");
+
+    let r = restore_with(&w, &out.backup.stamp, false).unwrap();
+    assert_eq!(r.playlists_to_delete, 1, "Zold's row is gone");
+    assert_eq!(w.ipod_playlist("Zold"), Some((zold_ipod, vec![D1])));
+    let maps = mapping_view(&w).1;
+    assert!(
+        maps.iter()
+            .all(|m| m.0 != fresh_id || m.1 != Some(zold_ipod)),
+        "Fresh must not be mapped to Zold's list: {maps:?}"
+    );
+
+    w.sync().unwrap();
+    assert_eq!(w.ipod_playlist("Zold"), None, "the removed list is deleted");
+    let fresh = w.ipod_playlist("Fresh").expect("Fresh was created");
+    assert_ne!(fresh.0, zold_ipod);
+    assert_eq!(fresh.1, vec![D3]);
+}
+
+fn playlist_id(w: &World, name: &str) -> Option<i64> {
+    w.env
+        .store
+        .conn()
+        .query_row("SELECT id FROM playlists WHERE name = ?1", [name], |r| {
+            r.get(0)
+        })
+        .ok()
+}
+
+// Prevents (audit L78) a playlist the library no longer has coming back from
+// a restore and staying on the iPod for good, unmapped.
+#[test]
+fn a_playlist_the_library_dropped_since_the_backup_is_deleted_by_the_next_sync() {
+    let w = world_with_old();
+    let conn = w.env.store.conn();
+    playlists::delete(conn, &w.env.cfg, "Old").unwrap();
+    w.reload();
+    let out = w.sync().unwrap();
+    assert!(w.ipod_playlist("Old").is_none());
+    let road = w.ipod_playlist("Road").unwrap();
+    let mix = w.ipod_playlist("Mix").unwrap();
+    let stray = w.ipod_playlist("Stray").unwrap();
+
+    let r = restore_with(&w, &out.backup.stamp, false).unwrap();
+    assert_eq!(r.playlists_to_delete, 1);
+    let (old_ipod, old_members) = w.ipod_playlist("Old").expect("back on the iPod");
+    assert_eq!(old_members, vec![D1]);
+    // Mapped to a row the library has marked as removed.
+    let removed = iprune_core::store::removed_playlists(w.env.store.conn()).unwrap();
+    assert_eq!(removed.len(), 1, "{removed:?}");
+    let maps = mapping_view(&w).1;
+    let m = maps.iter().find(|m| m.1 == Some(old_ipod)).expect("mapped");
+    assert_eq!(m.0, removed[0].0);
+
+    let p = w.prepare();
+    assert_eq!(p.plan.playlists.len(), 1, "{:?}", p.plan.playlists);
+    w.sync().unwrap();
+    assert_eq!(w.ipod_playlist("Old"), None);
+    assert!(
+        iprune_core::store::removed_playlists(w.env.store.conn())
+            .unwrap()
+            .is_empty(),
+        "the tombstone is dropped once deleted"
+    );
+    // The other lists are as they were.
+    assert_eq!(w.ipod_playlist("Road"), Some(road));
+    assert_eq!(w.ipod_playlist("Mix"), Some(mix));
+    assert_eq!(w.ipod_playlist("Stray"), Some(stray));
+    assert!(w.prepare().plan.playlists.is_empty());
+}
+
+// The restored list and a library playlist of the same name, written after
+// the backup: the list is deleted, the library playlist gets its own.
+#[test]
+fn a_restored_list_whose_name_a_new_library_playlist_took_is_still_deleted() {
+    let w = world_with_old();
+    let conn = w.env.store.conn();
+    playlists::delete(conn, &w.env.cfg, "Old").unwrap();
+    w.reload();
+    let out = w.sync().unwrap();
+    w.write_list("Old", &[D3, D2]);
+    w.reload();
+
+    let r = restore_with(&w, &out.backup.stamp, false).unwrap();
+    assert_eq!(r.playlists_to_delete, 1);
+    let (restored_id, _) = w.ipod_playlist("Old").unwrap();
+
+    w.sync().unwrap();
+    let lists: Vec<(u64, Vec<u64>)> = w
+        .contents()
+        .playlists
+        .into_iter()
+        .filter(|p| p.name == "Old")
+        .map(|p| (p.id, p.members))
+        .collect();
+    assert_eq!(lists.len(), 1, "exactly one list of that name: {lists:?}");
+    assert_ne!(lists[0].0, restored_id, "the restored one is gone");
+    assert_eq!(lists[0].1, vec![D3, D2]);
+}
+
+// Prevents (audit M1) a restore onto an iPod whose GUID cannot be read taking
+// the only backup folder, which may belong to another iPod.
+#[test]
+fn a_restore_onto_an_ipod_without_a_readable_guid_is_refused_and_changes_nothing() {
+    let (w, stamp) = synced_once();
+    // Another iPod: no GUID in SysInfo, no SysInfoExtended.
+    let b_dir = tempfile::tempdir().unwrap();
+    let b_tracks = [IpodSpec {
+        dbid: 0x0B0B,
+        size: 1234,
+        ms: 1000,
+        title: "OnlyOnB",
+        artist: "ArtistB",
+        album: "",
+        plays: 7,
+    }];
+    let b_root = fake_ipod(
+        b_dir.path(),
+        None,
+        &b_tracks,
+        &[ipod_playlist("B list", &[0x0B0B])],
+    );
+    let b_before = tree(&b_root);
+    let maps = mapping_view(&w);
+    let backups = tree(&w.paths.data_dir.join("backups"));
+    assert_eq!(device::firewire_guid(&b_root), None, "set up");
+
+    // What `iprune restore` does with no --guid.
+    let e = exec::backup_guid(&w.paths, device::firewire_guid(&b_root).as_deref()).unwrap_err();
+    assert!(matches!(e, Error::RestoreNeedsGuid), "{e:?}");
+
+    assert_eq!(tree(&b_root), b_before, "iPod B is untouched");
+    assert_eq!(mapping_view(&w), maps);
+    assert_eq!(tree(&w.paths.data_dir.join("backups")), backups);
+    // A named folder is accepted (the user's choice).
+    assert_eq!(exec::backup_guid(&w.paths, Some(GUID)).unwrap(), GUID);
+    let _ = stamp;
+}
+
+// ---- restore: the unfinished marker
+
+/// Ways to make a restore fail after it has begun changing the iPod. Each
+/// returns what to remove to let the next try go through.
+fn obstruct_rename(w: &World) -> PathBuf {
+    // The artwork file cannot be replaced: a folder is in its place.
+    let art = w.root.join("iPod_Control/Artwork/ArtworkDB");
+    fs::remove_file(&art).unwrap();
+    fs::create_dir(&art).unwrap();
+    fs::write(art.join("inside"), "x").unwrap();
+    art
+}
+
+fn obstruct_copy(w: &World) -> PathBuf {
+    // The iTunesDB is staged under this name; a folder is there already.
+    let tmp = w.root.join("iPod_Control/iTunes/.iprune-restore-iTunesDB");
+    fs::create_dir(&tmp).unwrap();
+    tmp
+}
+
+// Prevents (audit M11) a restore stopped part way leaving a database that no
+// longer matches the mappings, with a sync free to run on it.
+#[test]
+fn a_restore_that_stops_part_way_blocks_sync_until_it_is_run_again() {
+    type Obstruct = fn(&World) -> PathBuf;
+    let cases: [(&str, Obstruct); 2] = [("rename", obstruct_rename), ("copy", obstruct_copy)];
+    for (what, obstruct) in cases {
+        let w = world_with_old();
+        // An ArtworkDB, so the backup holds one and the restore renames two files.
+        let art = w.root.join("iPod_Control/Artwork/ArtworkDB");
+        fs::create_dir_all(art.parent().unwrap()).unwrap();
+        fs::write(&art, "art").unwrap();
+        // Old is dropped, so the mappings differ before and after the restore.
+        playlists::delete(w.env.store.conn(), &w.env.cfg, "Old").unwrap();
+        w.reload();
+        let out = w.sync().unwrap();
+        let stamp = out.backup.stamp;
+        let maps_before_restore = mapping_view(&w);
+        let db_after_sync = fs::read(db_path(&w)).unwrap();
+        // Plays waiting: set aside before the restore stops.
+        w.write_play_counts(&[(1, 1_700_000_000, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]);
+
+        let blocker = obstruct(&w);
+        let e = restore_with(&w, &stamp, false).unwrap_err();
+        assert!(!matches!(e, Error::Verification { .. }), "{what}: {e:?}");
+
+        assert_eq!(
+            fs::read(db_path(&w)).unwrap(),
+            db_after_sync,
+            "{what}: the old iTunesDB is whole"
+        );
+        assert!(!w.play_counts().exists(), "{what}: the restore had begun");
+        assert_eq!(restoring(&w).as_deref(), Some(&stamp[..]), "{what}");
+        assert_eq!(
+            mapping_view(&w),
+            maps_before_restore,
+            "{what}: the mappings are replaced last"
+        );
+        let refused = prepare_result(&w).err();
+        assert!(
+            matches!(&refused, Some(Error::RestoreUnfinished(s)) if *s == stamp),
+            "{what}: {refused:?}"
+        );
+
+        // Run again, with the obstacle gone.
+        if blocker.is_dir() {
+            fs::remove_dir_all(&blocker).unwrap();
+        } else {
+            fs::remove_file(&blocker).unwrap();
+        }
+        let r = restore_with(&w, &stamp, false).unwrap();
+        assert_eq!(restoring(&w), None, "{what}: the mark is cleared");
+        assert!(prepare_result(&w).is_ok(), "{what}: sync is free again");
+        assert_eq!(
+            fs::read(db_path(&w)).unwrap(),
+            fs::read(r.saved.dir.parent().unwrap().join(&stamp).join("iTunesDB")).unwrap()
+        );
+        assert_ne!(fs::read(db_path(&w)).unwrap(), db_after_sync);
+        assert_eq!(
+            mapping_view(&w).1.len(),
+            maps_before_restore.1.len() + 1,
+            "{what}: Old's mapping is back (as a removed list)"
+        );
+        assert_eq!(fs::read_to_string(&art).unwrap(), "art", "{what}");
+    }
+}
+
+// ---- restore: Play Counts when the database cannot be read
+
+/// `synced_once` and then a database that no longer parses, with a
+/// `Play Counts` of `counts` bytes when given.
+fn damaged(counts: Option<&[u8]>) -> (World, String) {
+    let (w, stamp) = synced_once();
+    fs::write(db_path(&w), b"damaged").unwrap();
+    if let Some(c) = counts {
+        fs::write(w.play_counts(), c).unwrap();
+    }
+    assert!(gpod::Database::open(&w.root).is_err(), "set up");
+    (w, stamp)
+}
+
+// Prevents (audit H2) discarding plays that cannot be pulled without being
+// asked to.
+#[test]
+fn an_unreadable_database_with_plays_waiting_is_refused_unless_they_may_be_discarded() {
+    let counts = b"mhdp-not-really-but-not-empty";
+    let (w, stamp) = damaged(Some(counts));
+    let tree_before = w.ipod_tree();
+    let maps = mapping_view(&w);
+    let backups = tree(&w.paths.data_dir.join("backups"));
+
+    let e = restore_with(&w, &stamp, false).unwrap_err();
+    assert!(matches!(e, Error::PlayCountsUnread), "{e:?}");
+    assert_eq!(w.ipod_tree(), tree_before, "nothing changed on the iPod");
+    assert_eq!(mapping_view(&w), maps);
+    assert_eq!(tree(&w.paths.data_dir.join("backups")), backups);
+    assert_eq!(restoring(&w), None);
+
+    let r = restore_with(&w, &stamp, true).unwrap();
+    assert_eq!(r.set_aside, vec!["Play Counts"]);
+    assert_eq!(r.pulled.tracks(), 0);
+    assert!(!w.play_counts().exists());
+    // Kept in the backup of what the restore replaced, with the database.
+    assert_eq!(fs::read(r.saved.dir.join("Play Counts")).unwrap(), counts);
+    assert_eq!(fs::read(r.saved.dir.join("iTunesDB")).unwrap(), b"damaged");
+    assert!(!r.saved.dir.join("snapshot.txt").exists(), "none to take");
+    assert!(w.open().track_count() > 0, "the iPod reads again");
+    assert_eq!(restoring(&w), None);
+}
+
+// An empty Play Counts holds no plays, and with none the damage alone does
+// not stop a restore, which exists to repair it.
+#[test]
+fn an_unreadable_database_with_no_plays_waiting_restores_without_the_flag() {
+    for counts in [None, Some(&b""[..])] {
+        let (w, stamp) = damaged(counts);
+        let r = restore_with(&w, &stamp, false).unwrap();
+        assert!(w.open().track_count() > 0, "{counts:?}");
+        assert!(!w.play_counts().exists(), "{counts:?}");
+        assert_eq!(
+            r.set_aside.len(),
+            usize::from(counts.is_some()),
+            "{counts:?}"
+        );
+        assert_eq!(restoring(&w), None);
+    }
+}
+
+// ---- restore: the read-back
+
+// Prevents (audit M2) a restore that does not read back as the backup
+// passing for done. A leftover `iTunesCDB` makes libgpod read that file
+// instead of the restored `iTunesDB`.
+#[test]
+fn a_restore_whose_result_cannot_be_read_back_says_so_and_stays_marked() {
+    let (w, stamp) = synced_once();
+    fs::write(
+        w.root.join("iPod_Control/iTunes/iTunesCDB"),
+        b"not a database",
+    )
+    .unwrap();
+    assert!(gpod::Database::open(&w.root).is_err(), "set up");
+
+    let e = restore_with(&w, &stamp, false).unwrap_err();
+    let Error::RestoreVerification {
+        problems,
+        stamp: s,
+        saved,
+    } = &e
+    else {
+        panic!("{e:?}");
+    };
+    assert_eq!(s, &stamp);
+    assert!(!problems.is_empty());
+    assert!(e.is_check_failure(), "exit 3");
+    // The message names both ways out.
+    let text = e.to_string();
+    assert!(
+        text.contains(&stamp) && text.contains(saved.as_str()),
+        "{text}"
+    );
+    // The pre-restore copy exists, and the mark stays.
+    assert!(w.backups().iter().any(|b| b.stamp == *saved));
+    assert_eq!(restoring(&w).as_deref(), Some(&stamp[..]));
+    // (A sync is refused for the mark, see the test of a stopped restore.)
 }

@@ -597,7 +597,10 @@ fn settled_tracks_are_not_read_and_unreadable_files_do_not_stop_the_run() {
     let c = content_world(3);
     let _keep = &c.dir;
     // Track 1: file absent. Track 2: file present. Track 3: path is a directory.
+    // (`fake_ipod` gives every entry a file, so two are taken away.)
+    fs::remove_file(ipod_file(&c.root, 0)).unwrap();
     put(&c.root, 1, &fs::read(&c.lib[1]).unwrap());
+    fs::remove_file(ipod_file(&c.root, 2)).unwrap();
     fs::create_dir_all(ipod_file(&c.root, 2)).unwrap();
     let run = c.run();
 

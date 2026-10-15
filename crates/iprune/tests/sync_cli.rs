@@ -526,11 +526,9 @@ fn sync_copies_a_new_file_to_the_fake_ipod_and_reports_the_counts() {
         ),
     )
     .unwrap();
+    // The fake iPod holds a file for each of its three entries.
     let files_before = sb.music_files();
-    assert!(
-        files_before.is_empty(),
-        "set up: the fake iPod holds no audio"
-    );
+    assert_eq!(files_before.len(), 3, "set up: {files_before:?}");
     let size = fs::metadata(&four).unwrap().len();
 
     let o = sb.ok(&["sync", "--yes"]);
@@ -544,9 +542,13 @@ fn sync_copies_a_new_file_to_the_fake_ipod_and_reports_the_counts() {
     assert!(text.contains("verified"), "{text}");
     assert!(!text.contains("left out"), "{text}");
 
-    // One audio file on the iPod, with the library file's bytes, and the
+    // One new audio file on the iPod, with the library file's bytes, and the
     // track in the playlist after the two that were there.
-    let files = sb.music_files();
+    let files: Vec<PathBuf> = sb
+        .music_files()
+        .into_iter()
+        .filter(|f| !files_before.contains(f))
+        .collect();
     assert_eq!(files.len(), 1, "{files:?}");
     assert_eq!(fs::read(&files[0]).unwrap(), fs::read(&four).unwrap());
     assert_eq!(files[0].metadata().unwrap().len(), size);
@@ -563,7 +565,7 @@ fn sync_copies_a_new_file_to_the_fake_ipod_and_reports_the_counts() {
     // Nothing left to do, and no second copy of the file.
     let again = sb.ok(&["sync", "--yes"]);
     assert!(out(&again).contains("Nothing to apply"), "{}", out(&again));
-    assert_eq!(sb.music_files().len(), 1);
+    assert_eq!(sb.music_files().len(), 4);
     assert_eq!(sb.stamps().len(), 1);
 }
 
@@ -644,7 +646,17 @@ fn backups_lists_the_backups_of_each_ipod() {
     let text = out(&o);
     let lines: Vec<&str> = text.lines().map(str::trim).collect();
     assert!(lines.iter().any(|l| l.contains(GUID_DIR)), "{lines:?}");
-    assert!(lines.iter().any(|l| *l == stamps[0]), "{lines:?}");
+    // The stamp is followed by what the backup holds, from its snapshot:
+    // the iPod's name and its counts (three tracks, the master list and Road).
+    let line = lines
+        .iter()
+        .find(|l| l.starts_with(&stamps[0]))
+        .unwrap_or_else(|| panic!("no line for the backup: {lines:?}"));
+    let what = line[stamps[0].len()..].trim();
+    assert!(
+        what.contains("iPod de Test") && what.contains("3 tracks") && what.contains("2 playlists"),
+        "{line:?}"
+    );
 }
 
 #[test]
@@ -705,6 +717,159 @@ fn restore_with_no_backups_at_all_fails_cleanly() {
     assert_eq!(sb.tree(&sb.ipod), ipod_before);
 }
 
+// ---- restore: --guid, the copy of what it replaces, an unfinished restore
+
+impl Sandbox {
+    /// `adopted()`, one sync (Road reversed) and its backup's stamp.
+    fn synced(&self) -> String {
+        self.reverse_road();
+        self.ok(&["sync", "--yes"]);
+        self.stamps().remove(0)
+    }
+}
+
+// Prevents (audit M1) a restore with a backup folder named for another iPod
+// than the one plugged in.
+#[test]
+fn restore_with_a_guid_that_is_not_the_connected_ipods_is_refused_and_changes_nothing() {
+    let sb = adopted();
+    let stamp = sb.synced();
+    let ipod_before = sb.tree(&sb.ipod);
+    let backups_before = sb.tree(&sb.backups_dir());
+
+    let o = sb.run(&["restore", &stamp, "--guid", "0x000A27009999AAAA", "--yes"]);
+    assert_code(&o, 1);
+    let text = err(&o);
+    assert!(
+        text.contains("9999AAAA") && text.contains("000A27001234ABCD"),
+        "both GUIDs are named: {text}"
+    );
+    assert_eq!(sb.tree(&sb.ipod), ipod_before);
+    assert_eq!(sb.tree(&sb.backups_dir()), backups_before, "no new backup");
+
+    // The same GUID written another way is the same iPod.
+    let o = sb.ok(&["restore", &stamp, "--guid", "000a27001234abcd", "--yes"]);
+    assert!(out(&o).contains("restored iTunesDB"), "{}", out(&o));
+}
+
+// Prevents (audit M1) an iPod without a readable GUID being given the only
+// backup folder there is.
+#[test]
+fn restore_onto_an_ipod_without_a_readable_guid_needs_the_folder_named() {
+    let sb = adopted();
+    let stamp = sb.synced();
+    fs::remove_file(sb.ipod.join("iPod_Control/Device/SysInfo")).unwrap();
+    let ipod_before = sb.tree(&sb.ipod);
+    let backups_before = sb.tree(&sb.backups_dir());
+
+    let o = sb.run(&["restore", &stamp, "--yes"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("--guid"), "{}", err(&o));
+    assert_eq!(sb.tree(&sb.ipod), ipod_before);
+    assert_eq!(sb.tree(&sb.backups_dir()), backups_before);
+
+    // `iprune backups` names the folder.
+    let listed = out(&sb.ok(&["backups"]));
+    assert!(listed.contains(GUID_DIR), "{listed}");
+    let o = sb.ok(&["restore", &stamp, "--guid", GUID_DIR, "--yes"]);
+    assert!(out(&o).contains("restored iTunesDB"), "{}", out(&o));
+    assert_ne!(sb.tree(&sb.ipod), ipod_before);
+}
+
+#[test]
+fn restore_says_where_it_saved_what_it_replaced() {
+    let sb = adopted();
+    let stamp = sb.synced();
+    let after_sync = sb.itunesdb();
+    let o = sb.ok(&["restore", &stamp, "--yes"]);
+    let stamps = sb.stamps();
+    assert_eq!(stamps.len(), 2, "{stamps:?}");
+    let saved = stamps.iter().find(|s| **s != stamp).unwrap();
+    assert!(out(&o).contains(saved.as_str()), "{}", out(&o));
+    assert_eq!(
+        fs::read(sb.backups_dir().join(GUID_DIR).join(saved).join("iTunesDB")).unwrap(),
+        after_sync,
+        "the replaced database is that backup"
+    );
+}
+
+// Prevents (audit H2) plays that cannot be pulled being dropped without the
+// flag that says so.
+#[test]
+fn restore_over_a_database_that_cannot_be_read_keeps_play_counts_unless_told_to_discard_them() {
+    let sb = adopted();
+    let stamp = sb.synced();
+    let db = sb.ipod.join("iPod_Control/iTunes/iTunesDB");
+    let counts = sb.ipod.join("iPod_Control/iTunes/Play Counts");
+    fs::write(&db, b"damaged").unwrap();
+    fs::write(&counts, b"some plays").unwrap();
+    let ipod_before = sb.tree(&sb.ipod);
+
+    let o = sb.run(&["restore", &stamp, "--yes"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("--discard-play-counts"), "{}", err(&o));
+    assert_eq!(sb.tree(&sb.ipod), ipod_before);
+    assert_eq!(sb.stamps().len(), 1, "nothing was saved: nothing changed");
+
+    sb.ok(&["restore", &stamp, "--discard-play-counts", "--yes"]);
+    assert!(!counts.exists());
+    assert!(gpod::Database::open(&sb.ipod).is_ok());
+    let saved = sb.stamps().pop().unwrap();
+    assert_eq!(
+        fs::read(
+            sb.backups_dir()
+                .join(GUID_DIR)
+                .join(saved)
+                .join("Play Counts")
+        )
+        .unwrap(),
+        b"some plays"
+    );
+}
+
+// Prevents (audit M11) a sync or a repair running on an iPod whose restore
+// stopped part way.
+#[test]
+fn after_a_restore_that_stopped_sync_and_doctor_fix_refuse_until_it_is_run_again() {
+    let sb = adopted();
+    // An ArtworkDB, so the backup holds one and the restore renames two files.
+    let art = sb.ipod.join("iPod_Control/Artwork/ArtworkDB");
+    fs::create_dir_all(art.parent().unwrap()).unwrap();
+    fs::write(&art, "art").unwrap();
+    let stamp = sb.synced();
+    // The artwork file cannot be replaced: a folder stands in its place.
+    fs::remove_file(&art).unwrap();
+    fs::create_dir(&art).unwrap();
+    fs::write(art.join("inside"), "x").unwrap();
+
+    let o = sb.run(&["restore", &stamp, "--yes"]);
+    assert_code(&o, 1);
+    let stopped_ipod = sb.tree(&sb.ipod);
+    let stopped_backups = sb.tree(&sb.backups_dir());
+    for args in [
+        &["sync", "--yes"][..],
+        &["sync", "--plan-only"],
+        &["doctor", "--fix", "--yes"],
+    ] {
+        let o = sb.run(args);
+        assert_code(&o, 1);
+        assert!(
+            err(&o).contains(&stamp) && err(&o).contains("restore"),
+            "{args:?}: {}",
+            err(&o)
+        );
+        assert_eq!(sb.tree(&sb.ipod), stopped_ipod, "{args:?}");
+        assert_eq!(sb.tree(&sb.backups_dir()), stopped_backups, "{args:?}");
+    }
+
+    // Run again, once what stopped it is gone.
+    fs::remove_dir_all(&art).unwrap();
+    sb.ok(&["restore", &stamp, "--yes"]);
+    assert_eq!(fs::read_to_string(&art).unwrap(), "art");
+    sb.ok(&["sync", "--yes"]);
+    sb.ok(&["doctor", "--fix", "--yes"]);
+}
+
 // ---- the iPod lock
 
 impl Sandbox {
@@ -763,14 +928,15 @@ fn plan_only_and_doctor_read_the_ipod_only_under_the_lock() {
 // ---- doctor
 
 impl Sandbox {
-    /// Puts a file at each track's place on the fake iPod, so no entry is
-    /// missing its file (make_ipod.c names the k-th track F(k)/T000k.mp3).
-    fn give_files(&self, n: usize) {
-        for k in 0..n {
+    /// Deletes the file of the k-th track of the fake iPod for each k given,
+    /// so those entries are missing their file. `fake_ipod` gives every
+    /// entry a file (make_ipod.c names the k-th track F(k)/T000k.mp3).
+    fn lose_files(&self, ks: impl IntoIterator<Item = usize>) {
+        for k in ks {
             let f = self
                 .ipod
                 .join(format!("iPod_Control/Music/F{k:02}/T{k:04}.mp3"));
-            fs::write(f, format!("audio {k}")).unwrap();
+            fs::remove_file(&f).unwrap();
         }
     }
 
@@ -789,8 +955,7 @@ impl Sandbox {
 
 #[test]
 fn doctor_on_a_clean_ipod_says_so_and_changes_nothing() {
-    let sb = adopted();
-    sb.give_files(3);
+    let sb = adopted(); // every entry has its file
     let before = sb.tree(&sb.ipod);
     let o = sb.ok(&["doctor"]);
     assert!(out(&o).contains("nothing to repair"), "{}", out(&o));
@@ -800,7 +965,7 @@ fn doctor_on_a_clean_ipod_says_so_and_changes_nothing() {
 #[test]
 fn doctor_without_fix_lists_the_problems_and_changes_nothing() {
     let sb = adopted();
-    sb.give_files(2); // the third entry has no file
+    sb.lose_files([2]); // the third entry has no file
     let orphan = sb.orphans(1);
     let before = sb.tree(&sb.ipod);
     let o = sb.ok(&["doctor"]);
@@ -818,7 +983,7 @@ fn doctor_without_fix_lists_the_problems_and_changes_nothing() {
 #[test]
 fn doctor_fix_without_yes_and_without_a_terminal_changes_nothing() {
     let sb = adopted();
-    sb.give_files(2);
+    sb.lose_files([2]);
     sb.orphans(1);
     let before = sb.tree(&sb.ipod);
     let o = sb.run(&["doctor", "--fix"]);
@@ -831,7 +996,7 @@ fn doctor_fix_without_yes_and_without_a_terminal_changes_nothing() {
 #[test]
 fn doctor_fix_repairs_the_entries_the_orphans_and_keeps_the_playlist_mappings() {
     let sb = adopted();
-    sb.give_files(2); // track 3 (three.wav) has no file
+    sb.lose_files([2]); // track 3 (three.wav) has no file
     let orphans = sb.orphans(2);
     let mappings_before = sb.mappings();
     assert_eq!(mappings_before.0, 3);
@@ -870,7 +1035,7 @@ fn doctor_fix_repairs_the_entries_the_orphans_and_keeps_the_playlist_mappings() 
 #[test]
 fn doctor_fix_deletes_orphans_after_its_own_sync_and_leaves_the_lock_free() {
     let sb = adopted();
-    sb.give_files(2); // track 3 has no file: a sync runs, then the orphans go
+    sb.lose_files([2]); // track 3 has no file: a sync runs, then the orphans go
     let orphans = sb.orphans(2);
     let o = sb.ok(&["doctor", "--fix", "--yes"]);
     assert!(out(&o).contains("deleted 2 orphan files"), "{}", out(&o));
@@ -881,7 +1046,7 @@ fn doctor_fix_deletes_orphans_after_its_own_sync_and_leaves_the_lock_free() {
 #[test]
 fn doctor_fix_will_not_delete_orphans_while_the_ipod_lock_is_held() {
     let sb = adopted();
-    sb.give_files(3); // nothing missing: only orphans to delete
+    // nothing missing: only orphans to delete
     let orphans = sb.orphans(2);
     let before = sb.tree(&sb.ipod);
     let lock = sb.hold_ipod_lock();
@@ -899,7 +1064,6 @@ fn doctor_fix_will_not_delete_orphans_while_the_ipod_lock_is_held() {
 #[test]
 fn many_orphans_are_refused_until_allowed() {
     let sb = adopted();
-    sb.give_files(3);
     let orphans = sb.orphans(6);
     let before = sb.tree(&sb.ipod);
     let o = sb.run(&["doctor", "--fix", "--yes"]);
@@ -917,7 +1081,7 @@ fn many_orphans_are_refused_until_allowed() {
 #[test]
 fn many_orphans_with_missing_entries_refuse_before_any_repair() {
     let sb = adopted();
-    sb.give_files(2); // track 3 has no file: a database repair is due
+    sb.lose_files([2]); // track 3 has no file: a database repair is due
     let orphans = sb.orphans(6);
     let before = sb.tree(&sb.ipod);
     let mappings_before = sb.mappings();
@@ -935,7 +1099,7 @@ fn many_orphans_with_missing_entries_refuse_before_any_repair() {
 
 /// Like `adopted()`, with `extra` more iPod tracks no library file
 /// matches (dbids 100 and up). The k-th track of the iPod database has
-/// its place at F(k)/T000k.mp3, which `give_files` fills.
+/// its place at F(k)/T000k.mp3, where `fake_ipod` puts its file.
 fn adopted_with_extras(extra: usize) -> Sandbox {
     let sb = Sandbox::new();
     sb.library(&[
@@ -983,7 +1147,7 @@ fn adopted_with_extras(extra: usize) -> Sandbox {
 #[test]
 fn many_missing_entries_are_refused_until_allowed() {
     let sb = adopted_with_extras(8);
-    sb.give_files(4); // 3 managed + Extra0 have files; Extra1..7 do not
+    sb.lose_files(4..11); // Extra1..7 have no file; 3 managed + Extra0 do
     let before = sb.tree(&sb.ipod);
     let mappings_before = sb.mappings();
     let o = sb.run(&["doctor", "--fix", "--yes"]);
@@ -1019,7 +1183,7 @@ fn many_missing_entries_are_refused_until_allowed() {
 #[test]
 fn five_missing_entries_pass_without_the_flag() {
     let sb = adopted_with_extras(8);
-    sb.give_files(6); // Extra0..2 have files; Extra3..7 (5 entries) do not
+    sb.lose_files(6..11); // Extra3..7 (5 entries) have no file; Extra0..2 do
     let o = sb.ok(&["doctor", "--fix", "--yes"]);
     assert!(
         out(&o).contains("removed 5 database entries"),
@@ -1063,7 +1227,7 @@ fn sync_takes_back_tracks_a_crash_left_unrecorded_and_says_so() {
     let four = sb.music.join("four.mp3");
     fs::copy(fixture(Kind::Mp3, 4), &four).unwrap();
     sb.ok(&["sync", "--yes"]);
-    assert_eq!(sb.music_files().len(), 1);
+    assert_eq!(sb.music_files().len(), 4);
     // The crash: the index forgot the track the iPod now holds.
     {
         let store = Store::open(&sb.base().join("data/iprune/iprune.sqlite")).unwrap();
@@ -1083,8 +1247,88 @@ fn sync_takes_back_tracks_a_crash_left_unrecorded_and_says_so() {
         err(&o)
     );
     assert!(out(&o).contains("Nothing to apply"), "{}", out(&o));
-    assert_eq!(sb.music_files().len(), 1, "not copied a second time");
+    assert_eq!(sb.music_files().len(), 4, "not copied a second time");
     assert_eq!(sb.mappings().0, 4);
+}
+
+// ---- the guard on copying many tracks again for a missing file
+
+/// Eight library files and an iPod holding all of them, with their files.
+/// Adopted.
+fn adopted_eight() -> Sandbox {
+    let sb = Sandbox::new();
+    let names: Vec<String> = (1..=8).map(|i| format!("s{i}.mp3")).collect();
+    let files: Vec<(&str, Kind, u32)> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), Kind::Mp3, i as u32 + 1))
+        .collect();
+    sb.library(&files);
+    let tracks: Vec<IpodSpec> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let title: &'static str = Box::leak(format!("Title{}", i + 1).into_boxed_str());
+            let artist: &'static str = Box::leak(format!("Artist{}", i + 1).into_boxed_str());
+            sb.spec(n, 100 + i as u64, title, artist)
+        })
+        .collect();
+    fake_ipod(
+        &sb.ipod,
+        Some(GUID_SYSINFO),
+        &tracks,
+        &[ipod_playlist("Road", &[100, 101])],
+    );
+    fs::write(
+        sb.lists.join("Road.m3u8"),
+        format!(
+            "{}\n{}\n",
+            sb.music.join("s1.mp3").display(),
+            sb.music.join("s2.mp3").display()
+        ),
+    )
+    .unwrap();
+    sb.ok(&["adopt"]);
+    assert_eq!(sb.mappings().0, 8, "set up: all adopted");
+    sb
+}
+
+#[test]
+fn many_files_missing_from_the_ipod_are_refused_with_exit_1_until_allowed() {
+    let sb = adopted_eight();
+    sb.lose_files(1..7); // six entries
+    let ipod_before = sb.tree(&sb.ipod);
+    let o = sb.run(&["sync", "--yes"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("--allow-mass-removal"), "{}", err(&o));
+    assert!(err(&o).contains("6 of 8"), "{}", err(&o));
+    // Refused before the prompt: without --yes the reason is still this one.
+    let o = sb.run(&["sync"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("--allow-mass-removal"), "{}", err(&o));
+    assert_eq!(sb.tree(&sb.ipod), ipod_before, "the iPod is untouched");
+    assert!(!sb.backups_dir().exists(), "no backup, so no write began");
+
+    let o = sb.ok(&["sync", "--yes", "--allow-mass-removal"]);
+    assert!(out(&o).contains("copied 6 again"), "{}", out(&o));
+    let db = gpod::Database::open(&sb.ipod).unwrap();
+    let contents = iprune_core::ipod::read(&db);
+    assert_eq!(contents.tracks.len(), 8);
+    for t in &contents.tracks {
+        let f = iprune_core::ipod::file_path(&sb.ipod, t.ipod_path.as_deref().unwrap()).unwrap();
+        assert!(f.is_file(), "{:x} has no file", t.adopt.dbid);
+    }
+    drop(db);
+    let again = sb.ok(&["sync", "--yes"]);
+    assert!(out(&again).contains("Nothing to apply"), "{}", out(&again));
+}
+
+#[test]
+fn five_files_missing_from_the_ipod_are_copied_again_without_the_flag() {
+    let sb = adopted_eight();
+    sb.lose_files(1..6); // five entries
+    let o = sb.ok(&["sync", "--yes"]);
+    assert!(out(&o).contains("copied 5 again"), "{}", out(&o));
 }
 
 // ---- desktop notifications (M7)

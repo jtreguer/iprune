@@ -280,6 +280,7 @@ fn plan() -> Plan {
         path: "/music/three.mp3".into(),
         size: 1003,
         old_size: 500,
+        file_missing: false,
     }];
     plan.update_tags = vec![
         TagOp {

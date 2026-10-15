@@ -105,6 +105,7 @@ pub fn plan(config: &Config, paths: &Paths) -> Result<Planned> {
     let opts = exec::Options::default();
     let mass_removal = exec::check_removals(&work.playlists, prepared.playlists_map.len(), opts)
         .and_then(|()| exec::check_track_removals(&work.tracks, prepared.tracks_map.len(), opts))
+        .and_then(|()| exec::check_missing_files(&prepared.plan, prepared.tracks_map.len(), opts))
         .err()
         .map(|e| e.to_string());
     Ok(Planned {

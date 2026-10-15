@@ -155,8 +155,11 @@ From the command line, for scripts:
 ### 7.4 Recovering
 
 - `iprune backups` lists saved iPod databases.
-- `iprune restore <backup>` puts one back. Files copied after that backup stay
-  on the iPod as orphans; `iprune doctor` finds and removes them.
+- `iprune restore <backup>` puts one back. It first pulls the plays waiting
+  on the iPod and backs up what it replaces, so a restore can be undone the
+  same way. Files copied after that backup stay on the iPod as orphans;
+  `iprune doctor` finds and removes them. Tracks whose files a later sync
+  deleted are copied again by the next sync.
 - `iprune doctor` also checks for playlists with repeated tracks, database
   entries whose files are gone, and files on the iPod with no database entry.
 

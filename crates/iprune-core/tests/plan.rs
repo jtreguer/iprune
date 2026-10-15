@@ -104,6 +104,7 @@ struct World {
     scope: Option<Vec<String>>,
     remove_unmanaged: bool,
     space: Option<Space>,
+    files_missing: std::collections::HashSet<u64>,
 }
 
 impl World {
@@ -175,6 +176,7 @@ impl World {
             },
             remove_unmanaged: self.remove_unmanaged,
             space: self.space,
+            files_missing: &self.files_missing,
         })
     }
 

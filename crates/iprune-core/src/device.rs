@@ -436,9 +436,7 @@ garbage line
         (tool, log)
     }
 
-    /// Writing a script and running it while another test forks can fail
-    /// with "Text file busy"; these tests take turns.
-    static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::SPAWN;
 
     #[test]
     fn run_tool_adds_no_user_interaction_last() {

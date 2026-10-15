@@ -422,6 +422,13 @@ pub fn fake_ipod(
         tracks,
         playlists,
     );
+    // Each track's file, where `make_ipod.c` points it, of its size (sparse):
+    // an entry with no file is a damaged iPod, which a sync repairs.
+    for (serial, t) in tracks.iter().enumerate() {
+        let f = fs::File::create(ctl.join(format!("Music/F{:02}/T{serial:04}.mp3", serial % 50)))
+            .unwrap();
+        f.set_len(t.size).unwrap();
+    }
     if let Some(s) = sysinfo {
         fs::write(ctl.join("Device/SysInfo"), s).unwrap();
     }

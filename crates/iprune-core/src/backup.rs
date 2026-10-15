@@ -73,6 +73,30 @@ pub fn create(
     now: i64,
     extra: &[(&str, &[u8])],
 ) -> Result<Backup> {
+    create_with(root, guid, mountpoint, now, extra, true)
+}
+
+/// Like [`create`], for the copy a restore takes of what it replaces: the
+/// iPod may have no `iTunesDB` left, and what is there is still kept. Such a
+/// backup is listed only when it holds an `iTunesDB`.
+pub fn create_before_restore(
+    root: &Path,
+    guid: &str,
+    mountpoint: &Path,
+    now: i64,
+    extra: &[(&str, &[u8])],
+) -> Result<Backup> {
+    create_with(root, guid, mountpoint, now, extra, false)
+}
+
+fn create_with(
+    root: &Path,
+    guid: &str,
+    mountpoint: &Path,
+    now: i64,
+    extra: &[(&str, &[u8])],
+    require_db: bool,
+) -> Result<Backup> {
     let base = root.join(guid);
     fs::create_dir_all(&base).at(&base)?;
     // Folders left by a backup interrupted part way.
@@ -104,7 +128,7 @@ pub fn create(
     for (name, rel, required) in FILES {
         let from = mountpoint.join(rel);
         if !from.is_file() {
-            if *required {
+            if *required && require_db {
                 return Err(Error::Io {
                     path: from,
                     source: std::io::ErrorKind::NotFound.into(),
@@ -122,6 +146,25 @@ pub fn create(
     }
     fs::rename(&partial, &dir).at(&dir)?;
     Ok(Backup { dir, stamp })
+}
+
+/// What a backup holds, from its `snapshot.txt`: the iPod's name and its
+/// track and playlist counts, as "iPod de Julien, 9669 tracks, 336
+/// playlists". `None` when the backup has no readable snapshot.
+pub fn summary(backup: &Backup) -> Option<String> {
+    let text = fs::read_to_string(backup.dir.join("snapshot.txt")).ok()?;
+    let mut lines = text.lines();
+    let counts: Vec<&str> = lines.next()?.split(' ').collect();
+    let ["tracks", tracks, "playlists", playlists] = counts[..] else {
+        return None;
+    };
+    let name = lines
+        .filter_map(|l| l.strip_prefix("P "))
+        .find_map(|l| Some(l[..l.find(" [master]")?].to_owned()));
+    Some(format!(
+        "{}, {tracks} tracks, {playlists} playlists",
+        name.as_deref().unwrap_or("unnamed iPod")
+    ))
 }
 
 /// The backups of one iPod, oldest first.
@@ -167,20 +210,66 @@ pub fn prune(root: &Path, guid: &str, keep: usize) -> Result<Vec<PathBuf>> {
     Ok(removed)
 }
 
-/// Puts the backed up `iTunesDB` and `ArtworkDB` back on the iPod, each
-/// through a temporary file and a rename. Returns the files restored.
+/// Puts the backed up `iTunesDB` and `ArtworkDB` back on the iPod. Every
+/// file is first copied next to its target under a temporary name and
+/// compared, then renamed over it, `iTunesDB` last: a failure while copying
+/// changes nothing, and one part way through the renames leaves the old
+/// `iTunesDB`. Returns the files restored.
 pub fn restore_files(backup: &Backup, mountpoint: &Path) -> Result<Vec<&'static str>> {
-    let mut done = Vec::new();
-    for (name, rel, _) in FILES.iter().filter(|(n, _, _)| RESTORED.contains(n)) {
+    let mut staged = Vec::new();
+    // `RESTORED` in reverse: `ArtworkDB`, then `iTunesDB`.
+    for name in RESTORED.iter().rev() {
         let from = backup.dir.join(name);
         if !from.is_file() {
             continue;
         }
+        let rel = FILES
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, rel, _)| *rel)
+            .expect("restored files are backed up");
         let to = mountpoint.join(rel);
         let dir = to.parent().expect("an iPod path has a parent");
         let tmp = dir.join(format!(".iprune-restore-{name}"));
-        copy_synced(&from, &tmp)?;
+        if let Err(e) = copy_synced(&from, &tmp) {
+            for (_, tmp, _) in &staged {
+                let _ = fs::remove_file(tmp);
+            }
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        staged.push((*name, tmp, to));
+    }
+    let mut done = Vec::new();
+    for (name, tmp, to) in staged {
         fs::rename(&tmp, &to).at(&to)?;
+        done.push(name);
+    }
+    Ok(done)
+}
+
+/// Files a restore takes off the iPod once they are in the backup taken
+/// before it: libgpod would read `Play Counts` and `OTGPlaylistInfo`, which
+/// index tracks by their position, against the restored database.
+pub const SET_ASIDE: &[&str] = &["Play Counts", "OTGPlaylistInfo"];
+
+/// Deletes the [`SET_ASIDE`] files from the iPod, each only when `kept`, the
+/// backup taken before the restore, holds the same bytes. Returns the files
+/// deleted.
+pub fn set_aside(kept: &Backup, mountpoint: &Path) -> Result<Vec<&'static str>> {
+    let mut done = Vec::new();
+    for (name, rel, _) in FILES.iter().filter(|(n, _, _)| SET_ASIDE.contains(n)) {
+        let live = mountpoint.join(rel);
+        let now = match fs::read(&live) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(Error::Io { path: live, source }),
+        };
+        let copy = kept.dir.join(name);
+        if fs::read(&copy).ok().as_deref() != Some(&now[..]) {
+            return Err(Error::BackupMismatch(copy));
+        }
+        fs::remove_file(&live).at(&live)?;
         done.push(*name);
     }
     Ok(done)

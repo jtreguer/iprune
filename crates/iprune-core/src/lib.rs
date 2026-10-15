@@ -25,6 +25,12 @@ pub mod verify;
 
 pub use error::{Error, Result};
 
+/// Writing a script and running it while another test forks can fail with
+/// "Text file busy": the unit tests that run a program they wrote take
+/// turns, across every module.
+#[cfg(test)]
+pub(crate) static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -275,6 +275,20 @@ pub fn check_track_removals(work: &TrackWork, mapped: usize, opts: Options) -> R
     Ok(())
 }
 
+/// Refuses copying again many managed tracks because their files seem
+/// missing on the iPod, which more likely means its music folder reads badly
+/// than files lost.
+pub fn check_missing_files(plan: &Plan, mapped: usize, opts: Options) -> Result<()> {
+    let missing = plan.replace.iter().filter(|r| r.file_missing).count();
+    if !opts.allow_mass_removal && missing > 5 && missing * 10 > mapped {
+        return Err(Error::MassMissingFiles {
+            missing,
+            managed: mapped,
+        });
+    }
+    Ok(())
+}
+
 /// `work.json` in a backup: what the sync was about to apply.
 #[derive(Serialize)]
 struct WorkFile<'a> {
@@ -529,6 +543,7 @@ pub fn sync(
         .ok_or_else(|| Error::NotAdopted(prepared.guid.clone()))?;
     check_removals(&work.playlists, prepared.playlists_map.len(), opts)?;
     check_track_removals(&work.tracks, prepared.tracks_map.len(), opts)?;
+    check_missing_files(&prepared.plan, prepared.tracks_map.len(), opts)?;
     if !work.tracks.copies.is_empty() && !prepared.plan.space.fits {
         return Err(Error::NoSpace);
     }
@@ -947,15 +962,27 @@ pub struct Restored {
     pub files: Vec<&'static str>,
     pub tracks: usize,
     pub playlists: usize,
-    /// Mappings dropped because their library track or playlist is gone.
+    /// Track mappings dropped because their library track is gone.
     pub dropped_tracks: usize,
-    pub dropped_playlists: usize,
+    /// iPod playlists the backup brings back whose library playlist is gone:
+    /// the next sync deletes them again.
+    pub playlists_to_delete: usize,
+    /// The backup of what the restore replaced.
+    pub saved: Backup,
+    /// Statistics pulled from the replaced database first.
+    pub pulled: Pulled,
+    /// Files taken off the iPod once saved, see [`backup::SET_ASIDE`].
+    pub set_aside: Vec<&'static str>,
 }
 
 /// The backup folder name for the iPod whose GUID is `guid` (as read by
 /// [`device::firewire_guid`]), matched without regard to case or a `0x`
-/// prefix. Without a GUID, the only iPod with backups, if there is one.
+/// prefix. Without a GUID the iPod cannot be told apart from another one,
+/// and it is refused: the caller names the folder instead.
 pub fn backup_guid(paths: &Paths, guid: Option<&str>) -> Result<String> {
+    let Some(guid) = guid else {
+        return Err(Error::RestoreNeedsGuid);
+    };
     let root = paths.data_dir.join("backups");
     let norm = device::normalize_guid;
     let names: Vec<String> = match std::fs::read_dir(&root) {
@@ -966,30 +993,50 @@ pub fn backup_guid(paths: &Paths, guid: Option<&str>) -> Result<String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(source) => return Err(Error::Io { path: root, source }),
     };
-    let found: Vec<&String> = match guid {
-        Some(g) => names.iter().filter(|n| norm(n) == norm(g)).collect(),
-        None => names.iter().collect(),
-    };
+    let found: Vec<&String> = names.iter().filter(|n| norm(n) == norm(guid)).collect();
     match found[..] {
         [one] => Ok(one.clone()),
-        [] => Err(Error::NoSuchBackup("no backups for this iPod".to_owned())),
-        _ => Err(Error::NoSuchBackup(
-            "backups of several iPods, and this one has no readable GUID".to_owned(),
-        )),
+        [] => Err(Error::NoSuchBackup(format!("any, for the iPod {guid}"))),
+        _ => Err(Error::NoSuchBackup(format!(
+            "folder for {guid}: several match"
+        ))),
+    }
+}
+
+fn bad_backup(stamp: &str, why: impl std::fmt::Display) -> Error {
+    Error::BadBackup {
+        stamp: stamp.to_owned(),
+        why: why.to_string(),
     }
 }
 
 /// Puts backup `stamp` of the iPod `guid` (a backup folder name, see
 /// [`backup_guid`]) back on the iPod at `mountpoint` and returns the
-/// device's mappings to what they were when it was taken. Files copied to the
-/// iPod after the backup stay as orphans. The iPod's database is not read, so
-/// this works when it is damaged.
+/// device's mappings to what they were when it was taken. In order:
+/// - the backup is read and its database parsed; nothing changes if either
+///   fails;
+/// - what the iPod holds now is backed up, with the current mappings;
+/// - when the current database can be read, its statistics are pulled as a
+///   sync would; when it cannot and a `Play Counts` file is there, the
+///   restore is refused unless `discard_play_counts`;
+/// - `Play Counts` and `OTGPlaylistInfo`, which index the current database
+///   by position, are taken off the iPod (they are in that backup);
+/// - the files are put back, read back and compared with the backup's
+///   database; the mappings are replaced last. From the first change to
+///   the iPod until then, the device is marked as being restored and a sync
+///   refuses to run, so a restore stopped part way is run again.
+///
+/// Mappings of library tracks gone since the backup are dropped. A
+/// playlist mapping whose library playlist is gone becomes a tombstone, so
+/// the next sync deletes the iPod playlist again. Files copied to the iPod
+/// after the backup stay as orphans for `iprune doctor`.
 pub fn restore(
     conn: &Connection,
     paths: &Paths,
     mountpoint: &Path,
     guid: &str,
     stamp: &str,
+    discard_play_counts: bool,
 ) -> Result<Restored> {
     let _lock = crate::lock::ipod(paths)?;
     let backups = paths.data_dir.join("backups");
@@ -998,17 +1045,62 @@ pub fn restore(
         .find(|b| b.stamp == stamp)
         .ok_or_else(|| Error::NoSuchBackup(stamp.to_owned()))?;
     let path = backup.dir.join("mappings.json");
-    let text = std::fs::read(&path).map_err(|source| Error::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let saved: SavedMappings = serde_json::from_slice(&text).map_err(|e| Error::Io {
-        path: path.clone(),
-        source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-    })?;
+    let text = std::fs::read(&path).map_err(|e| bad_backup(stamp, e))?;
+    let saved: SavedMappings = serde_json::from_slice(&text)
+        .map_err(|e| bad_backup(stamp, format!("mappings.json: {e}")))?;
+    // Parsed from a copy on its own: libgpod applies a `Play Counts` it
+    // finds next to the file, and the backup may hold one.
+    let expected = {
+        let lone = tempfile::tempdir_in(&paths.data_dir).map_err(|source| Error::Io {
+            path: paths.data_dir.clone(),
+            source,
+        })?;
+        let copy = lone.path().join("iTunesDB");
+        std::fs::copy(backup.dir.join("iTunesDB"), &copy).map_err(|e| bad_backup(stamp, e))?;
+        gpod::Database::open_file(&copy)
+            .map_err(|e| bad_backup(stamp, format!("iTunesDB: {e}")))
+            .and_then(|db| snapshot(&db))?
+    };
     device::check_writable(mountpoint)?;
     let device =
         devices::device_id(conn, guid)?.ok_or_else(|| Error::NotAdopted(guid.to_owned()))?;
+
+    // What the iPod holds now, before anything changes.
+    let current = gpod::Database::open(mountpoint).ok();
+    let live_counts = mountpoint.join("iPod_Control/iTunes/Play Counts");
+    if current.is_none()
+        && !discard_play_counts
+        && std::fs::metadata(&live_counts).is_ok_and(|m| m.len() > 0)
+    {
+        return Err(Error::PlayCountsUnread);
+    }
+    let current_tracks = devices::track_mappings(conn, device)?;
+    let current_playlists = devices::playlist_mappings(conn, device)?;
+    let mut extra: Vec<(&str, Vec<u8>)> = vec![(
+        "mappings.json",
+        json(&MappingsFile {
+            tracks: &current_tracks,
+            playlists: &current_playlists,
+        }),
+    )];
+    if let Some(db) = &current {
+        extra.push(("snapshot.txt", snapshot(db)?.into_bytes()));
+    }
+    let extra: Vec<(&str, &[u8])> = extra.iter().map(|(n, b)| (*n, &b[..])).collect();
+    let kept = backup::create_before_restore(&backups, guid, mountpoint, now_unix(), &extra)?;
+
+    // The plays on the iPod belong to the current database's tracks.
+    let pulled = match current {
+        Some(db) => {
+            let play_counts = stats::play_counts(mountpoint)?;
+            stats::recover(conn, device, play_counts)?;
+            let contents = ipod::read(&db);
+            drop(db);
+            stats::pull(conn, device, &current_tracks, &contents, play_counts.live)?
+        }
+        None => Pulled::default(),
+    };
+
     let track_ids: std::collections::HashSet<i64> = crate::store::all_tracks(conn)?
         .into_iter()
         .map(|t| t.id)
@@ -1017,26 +1109,60 @@ pub fn restore(
         .prepare("SELECT id FROM playlists")?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    let saved_counts = (saved.tracks.len(), saved.playlists.len());
+    let saved_tracks = saved.tracks.len();
     let tracks: Vec<TrackMapping> = saved
         .tracks
         .into_iter()
         .filter(|m| track_ids.contains(&m.track_id))
         .collect();
-    let playlists: Vec<PlaylistMapping> = saved
+    let (playlists, gone): (Vec<PlaylistMapping>, Vec<PlaylistMapping>) = saved
         .playlists
         .into_iter()
-        .filter(|m| playlist_ids.contains(&m.playlist_id))
-        .collect();
+        .partition(|m| playlist_ids.contains(&m.playlist_id));
+
+    crate::store::savepoint(conn, || devices::set_restoring(conn, device, Some(stamp)))?;
+    // The pull stands from here: its `Play Counts` is gone from the iPod.
+    let set_aside = backup::set_aside(&kept, mountpoint)?;
+    stats::settle(conn, device)?;
     let files = backup::restore_files(&backup, mountpoint)?;
+    let reread = gpod::Database::open(mountpoint).map_err(|e| Error::RestoreVerification {
+        problems: vec![format!("the restored database cannot be read: {e}")],
+        stamp: stamp.to_owned(),
+        saved: kept.stamp.clone(),
+    })?;
+    let diffs = verify::differences(
+        &verify::without_artwork(&expected),
+        &verify::without_artwork(&snapshot(&reread)?),
+        20,
+    );
+    drop(reread);
+    if !diffs.is_empty() {
+        return Err(Error::RestoreVerification {
+            problems: diffs,
+            stamp: stamp.to_owned(),
+            saved: kept.stamp.clone(),
+        });
+    }
+    let playlists_to_delete = gone.len();
     crate::store::savepoint(conn, || {
-        devices::replace_mappings(conn, device, &tracks, &playlists)
+        let mut all = playlists.clone();
+        for m in &gone {
+            all.push(PlaylistMapping {
+                playlist_id: crate::store::insert_tombstone(conn, &m.ipod_name)?,
+                ..m.clone()
+            });
+        }
+        devices::replace_mappings(conn, device, &tracks, &all)?;
+        devices::set_restoring(conn, device, None)
     })?;
     Ok(Restored {
         files,
         tracks: tracks.len(),
         playlists: playlists.len(),
-        dropped_tracks: saved_counts.0 - tracks.len(),
-        dropped_playlists: saved_counts.1 - playlists.len(),
+        dropped_tracks: saved_tracks - tracks.len(),
+        playlists_to_delete,
+        saved: kept,
+        pulled,
+        set_aside,
     })
 }

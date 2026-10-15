@@ -50,6 +50,9 @@ pub struct PlanInput<'a> {
     pub remove_unmanaged: bool,
     /// `None` when unknown; the plan then cannot be refused for space.
     pub space: Option<Space>,
+    /// iPod tracks whose audio file is missing from the iPod, such as
+    /// entries a restore brought back after a sync deleted their files.
+    pub files_missing: &'a HashSet<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -88,6 +91,9 @@ pub struct ReplaceOp {
     pub path: PathBuf,
     pub size: u64,
     pub old_size: u64,
+    /// Copied again because the iPod's file is missing, not because the
+    /// audio changed.
+    pub file_missing: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -490,13 +496,15 @@ pub fn plan(input: &PlanInput) -> Plan {
             Some(m) => {
                 let it = on_ipod[&m.dbid];
                 // A protected file already on the iPod stays as it is.
-                if !t.drm && !too_fast(t) && audio_changed(t, m) {
+                let file_missing = input.files_missing.contains(&m.dbid);
+                if !t.drm && !too_fast(t) && (file_missing || audio_changed(t, m)) {
                     plan.replace.push(ReplaceOp {
                         track_id: id,
                         old_dbid: m.dbid,
                         path: t.path.clone(),
                         size: t.size,
                         old_size: it.adopt.size,
+                        file_missing,
                     });
                     new_members.insert(id);
                 } else if t.tags_hash != m.synced_tags_hash {

@@ -193,7 +193,7 @@ is lost, without running adoption again.
 
 ```sql
 CREATE TABLE tracks (
-  id            INTEGER PRIMARY KEY,
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
   path          TEXT NOT NULL UNIQUE,        -- exact on-disk path, absolute
   path_key      TEXT NOT NULL UNIQUE,        -- NFC form of path, for lookups
   size          INTEGER NOT NULL,
@@ -208,14 +208,17 @@ CREATE TABLE tracks (
   compilation   INTEGER NOT NULL DEFAULT 0,
   tags_hash     BLOB NOT NULL,               -- hash of the fields synced to the iPod
   added_at      INTEGER NOT NULL,
-  missing_since INTEGER                      -- set when the file disappears
+  missing_since INTEGER,                     -- set when the file disappears
+  tag_error     TEXT,                        -- why the tags could not be read
+  drm           INTEGER NOT NULL DEFAULT 0   -- FairPlay protected
 );
 
 CREATE TABLE playlists (
-  id         INTEGER PRIMARY KEY,
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
   name       TEXT NOT NULL UNIQUE,
   file       TEXT NOT NULL UNIQUE,
-  file_mtime_ns INTEGER NOT NULL
+  file_mtime_ns INTEGER NOT NULL,
+  removed_at INTEGER                         -- a tombstone, see below
 );
 
 CREATE TABLE playlist_items (
@@ -230,7 +233,8 @@ CREATE TABLE devices (
   id            INTEGER PRIMARY KEY,
   firewire_guid TEXT NOT NULL UNIQUE,
   name TEXT, model TEXT,
-  last_sync_at  INTEGER
+  last_sync_at  INTEGER,
+  restoring     TEXT                          -- stamp of an unfinished restore
 );
 
 CREATE TABLE device_tracks (
@@ -239,6 +243,7 @@ CREATE TABLE device_tracks (
   dbid        INTEGER NOT NULL,               -- u64 stored as i64
   synced_tags_hash BLOB NOT NULL,
   synced_size INTEGER NOT NULL,
+  synced_duration_ms INTEGER,
   PRIMARY KEY (device_id, track_id),
   UNIQUE (device_id, dbid)
 );
@@ -247,6 +252,7 @@ CREATE TABLE device_playlists (
   device_id   INTEGER NOT NULL REFERENCES devices(id),
   playlist_id INTEGER NOT NULL REFERENCES playlists(id),
   ipod_name   TEXT NOT NULL,
+  ipod_id     INTEGER,                        -- the iPod playlist's persistent id
   PRIMARY KEY (device_id, playlist_id)
 );
 
@@ -257,7 +263,16 @@ CREATE TABLE stats (
   rating      INTEGER,                         -- 0..100
   last_played INTEGER
 );
+
+CREATE TABLE pending_pulls (                   -- see 11.2
+  device_id        INTEGER PRIMARY KEY REFERENCES devices(id),
+  play_counts_hash BLOB,
+  changes          TEXT NOT NULL,
+  at               INTEGER NOT NULL
+);
 ```
+
+This is the schema after every migration in `store/migrations`.
 
 Migrations are numbered SQL files applied in order, tracked with
 `PRAGMA user_version`.
@@ -669,14 +684,56 @@ and the mappings are not updated.
 
 `iprune restore <stamp>` (confirmation, or `--yes`) identifies the iPod from
 `SysInfoExtended` or `SysInfo`, not from its database, which may be the
-damaged part; with no readable GUID it uses the only iPod that has
-backups. It puts the backed up
-`iTunesDB` and `ArtworkDB` back on the iPod, each through a temporary file
-and a rename, then returns the device's mappings to the backup's
-`mappings.json`. Mappings whose library track or playlist row no longer
-exists are dropped. `Play Counts` is never restored: its plays were pulled
-already and would count twice. Files added after the backup become orphans
-until `doctor --fix` deletes them. `iprune backups` lists the backups.
+damaged part. With no readable GUID it refuses unless `--guid` names the
+iPod's backup folder, as `iprune backups` lists it: a backup of another
+iPod must never be written onto this one. The confirmation and `iprune
+backups` show each backup's iPod name and track and playlist counts, from
+its `snapshot.txt`. Under the iPod lock, in order:
+
+1. The backup's `mappings.json` is read and its `iTunesDB` parsed; if
+   either fails, nothing changes.
+2. What the iPod holds now is backed up like before a sync (its
+   `iTunesDB` may be missing), with the current mappings, so a restore can
+   itself be undone.
+3. When the current database can be read, a pending pull is settled and
+   the statistics are pulled, as before a sync: `Play Counts` belongs to
+   the current database's track order. When it cannot be read and a
+   non-empty `Play Counts` is there, the restore is refused unless
+   `--discard-play-counts`.
+4. The device is marked as being restored; `sync`, the window's Sync and
+   `doctor --fix` refuse to run until the mark is cleared, so a restore
+   stopped part way is run again. `Play Counts` and `OTGPlaylistInfo`,
+   which index tracks by position, are deleted from the iPod once the
+   backup of step 2 is checked to hold them, and the pull is settled.
+   On-The-Go lists are not restored.
+5. `ArtworkDB` then `iTunesDB` are copied next to their targets under
+   temporary names and compared, then renamed over them, `iTunesDB` last.
+6. The iPod's database is read back and compared with the backup's
+   `iTunesDB` read from a copy on its own, so no `Play Counts` is applied
+   (artwork fields left out). A difference exits 3, leaves the mark set,
+   and names both ways out: the same restore again, or a restore of the
+   backup of step 2.
+7. The mappings are replaced with the backup's and the mark cleared, in
+   one transaction. Mappings of library tracks gone since are dropped. A
+   playlist mapping whose library playlist is gone gets a tombstone row,
+   so the next sync deletes that iPod playlist again.
+
+Track and playlist ids are `AUTOINCREMENT` (migration 5): an id is never
+given to another track or playlist, so a backup's mappings cannot attach an
+old iPod entry to a different song or playlist. Ids freed before migration
+5 below the highest id then in use can still have been given out again; a
+backup taken before it may hold such mappings. Entries the backup brings
+back whose files a later sync deleted have no file: the next sync copies
+mapped tracks in scope again (`files_missing` in the planner input), and
+`doctor` reports the others. More than 5 such tracks that are also more
+than a tenth of the managed ones are refused without
+`--allow-mass-removal` (the window's "Apply it anyway"): that many more
+likely means the iPod's music folder reads badly. After restoring a backup
+older than a sync that removed many tracks it is expected, and the flag is
+the way through. Ratings pulled from the
+replaced database are overwritten by the restored database's own on the
+next sync. Files added after the backup become orphans
+until `doctor --fix` deletes them.
 
 ## 12. Doctor
 
@@ -712,7 +769,7 @@ iprune sync [--plan-only] [--verbose] [--json] [--yes] [--allow-mass-removal]
 iprune playlist list|show|new|rm|rename|add|remove|move ...
 iprune device info
 iprune backups
-iprune restore <stamp> [--yes]
+iprune restore <stamp> [--guid GUID] [--discard-play-counts] [--yes]
 iprune doctor [--fix]
 iprune snapshot <mountpoint|iTunesDB>
 iprune eject

@@ -225,6 +225,21 @@ pub fn normalize(snapshot: &str) -> String {
         .join("\n")
 }
 
+/// `snapshot` without each track's artwork fields (`art N mhii M`). A
+/// database read from a file alone has no artwork, the same one read on the
+/// iPod has its `ArtworkDB`.
+pub fn without_artwork(snapshot: &str) -> String {
+    snapshot
+        .lines()
+        // From the end: a tag may contain " | art ".
+        .map(|l| match (l.rfind(" | art "), l.rfind(" | rating ")) {
+            (Some(a), Some(r)) if l.starts_with("T ") && a < r => format!("{}{}", &l[..a], &l[r..]),
+            _ => l.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Lines that differ between two normalized snapshots, at most `limit`, as
 /// `-expected` / `+actual` pairs with their line number.
 pub fn differences(expected: &str, actual: &str, limit: usize) -> Vec<String> {

@@ -348,9 +348,7 @@ mod tests {
         }
     }
 
-    /// Writing a script and running it while another test forks can fail
-    /// with "Text file busy"; these tests take turns.
-    static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::SPAWN;
 
     fn fake_program(dir: &Path) -> (PathBuf, PathBuf) {
         let (tool, log) = (dir.join("fake-notify-send"), dir.join("log"));
@@ -392,6 +390,8 @@ mod tests {
 
     #[test]
     fn send_with_a_missing_program_is_an_error_not_a_panic() {
+        // It still forks.
+        let _turn = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
         let note = failed("x");
         let e = send_with("/nonexistent/notify-send", &note).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::NotFound);

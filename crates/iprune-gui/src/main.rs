@@ -1034,7 +1034,7 @@ impl Ui {
         note.set_xalign(0.0);
         page.append(&note);
 
-        let allow = gtk::CheckButton::with_label("Remove them from the iPod anyway");
+        let allow = gtk::CheckButton::with_label("Apply it anyway");
         if let Some(why) = &planned.mass_removal {
             let warn = gtk::Label::new(Some(why));
             warn.set_wrap(true);

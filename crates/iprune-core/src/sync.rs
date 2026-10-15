@@ -50,6 +50,9 @@ pub fn prepare(conn: &Connection, cfg: &Config, db: &gpod::Database) -> Result<P
         // Without a mapping every track would be copied a second time.
         _ => return Err(Error::NotAdopted(guid)),
     };
+    if let Some(stamp) = devices::restoring(conn, device)? {
+        return Err(Error::RestoreUnfinished(stamp));
+    }
     let library = store::all_tracks(conn)?;
     let playlists = devices::library_playlists(conn)?;
     let removed = store::removed_playlists(conn)?;
@@ -65,6 +68,22 @@ pub fn prepare(conn: &Connection, cfg: &Config, db: &gpod::Database) -> Result<P
     }
     let playlists_map = devices::playlist_mappings(conn, device)?;
     let space = db.mountpoint().map(|m| space(&m)).transpose()?;
+    // Entries whose file is gone, such as those a restore brought back after
+    // a sync deleted their files: mapped ones in scope are copied again.
+    let files_missing: std::collections::HashSet<u64> = match db.mountpoint() {
+        Some(mp) => ipod
+            .tracks
+            .iter()
+            .filter(|t| {
+                t.ipod_path
+                    .as_deref()
+                    .and_then(|p| ipod::file_path(&mp, p))
+                    .is_none_or(|f| !f.is_file())
+            })
+            .map(|t| t.adopt.dbid)
+            .collect(),
+        None => Default::default(),
+    };
     let scope = match cfg.sync.scope {
         config::Scope::All => Scope::All,
         config::Scope::Playlists => {
@@ -116,6 +135,7 @@ pub fn prepare(conn: &Connection, cfg: &Config, db: &gpod::Database) -> Result<P
         scope,
         remove_unmanaged: cfg.sync.remove_unmanaged,
         space,
+        files_missing: &files_missing,
     });
     Ok(Prepared {
         plan,
@@ -194,7 +214,7 @@ pub fn describe(p: &Prepared, verbose: bool) -> String {
     if !plan.replace.is_empty() {
         let _ = writeln!(
             w,
-            "  * {} with new audio to copy again",
+            "  * {} with new audio, or no file on the iPod, to copy again",
             plural(plan.replace.len(), "track", "tracks")
         );
     }
@@ -286,7 +306,7 @@ pub fn describe(p: &Prepared, verbose: bool) -> String {
     );
     section(
         w,
-        "Copy again (audio changed)",
+        "Copy again (audio changed, or no file on the iPod)",
         plan.replace.iter().map(|r| path(r.track_id)).collect(),
     );
     section(

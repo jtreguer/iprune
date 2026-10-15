@@ -93,6 +93,15 @@ enum Command {
     Restore {
         /// The backup's stamp, as `iprune backups` lists it.
         stamp: String,
+        /// The iPod's backup folder, as `iprune backups` lists it. Needed
+        /// only when the iPod's GUID cannot be read.
+        #[arg(long, value_name = "GUID")]
+        guid: Option<String>,
+        /// Restore even when the iPod's database cannot be read, so the
+        /// plays in its Play Counts file cannot be pulled first. The file is
+        /// kept in the backup taken before the restore.
+        #[arg(long)]
+        discard_play_counts: bool,
         /// Restore without asking for confirmation.
         #[arg(long)]
         yes: bool,
@@ -445,6 +454,7 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
     };
     exec::check_removals(&work.playlists, prepared.playlists_map.len(), opts)?;
     exec::check_track_removals(&work.tracks, prepared.tracks_map.len(), opts)?;
+    exec::check_missing_files(&prepared.plan, prepared.tracks_map.len(), opts)?;
     if !work.tracks.copies.is_empty() && !prepared.plan.space.fits {
         bail!("the tracks to copy do not fit on the iPod; nothing was changed");
     }
@@ -571,6 +581,12 @@ fn run_doctor(fix: bool, yes: bool, allow_mass_removal: bool) -> Result<Outcome>
         Some(g) => devices::device_id(conn, g)?,
         None => None,
     };
+    if fix
+        && let Some(d) = device
+        && let Some(stamp) = devices::restoring(conn, d)?
+    {
+        return Err(iprune_core::Error::RestoreUnfinished(stamp).into());
+    }
     let report = doctor::examine(conn, &mp, &contents, device, iprune_core::now_unix())?;
     let mut out = io::stdout().lock();
     print_list(
@@ -696,38 +712,83 @@ fn run_backups() -> Result<()> {
     for guid in guids {
         writeln!(out, "iPod {guid}")?;
         for b in backup::list(&root, &guid)? {
-            writeln!(out, "  {}", b.stamp)?;
+            match backup::summary(&b) {
+                Some(s) => writeln!(out, "  {}  {s}", b.stamp)?,
+                None => writeln!(out, "  {}", b.stamp)?,
+            }
         }
     }
     Ok(())
 }
 
-fn run_restore(stamp: &str, yes: bool) -> Result<Outcome> {
+fn run_restore(
+    stamp: &str,
+    guid: Option<&str>,
+    discard_play_counts: bool,
+    yes: bool,
+) -> Result<Outcome> {
     let (config, store) = load()?;
     let paths = paths()?;
     let mp = find_mountpoint(&config)?;
     // From the device files, not the database: the database may be damaged.
-    let guid = exec::backup_guid(&paths, device::firewire_guid(&mp).as_deref())?;
+    let read = device::firewire_guid(&mp);
+    if let (Some(read), Some(given)) = (&read, guid)
+        && device::normalize_guid(read) != device::normalize_guid(given)
+    {
+        return Err(iprune_core::Error::GuidMismatch {
+            ipod: read.clone(),
+            given: given.to_owned(),
+        }
+        .into());
+    }
+    let guid = exec::backup_guid(&paths, read.as_deref().or(guid))?;
     device::check_writable(&mp)?;
+    let backups = paths.data_dir.join("backups");
+    let what = backup::list(&backups, &guid)?
+        .into_iter()
+        .find(|b| b.stamp == stamp)
+        .and_then(|b| backup::summary(&b))
+        .map(|s| format!(" ({s})"))
+        .unwrap_or_default();
     if !yes
         && !confirm(&format!(
-            "Put backup {stamp} back on the iPod at {}, replacing its database?",
+            "Put backup {stamp} of iPod {guid}{what} back on the iPod at {}, replacing its database? \
+             What it holds now is backed up first.",
             mp.display()
         ))?
     {
         return Ok(Outcome::Declined);
     }
-    let r = exec::restore(store.conn(), &paths, &mp, &guid, stamp)?;
+    let r = exec::restore(store.conn(), &paths, &mp, &guid, stamp, discard_play_counts)?;
     println!(
-        "restored {}; mappings back to {} tracks and {} playlists",
+        "saved what the iPod held as backup {}; statistics pulled for {} tracks ({} plays)",
+        r.saved.stamp,
+        r.pulled.tracks(),
+        r.pulled.plays()
+    );
+    if !r.set_aside.is_empty() {
+        println!(
+            "took {} off the iPod: kept in backup {}",
+            r.set_aside.join(" and "),
+            r.saved.stamp
+        );
+    }
+    println!(
+        "restored {} and read it back; mappings back to {} tracks and {} playlists",
         r.files.join(" and "),
         r.tracks,
         r.playlists
     );
-    if r.dropped_tracks + r.dropped_playlists > 0 {
+    if r.dropped_tracks > 0 {
         println!(
-            "{} track and {} playlist mappings dropped: their file is gone",
-            r.dropped_tracks, r.dropped_playlists
+            "{} track mappings dropped: their library file is gone",
+            r.dropped_tracks
+        );
+    }
+    if r.playlists_to_delete > 0 {
+        println!(
+            "{} iPod playlists came back whose library playlist is gone; the next sync deletes them",
+            r.playlists_to_delete
         );
     }
     Ok(Outcome::Done)
@@ -844,7 +905,12 @@ fn main() -> ExitCode {
         } => run_doctor(*fix, *yes, *allow_mass_removal),
         Command::Eject => run_eject().map(|()| Outcome::Done),
         Command::Backups => run_backups().map(|()| Outcome::Done),
-        Command::Restore { stamp, yes } => run_restore(stamp, *yes),
+        Command::Restore {
+            stamp,
+            guid,
+            discard_play_counts,
+            yes,
+        } => run_restore(stamp, guid.as_deref(), *discard_play_counts, *yes),
         Command::Playlist(cmd) => playlist(cmd),
         Command::Snapshot { path } => snapshot(path).map(|()| Outcome::Done),
     };

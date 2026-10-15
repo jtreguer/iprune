@@ -62,6 +62,10 @@ pub enum Error {
     )]
     MassTrackRemoval { removes: usize, managed: usize },
     #[error(
+        "the plan copies {missing} of {managed} managed tracks again because their files are missing from the iPod: that many more likely means its music folder is not readable than lost files, unless an older backup was just restored. If that is intended, run again with --allow-mass-removal"
+    )]
+    MassMissingFiles { missing: usize, managed: usize },
+    #[error(
         "{files} files on the iPod are not in its database, which holds {tracks} tracks: that many more likely means a damaged database (see `iprune backups` and `iprune restore`) than leftovers. Nothing deleted; run again with --allow-mass-removal if you are sure"
     )]
     MassOrphans { files: usize, tracks: usize },
@@ -102,6 +106,33 @@ pub enum Error {
     Eject(String),
     #[error("no backup {0:?}; `iprune backups` lists them")]
     NoSuchBackup(String),
+    #[error(
+        "the iPod's FireWire GUID cannot be read, so iprune cannot tell which backups are its own; name its folder from `iprune backups` with --guid"
+    )]
+    RestoreNeedsGuid,
+    #[error("the connected iPod is {ipod}, not {given}; nothing was changed")]
+    GuidMismatch { ipod: String, given: String },
+    #[error("backup {stamp} cannot be read ({why}); nothing was changed")]
+    BadBackup { stamp: String, why: String },
+    #[error(
+        "the iPod's database cannot be read, so the plays in its Play Counts file cannot be pulled first; nothing was changed. Run again with --discard-play-counts to restore anyway: the file is kept in the backup taken before the restore"
+    )]
+    PlayCountsUnread,
+    #[error(
+        "backup {stamp} was put back but does not read back as expected:\n  {}\nthe iPod stays marked as being restored. Run `iprune restore {stamp}` again, or `iprune restore {saved}` to put back what it held before",
+        problems.join("\n  ")
+    )]
+    RestoreVerification {
+        problems: Vec<String>,
+        stamp: String,
+        saved: String,
+    },
+    #[error("the index cannot be upgraded: {0}")]
+    Migration(String),
+    #[error(
+        "a restore of backup {0} did not finish, so the iPod and the index may disagree; run `iprune restore {0}` again first"
+    )]
+    RestoreUnfinished(String),
     #[error("position {position} is out of range (playlist has {len} entries)")]
     BadPosition { position: usize, len: usize },
 }
@@ -114,6 +145,7 @@ impl Error {
             Error::PreWriteCheck(_)
             | Error::CheckAfterCheckpoint(_)
             | Error::Verification { .. }
+            | Error::RestoreVerification { .. }
             | Error::WriteIncomplete { .. } => true,
             Error::UndoFailed { cause, .. } => cause.is_check_failure(),
             _ => false,

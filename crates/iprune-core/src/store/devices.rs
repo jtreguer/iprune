@@ -85,6 +85,29 @@ pub struct PlaylistMapping {
     pub ipod_name: String,
 }
 
+/// The stamp of a restore that started putting files back on the iPod and
+/// has not recorded its mappings yet, if any.
+pub fn restoring(conn: &Connection, device_id: i64) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT restoring FROM devices WHERE id = ?1",
+            [device_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Records that a restore of backup `stamp` is under way, or with `None`
+/// that it finished.
+pub fn set_restoring(conn: &Connection, device_id: i64, stamp: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE devices SET restoring = ?2 WHERE id = ?1",
+        rusqlite::params![device_id, stamp],
+    )?;
+    Ok(())
+}
+
 /// Replaces every mapping of `device_id` with the given ones.
 pub fn replace_mappings(
     conn: &Connection,

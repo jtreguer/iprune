@@ -220,7 +220,8 @@ fn restore_puts_back_itunesdb_and_artworkdb_but_never_play_counts() {
     let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
     ipod.full("new");
     let done = backup::restore_files(&b, ipod.root()).unwrap();
-    assert_eq!(done, vec!["iTunesDB", "ArtworkDB"]);
+    // ArtworkDB first, iTunesDB last: see `restore_renames_the_itunesdb_last`.
+    assert_eq!(done, vec!["ArtworkDB", "iTunesDB"]);
     assert_eq!(fs::read_to_string(ipod.db()).unwrap(), "db old");
     assert_eq!(fs::read_to_string(ipod.artwork()).unwrap(), "art old");
     assert_eq!(
@@ -268,7 +269,8 @@ fn on_the_go_playlist_info_is_backed_up_but_never_restored() {
     fs::remove_file(&otg).unwrap();
     ipod.full("new");
     let done = backup::restore_files(&b, ipod.root()).unwrap();
-    assert_eq!(done, vec!["iTunesDB", "ArtworkDB"]);
+    // ArtworkDB first, iTunesDB last: see `restore_renames_the_itunesdb_last`.
+    assert_eq!(done, vec!["ArtworkDB", "iTunesDB"]);
     assert!(!otg.exists());
 }
 
@@ -360,4 +362,209 @@ fn create_removes_stale_partial_folders_of_any_stamp() {
     assert!(!base.join(".partial-19990101-000000").exists());
     assert!(keep.exists(), "only .partial-* folders are removed");
     assert!(b.dir.join("iTunesDB").is_file());
+}
+
+// ---- restore: staging, order and failure
+
+// Prevents (audit M11) a restore that fails while renaming leaving the new
+// `iTunesDB` next to an old `ArtworkDB`, or the reverse: `iTunesDB` goes
+// last, so a failure before it leaves the old database whole.
+#[test]
+fn restore_renames_the_itunesdb_last() {
+    let ipod = Ipod::new();
+    ipod.full("old");
+    let data = root();
+    let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    ipod.full("new");
+    // The ArtworkDB cannot be replaced: a folder (not empty) stands in its place.
+    fs::remove_file(ipod.artwork()).unwrap();
+    fs::create_dir(ipod.artwork()).unwrap();
+    fs::write(ipod.artwork().join("inside"), "x").unwrap();
+
+    let e = backup::restore_files(&b, ipod.root()).unwrap_err();
+    assert!(
+        matches!(&e, Error::Io { path, .. } if *path == ipod.artwork()),
+        "{e:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(ipod.db()).unwrap(),
+        "db new",
+        "the database was not replaced before the artwork"
+    );
+    assert!(ipod.artwork().join("inside").is_file());
+}
+
+// Prevents (audit M11) a copy that fails half way having already replaced
+// the first file: every file is copied and compared before any is renamed.
+#[test]
+fn a_restore_that_cannot_copy_one_file_changes_nothing_and_leaves_no_temporary_file() {
+    let ipod = Ipod::new();
+    ipod.full("old");
+    let data = root();
+    let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    ipod.full("new");
+    // The iTunesDB is staged under this name; a folder is there already.
+    let blocked = ipod
+        .root()
+        .join("iPod_Control/iTunes/.iprune-restore-iTunesDB");
+    fs::create_dir(&blocked).unwrap();
+
+    assert!(backup::restore_files(&b, ipod.root()).is_err());
+    assert_eq!(fs::read_to_string(ipod.db()).unwrap(), "db new");
+    assert_eq!(
+        fs::read_to_string(ipod.artwork()).unwrap(),
+        "art new",
+        "the artwork, copied first, was not renamed over"
+    );
+    let staged = ipod
+        .root()
+        .join("iPod_Control/Artwork/.iprune-restore-ArtworkDB");
+    assert!(!staged.exists(), "the earlier temporary copy is removed");
+}
+
+// ---- the copy a restore takes of what it replaces
+
+#[test]
+fn a_backup_before_a_restore_may_lack_the_itunesdb_but_keeps_the_rest_and_is_not_listed() {
+    let ipod = Ipod::new();
+    fs::write(ipod.counts(), "counts").unwrap();
+    let data = root();
+    // `create` still refuses: a sync backup without a database is useless.
+    assert!(backup::create(data.path(), GUID, ipod.root(), 100, &[]).is_err());
+    let b =
+        backup::create_before_restore(data.path(), GUID, ipod.root(), 100, &[("x", b"1")]).unwrap();
+    assert!(!b.dir.join("iTunesDB").exists());
+    assert_eq!(
+        fs::read_to_string(b.dir.join("Play Counts")).unwrap(),
+        "counts"
+    );
+    assert_eq!(fs::read_to_string(b.dir.join("x")).unwrap(), "1");
+    assert!(backup::list(data.path(), GUID).unwrap().is_empty());
+}
+
+// ---- set_aside
+
+fn otg(ipod: &Ipod) -> PathBuf {
+    ipod.root().join("iPod_Control/iTunes/OTGPlaylistInfo")
+}
+
+#[test]
+fn set_aside_deletes_play_counts_and_otg_info_when_the_backup_holds_the_same_bytes() {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    fs::write(otg(&ipod), "otg").unwrap();
+    let data = root();
+    let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+
+    let done = backup::set_aside(&b, ipod.root()).unwrap();
+    assert_eq!(done, vec!["Play Counts", "OTGPlaylistInfo"]);
+    assert!(!ipod.counts().exists() && !otg(&ipod).exists());
+    // The database and the artwork are not touched, the copies are kept.
+    assert!(ipod.db().is_file() && ipod.artwork().is_file());
+    assert_eq!(
+        fs::read_to_string(b.dir.join("Play Counts")).unwrap(),
+        "counts x"
+    );
+    assert_eq!(
+        fs::read_to_string(b.dir.join("OTGPlaylistInfo")).unwrap(),
+        "otg"
+    );
+}
+
+#[test]
+fn set_aside_keeps_a_file_the_backup_does_not_hold_the_same_bytes_of() {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    let data = root();
+    let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    // Changed after the backup was taken.
+    fs::write(ipod.counts(), "counts changed").unwrap();
+    let e = backup::set_aside(&b, ipod.root()).unwrap_err();
+    assert!(
+        matches!(&e, Error::BackupMismatch(p) if *p == b.dir.join("Play Counts")),
+        "{e:?}"
+    );
+    assert_eq!(fs::read_to_string(ipod.counts()).unwrap(), "counts changed");
+
+    // A file the backup has no copy of at all is kept too.
+    fs::write(otg(&ipod), "new otg").unwrap();
+    fs::write(ipod.counts(), "counts x").unwrap();
+    let e = backup::set_aside(&b, ipod.root()).unwrap_err();
+    assert!(
+        matches!(&e, Error::BackupMismatch(p) if *p == b.dir.join("OTGPlaylistInfo")),
+        "{e:?}"
+    );
+    assert_eq!(fs::read_to_string(otg(&ipod)).unwrap(), "new otg");
+}
+
+#[test]
+fn set_aside_with_nothing_to_set_aside_does_nothing() {
+    let ipod = Ipod::new();
+    fs::write(ipod.db(), "db").unwrap();
+    let data = root();
+    let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    assert!(backup::set_aside(&b, ipod.root()).unwrap().is_empty());
+    assert_eq!(fs::read_to_string(ipod.db()).unwrap(), "db");
+}
+
+// ---- summary
+
+fn backup_with_snapshot(data: &Path, snapshot: Option<&str>) -> Backup {
+    let ipod = Ipod::new();
+    fs::write(ipod.db(), "db").unwrap();
+    let extra: Vec<(&str, &[u8])> = snapshot
+        .map(|s| ("snapshot.txt", s.as_bytes()))
+        .into_iter()
+        .collect();
+    backup::create(data, GUID, ipod.root(), 100, &extra).unwrap()
+}
+
+const SNAPSHOT: &str = "tracks 3 playlists 2\n\
+T 0000000000000001 :iPod_Control:Music:F00:T0000.mp3 | A | B | C | 10 | art 0 mhii 0 | rating 0 plays 0\n\
+P iPod de Julien [master] 3\n\
+P Road 1\n  0000000000000001\n";
+
+#[test]
+fn summary_gives_the_ipod_name_and_the_counts_from_the_snapshot() {
+    let data = root();
+    let b = backup_with_snapshot(data.path(), Some(SNAPSHOT));
+    assert_eq!(
+        backup::summary(&b).as_deref(),
+        Some("iPod de Julien, 3 tracks, 2 playlists")
+    );
+}
+
+#[test]
+fn summary_takes_the_name_of_the_master_playlist_wherever_it_is() {
+    let data = root();
+    let snap = "tracks 0 playlists 2\nP Road 0\nP Julien's [x] iPod [master] 0\n";
+    let b = backup_with_snapshot(data.path(), Some(snap));
+    assert_eq!(
+        backup::summary(&b).as_deref(),
+        Some("Julien's [x] iPod, 0 tracks, 2 playlists")
+    );
+}
+
+#[test]
+fn summary_of_a_snapshot_without_a_master_playlist_still_gives_the_counts() {
+    let data = root();
+    let b = backup_with_snapshot(data.path(), Some("tracks 5 playlists 1\nP Road 0\n"));
+    let s = backup::summary(&b).unwrap();
+    assert!(s.ends_with(", 5 tracks, 1 playlists"), "{s}");
+    assert!(
+        !s.contains("Road"),
+        "a plain playlist is not the iPod's name: {s}"
+    );
+}
+
+#[test]
+fn summary_is_none_without_a_readable_snapshot() {
+    let data = root();
+    let none = backup_with_snapshot(data.path(), None);
+    assert_eq!(backup::summary(&none), None);
+    for bad in ["", "\n", "garbage\n", "tracks 3\n"] {
+        let data = root();
+        let b = backup_with_snapshot(data.path(), Some(bad));
+        assert_eq!(backup::summary(&b), None, "{bad:?}");
+    }
 }

@@ -1828,6 +1828,7 @@ fn restoring_a_backup_after_copies_returns_the_database_and_mappings_and_leaves_
         &w.root,
         GUID,
         &out.backup.stamp,
+        false,
     )
     .unwrap();
     assert_eq!(r.files, vec!["iTunesDB"]);
@@ -2542,5 +2543,297 @@ mod doctor_tests {
         assert_eq!(ghosts, 0);
         // Nothing left to repair.
         assert!(examine(&w).is_clean(), "{:?}", examine(&w));
+    }
+}
+
+// ---- restore: statistics, Play Counts and missing files
+
+fn restore(
+    w: &World,
+    stamp: &str,
+    discard_play_counts: bool,
+) -> iprune_core::Result<exec::Restored> {
+    // Tries again while the lock reports busy: a helper program forked by
+    // another test thread can briefly hold a copy of a released lock file.
+    for _ in 0..200 {
+        match exec::restore(
+            w.env.store.conn(),
+            &w.paths,
+            &w.root,
+            GUID,
+            stamp,
+            discard_play_counts,
+        ) {
+            Err(Error::IpodBusy) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            other => return other,
+        }
+    }
+    unreachable!("the iPod lock stayed busy")
+}
+
+/// A World where a sync removed track 1 (library file `s1.mp3` deleted), and
+/// the iPod then played `plays` of its remaining tracks, in the database
+/// order [d2, d3, orphan]. Returns the stamp of the backup taken before that
+/// sync, whose database is [d1, d2, d3, orphan].
+fn removed_then_played(w: &mut World) -> String {
+    fs::remove_file(&w.files[0]).unwrap();
+    w.rescan();
+    let out = w.sync().unwrap();
+    assert_eq!(out.removed, 1);
+    let order: Vec<u64> = w.contents().tracks.iter().map(|t| t.adopt.dbid).collect();
+    assert_eq!(order, vec![dbid(2), dbid(3), ORPHAN]);
+    // d2: 5 plays, rating 100; d3: 7 plays, rating 20; the orphan: none.
+    w.write_play_counts(&[
+        (5, 1_700_000_000, 100, 0),
+        (7, 1_700_000_100, 20, 0),
+        (0, 0, 0, 0),
+    ]);
+    out.backup.stamp
+}
+
+fn stats_of(w: &World, file: &Path) -> Option<(i64, Option<i64>)> {
+    let id = w.id_of(file);
+    w.env
+        .store
+        .conn()
+        .query_row(
+            "SELECT plays, rating FROM stats WHERE track_id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
+}
+
+// Prevents (audit H2) a restore leaving a live Play Counts, which libgpod
+// reads by position against the restored database, so that the plays of the
+// database it replaced went to the wrong tracks or were lost.
+#[test]
+fn restore_pulls_the_plays_of_the_database_it_replaces_and_takes_play_counts_off_the_ipod() {
+    let mut w = World::new(3);
+    let stamp = removed_then_played(&mut w);
+    let counts = fs::read(w.root.join("iPod_Control/iTunes/Play Counts")).unwrap();
+
+    let r = restore(&w, &stamp, false).unwrap();
+
+    // Credited to the tracks the plays belong to, by the current mappings.
+    assert_eq!(stats_of(&w, &w.files[1]), Some((5, Some(100))));
+    assert_eq!(stats_of(&w, &w.files[2]), Some((7, Some(20))));
+    assert_eq!(
+        stats_of(&w, &w.files[0]),
+        None,
+        "the removed track has none"
+    );
+    assert_eq!((r.pulled.tracks(), r.pulled.plays()), (2, 12));
+    // The file left the iPod, whole, and is kept in the backup of what the
+    // restore replaced; the restored database carries no recent plays.
+    assert!(!w.root.join("iPod_Control/iTunes/Play Counts").exists());
+    assert_eq!(r.set_aside, vec!["Play Counts"]);
+    assert_eq!(fs::read(r.saved.dir.join("Play Counts")).unwrap(), counts);
+    let restored = w.contents();
+    assert_eq!(restored.tracks.len(), 4, "the backup's database is back");
+    assert!(
+        restored.tracks.iter().all(|t| t.recent_plays == 0),
+        "{:?}",
+        restored
+            .tracks
+            .iter()
+            .map(|t| (t.adopt.dbid, t.recent_plays))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(w.pending_pulls(), 0, "settled, not left pending");
+
+    // The next sync does not credit them again. (Its pull takes the iPod's
+    // rating, which the restored database has not got, so ratings are not
+    // compared here.)
+    w.sync().unwrap();
+    assert_eq!(stats_of(&w, &w.files[1]).map(|s| s.0), Some(5));
+    assert_eq!(stats_of(&w, &w.files[2]).map(|s| s.0), Some(7));
+    assert_eq!(w.stats_total_plays(), 12);
+}
+
+// `--discard-play-counts` is for a database that cannot be read; with a
+// readable one the plays are still pulled.
+#[test]
+fn discarding_play_counts_does_not_lose_the_plays_of_a_readable_database() {
+    let mut w = World::new(3);
+    let stamp = removed_then_played(&mut w);
+    let r = restore(&w, &stamp, true).unwrap();
+    assert_eq!(w.stats_total_plays(), 12);
+    assert_eq!(r.pulled.plays(), 12);
+    assert!(!w.root.join("iPod_Control/iTunes/Play Counts").exists());
+}
+
+// Prevents (audit M17) entries a restore brought back after a sync deleted
+// their files staying in the database with no file: they are copied again.
+#[test]
+fn entries_a_restore_brings_back_without_their_files_are_copied_again() {
+    let mut w = World::new(3);
+    let s1 = w.files[0].clone();
+    let gone_file = w.file_of(dbid(1));
+    fs::remove_file(&s1).unwrap();
+    w.rescan();
+    let out = w.sync().unwrap();
+    assert_eq!(out.removed, 1);
+    assert!(!gone_file.exists(), "set up: the sync deleted the file");
+
+    let r = restore(&w, &out.backup.stamp, false).unwrap();
+    assert_eq!(r.dropped_tracks, 0, "the library track is still indexed");
+    assert!(w.track(dbid(1)).is_some(), "the entry is back");
+    assert!(!gone_file.exists(), "and has no file");
+
+    // The library file comes back.
+    w.env.add("s1.mp3", Kind::Mp3, 1);
+    w.rescan();
+    let p = w.prepare();
+    assert_eq!(
+        p.plan
+            .replace
+            .iter()
+            .map(|r| (r.old_dbid, r.file_missing))
+            .collect::<Vec<_>>(),
+        vec![(dbid(1), true)],
+        "{:?}",
+        p.plan
+    );
+    let out = w.sync().unwrap();
+    assert_eq!((out.copied, out.recopied), (0, 1));
+
+    // Every entry of the database has a file, with the library's bytes for
+    // the managed ones.
+    let c = w.contents();
+    for t in &c.tracks {
+        let f = ipod::file_path(&w.root, t.ipod_path.as_deref().expect("a path")).unwrap();
+        assert!(
+            f.is_file(),
+            "{:x} has no file {}",
+            t.adopt.dbid,
+            f.display()
+        );
+    }
+    assert_eq!(
+        fs::read(w.file_of(dbid(1))).unwrap(),
+        fs::read(&s1).unwrap()
+    );
+    // Nothing is left to do.
+    let p = w.prepare();
+    assert!(exec::full_work(&p).is_empty(), "{:?}", p.plan);
+}
+
+// ---- the guard on copying many tracks again for a missing file
+
+fn lose_ipod_files(w: &World, ks: std::ops::RangeInclusive<usize>) {
+    for k in ks {
+        fs::remove_file(w.file_of(dbid(k))).unwrap();
+    }
+}
+
+fn every_entry_has_a_file(w: &World) {
+    for t in &w.contents().tracks {
+        let f = ipod::file_path(&w.root, t.ipod_path.as_deref().expect("a path")).unwrap();
+        assert!(f.is_file(), "{:x} has no file", t.adopt.dbid);
+    }
+}
+
+// Prevents copying most of the library again because the iPod's music
+// folder read badly.
+#[test]
+fn many_files_missing_from_the_ipod_are_refused_unless_allowed() {
+    let w = World::new(8);
+    lose_ipod_files(&w, 1..=6);
+    let tree_before = w.tree();
+    let e = w.sync().unwrap_err();
+    assert!(
+        matches!(
+            e,
+            Error::MassMissingFiles {
+                missing: 6,
+                managed: 8
+            }
+        ),
+        "{e}"
+    );
+    assert!(e.to_string().contains("--allow-mass-removal"), "{e}");
+    assert_eq!(w.tree(), tree_before, "the iPod is untouched");
+    assert!(w.backups().is_empty(), "no backup, so no write began");
+    assert_eq!(w.mapping().len(), 8);
+
+    let p = w.prepare();
+    let work = exec::full_work(&p);
+    let out = w
+        .run(
+            &p,
+            &work,
+            Options {
+                allow_mass_removal: true,
+            },
+            &|_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!((out.recopied, out.removed), (6, 0));
+    every_entry_has_a_file(&w);
+    assert!(exec::full_work(&w.prepare()).is_empty());
+}
+
+#[test]
+fn five_files_missing_from_the_ipod_are_copied_again_without_the_flag() {
+    let w = World::new(8);
+    lose_ipod_files(&w, 1..=5);
+    let out = w.sync().unwrap();
+    assert_eq!(out.recopied, 5);
+    every_entry_has_a_file(&w);
+}
+
+// The refusal needs more than five and more than a tenth of the managed
+// tracks; a replace for changed audio is not counted.
+#[test]
+fn the_missing_files_guard_counts_only_missing_files_and_a_tenth_of_the_managed_tracks() {
+    use iprune_core::plan::{Plan, ReplaceOp};
+    let plan = |missing: usize, changed: usize| Plan {
+        replace: (0..missing + changed)
+            .map(|i| ReplaceOp {
+                track_id: i as i64,
+                old_dbid: i as u64,
+                path: "/x.mp3".into(),
+                size: 1,
+                old_size: 1,
+                file_missing: i < missing,
+            })
+            .collect(),
+        ..Plan::default()
+    };
+    let strict = Options::default();
+    let allow = Options {
+        allow_mass_removal: true,
+    };
+    // (missing, changed audio, managed, refused)
+    let cases = [
+        (6, 0, 59, true),
+        (6, 0, 60, false),
+        (5, 0, 1, false),
+        (0, 20, 3, false),
+        (6, 20, 59, true),
+        (60, 0, 400, true),
+        (40, 0, 400, false),
+    ];
+    for (missing, changed, managed, refused) in cases {
+        let r = exec::check_missing_files(&plan(missing, changed), managed, strict);
+        match (refused, r) {
+            (
+                true,
+                Err(Error::MassMissingFiles {
+                    missing: m,
+                    managed: n,
+                }),
+            ) => {
+                assert_eq!((m, n), (missing, managed));
+            }
+            (false, Ok(())) => {}
+            (_, other) => panic!("{missing}/{changed}/{managed}: {other:?}"),
+        }
+        assert!(
+            exec::check_missing_files(&plan(missing, changed), managed, allow).is_ok(),
+            "the flag allows it"
+        );
     }
 }

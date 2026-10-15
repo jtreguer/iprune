@@ -17,7 +17,13 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_tag_state.sql"),
     include_str!("migrations/0003_playlist_tombstones.sql"),
     include_str!("migrations/0004_pending_pulls.sql"),
+    include_str!("migrations/0005_stable_ids.sql"),
 ];
+
+/// First line of a migration that rebuilds tables: it runs with foreign
+/// keys off, which a transaction cannot change, and is checked before it is
+/// committed.
+const FOREIGN_KEYS_OFF: &str = "-- foreign_keys off";
 
 pub struct Store {
     conn: Connection,
@@ -50,10 +56,34 @@ impl Store {
             ))));
         }
         for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
-            let tx = conn.transaction()?;
-            tx.execute_batch(sql)?;
-            tx.pragma_update(None, "user_version", (i + 1) as i64)?;
-            tx.commit()?;
+            let rebuild = sql.starts_with(FOREIGN_KEYS_OFF);
+            if rebuild {
+                conn.pragma_update(None, "foreign_keys", false)?;
+            }
+            let done = (|| -> Result<()> {
+                let tx = conn.transaction()?;
+                tx.execute_batch(sql)?;
+                if rebuild {
+                    let broken: i64 =
+                        tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                            r.get(0)
+                        })?;
+                    if broken > 0 {
+                        return Err(Error::Migration(format!(
+                            "migration {} would leave {broken} broken references; the index was \
+                             not changed",
+                            i + 1
+                        )));
+                    }
+                }
+                tx.pragma_update(None, "user_version", (i + 1) as i64)?;
+                tx.commit()?;
+                Ok(())
+            })();
+            if rebuild {
+                conn.pragma_update(None, "foreign_keys", true)?;
+            }
+            done?;
         }
         Ok(Store { conn })
     }
@@ -455,6 +485,33 @@ pub fn delete_playlist(conn: &Connection, name: &str) -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// Adds a tombstone for a playlist a restore brought back on the iPod whose
+/// library playlist is gone, so the next sync deletes it again. It gets
+/// `name` when no playlist has it, an internal name otherwise. Returns its id.
+pub fn insert_tombstone(conn: &Connection, name: &str) -> Result<i64> {
+    let taken: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM playlists WHERE name = ?1)",
+        [name],
+        |r| r.get(0),
+    )?;
+    // Inserted under a placeholder, then named after its id.
+    let id: i64 = conn.query_row(
+        "INSERT INTO playlists (name, file, file_mtime_ns, removed_at) \
+         VALUES ('.restoring', '.restoring', 0, ?1) RETURNING id",
+        [crate::now_unix()],
+        |r| r.get(0),
+    )?;
+    let (name, file) = match taken {
+        true => (format!(".removed-{id}"), format!(".removed-{id}")),
+        false => (name.to_owned(), format!(".removed-{id}")),
+    };
+    conn.execute(
+        "UPDATE playlists SET name = ?2, file = ?3 WHERE id = ?1",
+        params![id, name, file],
+    )?;
+    Ok(id)
 }
 
 /// `(id, name)` of the tombstones: deleted playlists still mapped to an iPod.
