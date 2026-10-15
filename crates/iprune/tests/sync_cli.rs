@@ -3,7 +3,9 @@
 //! temp dir whose iTunesDB is written by libgpod (`make_ipod.c`), and the
 //! config always points `device.mountpoint` at it, so mount detection never
 //! looks at the machine's real mounts. A fake `notify-send` first on the
-//! PATH logs what a sync would show on the desktop, to `notify.log`.
+//! PATH logs what a sync would show on the desktop, to `notify.log`, and a
+//! fake `systemd-inhibit` logs the inhibitor a write would take, to
+//! `inhibit.log`, without taking one.
 
 #[path = "../../iprune-core/tests/common/mod.rs"]
 mod common;
@@ -44,6 +46,24 @@ impl Sandbox {
         )
         .unwrap();
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        // A systemd-inhibit that takes no inhibitor: it logs its options
+        // and runs the command it is given.
+        let inhibit = base.join("bin/systemd-inhibit");
+        fs::write(
+            &inhibit,
+            format!(
+                "#!/bin/sh\nwhile [ \"${{1#--}}\" != \"$1\" ]; do echo \"$1\" >> '{log}'; shift; done\n\
+                 # Signals for iprune (our parent), one per line in signals.once, sent once.\n\
+                 if [ -f '{sig}' ]; then\n  me=$PPID; list=$(cat '{sig}'); rm -f '{sig}'\n  # Detached: iprune ends this script when it drops the inhibitor.\n  ( for s in $list; do kill -$s $me; sleep 0.05; done ) >/dev/null 2>&1 &\nfi\n\
+                 # Not exec: a Ctrl+C or hang-up that reached us would be logged, then end cat.\n\
+                 trap 'echo got >> '{caught}'' INT HUP\n\"$@\"\n",
+                log = base.join("inhibit.log").display(),
+                caught = base.join("inhibit.caught").display(),
+                sig = base.join("signals.once").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&inhibit, fs::Permissions::from_mode(0o755)).unwrap();
         Sandbox {
             dir,
             music,
@@ -60,22 +80,25 @@ impl Sandbox {
         self.base().join("data/iprune/plan.json")
     }
 
-    fn run(&self, args: &[&str]) -> Output {
+    fn command(&self, args: &[&str]) -> Command {
         let base = self.base();
         let path = format!(
             "{}:{}",
             base.join("bin").display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        Command::new(env!("CARGO_BIN_EXE_iprune"))
-            .args(args)
+        let mut c = Command::new(env!("CARGO_BIN_EXE_iprune"));
+        c.args(args)
             .env("HOME", base.join("home"))
             .env("XDG_CONFIG_HOME", base.join("config"))
             .env("XDG_DATA_HOME", base.join("data"))
             .env("PATH", path)
-            .stdin(Stdio::null())
-            .output()
-            .unwrap()
+            .stdin(Stdio::null());
+        c
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
     }
 
     fn ok(&self, args: &[&str]) -> Output {
@@ -1431,6 +1454,17 @@ impl Sandbox {
     /// `during` while it waits and answers `y`. Returns the exit code and
     /// what appeared on the terminal.
     fn run_on_terminal(&self, args: &[&str], during: impl FnOnce()) -> (Option<i32>, String) {
+        self.run_on_terminal_answering(args, "y", during)
+    }
+
+    /// [`run_on_terminal`] answering `answer`. The answer is written without
+    /// checking: `during` may have ended the process.
+    fn run_on_terminal_answering(
+        &self,
+        args: &[&str],
+        answer: &str,
+        during: impl FnOnce(),
+    ) -> (Option<i32>, String) {
         use std::io::{Read, Write};
         use std::sync::{Arc, Mutex};
         use std::time::{Duration, Instant};
@@ -1479,8 +1513,8 @@ impl Sandbox {
         }
         during();
         let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(b"y\n").unwrap();
-        stdin.flush().unwrap();
+        let _ = stdin.write_all(format!("{answer}\n").as_bytes());
+        let _ = stdin.flush();
         let status = loop {
             if let Some(s) = child.try_wait().unwrap() {
                 break s;
@@ -1764,4 +1798,565 @@ fn doctor_fix_with_only_a_damaged_path_does_not_ask_and_changes_nothing() {
     assert_eq!(sb.tree(&sb.ipod), before);
     assert!(!sb.backups_dir().exists());
     assert_eq!(fs::read(&outside).unwrap(), b"not the iPod's");
+}
+
+// ---- audit step 8: signals and the inhibitor (M7, L4, L43)
+
+impl Sandbox {
+    /// The options the fake systemd-inhibit was run with, one per line, for
+    /// every inhibitor taken; empty when none was.
+    fn inhibit_log(&self) -> Vec<String> {
+        fs::read_to_string(self.base().join("inhibit.log"))
+            .map(|t| t.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// Makes the fake systemd-inhibit send these signals to iprune (its
+    /// parent) the next time it is run, at the moment the inhibitor is taken:
+    /// after the confirmation, before the first copy. Deterministic.
+    fn signal_when_inhibited(&self, signals: &[&str]) {
+        fs::write(self.base().join("signals.once"), signals.join("\n")).unwrap();
+    }
+
+    /// The pid of the iprune running with this sandbox's data folder (under
+    /// `script`, iprune is not the process spawned).
+    fn iprune_pid(&self) -> Option<u32> {
+        let exe = Path::new(env!("CARGO_BIN_EXE_iprune"));
+        let want = format!("XDG_DATA_HOME={}", self.base().join("data").display());
+        for e in fs::read_dir("/proc").ok()?.flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+                continue;
+            };
+            let env = fs::read(e.path().join("environ")).unwrap_or_default();
+            if fs::read_link(e.path().join("exe")).is_ok_and(|p| p == exe)
+                && env.split(|b| *b == 0).any(|v| v == want.as_bytes())
+            {
+                return Some(pid);
+            }
+        }
+        None
+    }
+}
+
+fn kill(signal: &str, pid: u32) {
+    let st = Command::new("kill")
+        .args([&format!("-{signal}"), &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(st.success(), "kill -{signal} {pid}");
+}
+
+/// Waits until the process has ended (gone, or a zombie its parent has yet
+/// to reap).
+fn wait_gone(pid: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let alive = fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+            !s.rsplit(')')
+                .next()
+                .unwrap_or("")
+                .trim_start()
+                .starts_with('Z')
+        });
+        if !alive {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "{pid} did not end");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+const WHAT: &str = "--what=sleep:shutdown:idle:handle-lid-switch";
+
+/// The log of one inhibitor: its four options, the reason non-empty.
+fn assert_one_inhibitor(log: &[String], who: &str) {
+    assert_eq!(log.len(), 4, "{who}: {log:?}");
+    assert_eq!(log[0], WHAT, "{who}");
+    assert_eq!(log[1], "--mode=block", "{who}");
+    assert_eq!(log[2], "--who=iprune", "{who}");
+    let why = log[3].strip_prefix("--why=").unwrap_or_default();
+    assert!(!why.is_empty(), "{who}: a reason is given: {log:?}");
+}
+
+// Prevents (audit M7) a sync, a restore or a repair running without
+// anything to keep the machine from suspending or shutting down.
+#[test]
+fn sync_doctor_fix_and_restore_each_take_one_blocking_inhibitor() {
+    let sb = adopted();
+    sb.reverse_road();
+    assert!(sb.inhibit_log().is_empty(), "set up");
+    let o = sb.ok(&["sync", "--yes"]);
+    assert!(!err(&o).contains("could not keep"), "{}", err(&o));
+    assert_one_inhibitor(&sb.inhibit_log(), "sync");
+    let stamp = sb.stamps().remove(0);
+
+    fs::remove_file(sb.base().join("inhibit.log")).unwrap();
+    sb.ok(&["restore", &stamp, "--yes"]);
+    assert_one_inhibitor(&sb.inhibit_log(), "restore");
+
+    fs::remove_file(sb.base().join("inhibit.log")).unwrap();
+    sb.lose_files([2]);
+    sb.ok(&["doctor", "--fix", "--yes"]);
+    assert_one_inhibitor(&sb.inhibit_log(), "doctor --fix");
+}
+
+// A command that only reads, or that was declined, holds nothing.
+#[test]
+fn plan_only_doctor_without_fix_and_a_declined_plan_take_no_inhibitor() {
+    let sb = adopted();
+    sb.reverse_road();
+    sb.ok(&["sync", "--plan-only"]);
+    sb.ok(&["doctor"]);
+    assert!(sb.inhibit_log().is_empty(), "{:?}", sb.inhibit_log());
+
+    let before = sb.tree(&sb.ipod);
+    let (code, text) = sb.run_on_terminal_answering(&["sync"], "n", || {});
+    assert_eq!(code, Some(4), "{text}");
+    assert!(sb.inhibit_log().is_empty(), "{:?}", sb.inhibit_log());
+    assert_eq!(sb.tree(&sb.ipod), before, "a declined plan wrote");
+    assert!(sb.stamps().is_empty());
+}
+
+// Prevents (audit L4) a signal while the prompt waits being ignored (the
+// process hanging on, or exiting 0) or, with the handler's state mixed up,
+// stopping something that never began. Nothing has been applied: it ends at
+// once with 130 and the iPod, the backups and the inhibitors are untouched.
+#[test]
+fn a_signal_while_the_prompt_waits_exits_130_and_writes_nothing() {
+    for signal in ["TERM", "HUP", "INT"] {
+        let sb = adopted();
+        sb.reverse_road();
+        let before = sb.tree(&sb.ipod);
+        let mut pid = None;
+        let (code, text) = sb.run_on_terminal(&["sync"], || {
+            pid = sb.iprune_pid();
+            let pid = pid.expect("iprune is running at the prompt");
+            kill(signal, pid);
+            // The answer must not race the handler thread: wait for the end.
+            wait_gone(pid);
+        });
+        assert_eq!(code, Some(130), "{signal}: {text}");
+        assert_eq!(sb.tree(&sb.ipod), before, "{signal}: the iPod was written");
+        assert!(sb.stamps().is_empty(), "{signal}: a backup was made");
+        assert!(sb.inhibit_log().is_empty(), "{signal}: an inhibitor");
+        assert_eq!(sb.ipod_playlist("Road"), Some(vec![u64::MAX - 1, 2]));
+        // And the next run is not marked by it.
+        sb.ok(&["sync", "--yes"]);
+        assert_eq!(sb.ipod_playlist("Road"), Some(vec![2, u64::MAX - 1]));
+    }
+}
+
+/// Audio files under an iPod's Music folder (one level of F00..F49).
+fn count_files(music: &Path) -> usize {
+    fs::read_dir(music)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| fs::read_dir(e.path()).map_or(0, Iterator::count))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// New library files in `with_new_files`: enough that the copies take far
+/// longer than a signal needs to arrive.
+const NEW: usize = 24;
+
+/// The adopted world (3 tracks) plus `NEW` new wav files, all to be copied.
+fn with_new_files() -> Sandbox {
+    let sb = adopted();
+    for i in 0..NEW {
+        fs::copy(
+            common::fixture_secs(Kind::Wav, 10 + i as u32, 10),
+            sb.music.join(format!("new{i:02}.wav")),
+        )
+        .unwrap();
+    }
+    sb
+}
+
+/// Checks that `o` is the end of a sync that was stopped (as Stop does, not
+/// killed) after some of the copies, that what it did is on the iPod,
+/// recorded and verified, and that the next sync copies the rest. Returns the
+/// number of copies made before the stop.
+fn assert_stopped_then_continued(sb: &Sandbox, o: &Output, ctx: &str) -> usize {
+    assert_code(o, 1);
+    assert!(err(o).contains("stopped early"), "{ctx}: {}", err(o));
+    assert!(out(o).contains("verified"), "{ctx}: {}", out(o));
+    let done = sb.music_files().len() - 3;
+    assert!(done < NEW, "{ctx}: nothing was stopped, all {done} copied");
+    assert_eq!(sb.stamps().len(), 1, "{ctx}: a backup, so a checkpoint");
+    // Every copy is in the database with its file, and mapped: the next
+    // plan holds exactly the rest.
+    let db = gpod::Database::open(&sb.ipod).unwrap();
+    assert_eq!(db.track_count(), 3 + done, "{ctx}");
+    drop(db);
+    let plan = sb.ok(&["sync", "--plan-only", "--json"]);
+    let plan: serde_json::Value = serde_json::from_str(&out(&plan)).unwrap();
+    assert_eq!(
+        plan["copy"].as_array().map(Vec::len).unwrap_or(0),
+        NEW - done,
+        "{ctx}: {plan}"
+    );
+
+    let o = sb.ok(&["sync", "--yes"]);
+    assert!(
+        out(&o).contains(&format!("copied {} tracks", NEW - done)),
+        "{ctx}: {}",
+        out(&o)
+    );
+    assert_eq!(
+        gpod::Database::open(&sb.ipod).unwrap().track_count(),
+        3 + NEW,
+        "{ctx}"
+    );
+    assert_eq!(sb.music_files().len(), 3 + NEW, "{ctx}");
+    assert!(out(&sb.ok(&["sync", "--yes"])).contains("Nothing to apply"));
+    done
+}
+
+// Prevents (audit L4) SIGTERM and SIGHUP killing a sync in the middle of its
+// copies, with no checkpoint: they must act as Stop. The fake systemd-inhibit
+// sends the signal as the inhibitor is taken, so it lands at the start of the
+// copies. Spawning does not wait for the script, so exactly when it lands is
+// timing; with 24 copies behind it, it lands before the end.
+#[test]
+fn sigterm_and_sighup_once_a_sync_applies_stop_it_cleanly_and_the_next_sync_continues() {
+    for signal in ["TERM", "HUP"] {
+        let sb = with_new_files();
+        sb.signal_when_inhibited(&[signal]);
+        let o = sb.run(&["sync", "--yes"]);
+        assert!(
+            !sb.base().join("signals.once").exists(),
+            "set up: the fake sent it"
+        );
+        assert_stopped_then_continued(&sb, &o, signal);
+    }
+}
+
+// The same stop, with the signal sent from outside once the first copy is on
+// the iPod: a stop after at least one copy, so the checkpoint holds copies.
+#[test]
+fn a_signal_after_the_first_copy_keeps_the_copies_made_and_the_next_sync_finishes() {
+    for signal in ["TERM", "HUP"] {
+        let sb = with_new_files();
+        let before = sb.music_files().len();
+        let child = sb
+            .command(&["sync", "--yes"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let (music, stop) = (
+            sb.ipod.join("iPod_Control/Music"),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let poller = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if count_files(&music) > before {
+                        kill(signal, pid);
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(300));
+                }
+            })
+        };
+        let o = child.wait_with_output().unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        poller.join().unwrap();
+        let done = assert_stopped_then_continued(&sb, &o, signal);
+        assert!(done >= 1, "{signal}: the signal came after a copy");
+    }
+}
+
+// Prevents (audit L4) a second signal ending the process. It used to exit at
+// once; it must keep finishing, and the result is the same as for one.
+#[test]
+fn a_second_and_third_signal_do_not_end_a_sync_that_is_stopping() {
+    let sb = with_new_files();
+    sb.signal_when_inhibited(&["TERM", "TERM", "HUP"]);
+    let o = sb.run(&["sync", "--yes"]);
+    assert!(
+        !sb.base().join("signals.once").exists(),
+        "set up: the fake sent them all"
+    );
+    assert!(
+        err(&o).contains("still finishing"),
+        "the later signals were received: {}",
+        err(&o)
+    );
+    assert_stopped_then_continued(&sb, &o, "three signals");
+}
+
+// Prevents (audit L43) a terminal that went away (SIGHUP) making the
+// handler, the progress or the final error message panic: once stderr's
+// reader is gone every write to it fails (EPIPE here, EIO on a dead tty), and
+// the sync must still stop and verify with exit 1, not 101.
+#[test]
+fn sighup_with_stderr_gone_still_stops_the_sync_cleanly() {
+    let sb = with_new_files();
+    let before = sb.music_files().len();
+    let mut child = sb
+        .command(&["sync", "--yes"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (pid, stderr) = (child.id(), child.stderr.take().unwrap());
+    let music = sb.ipod.join("iPod_Control/Music");
+    let poller = std::thread::spawn(move || {
+        // Once the first copy is there: the reader goes, then the hangup.
+        for _ in 0..200_000 {
+            if count_files(&music) > before {
+                drop(stderr);
+                kill("HUP", pid);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(300));
+        }
+    });
+    let o = child.wait_with_output().unwrap();
+    poller.join().unwrap();
+    assert_code(&o, 1);
+    assert!(out(&o).contains("verified"), "{}", out(&o));
+    let done = sb.music_files().len() - 3;
+    assert!((1..NEW).contains(&done), "stopped after {done} copies");
+    assert_eq!(sb.stamps().len(), 1);
+    assert_eq!(
+        gpod::Database::open(&sb.ipod).unwrap().track_count(),
+        3 + done
+    );
+}
+
+// Prevents (audit L43) the terminal going away in the middle of the copies
+// (the window closed, ssh dropped): the kernel sends SIGHUP and every write to
+// the terminal then fails with EIO. The progress line must not panic on it:
+// the sync stops after the current file, writes and verifies. The exit code
+// is lost with the parent (script), so the outcome is read from the iPod.
+#[test]
+fn a_terminal_that_vanishes_during_the_copies_does_not_cost_the_checkpoint() {
+    use std::io::Write;
+
+    let sb = with_new_files();
+    let (mut script, wait_for) = sb.terminal_session("sync");
+    wait_for("[y/N]");
+    let pid = sb.iprune_pid().expect("iprune is running at the prompt");
+    script.stdin.as_mut().unwrap().write_all(b"y\n").unwrap();
+    wait_for("copying 2/");
+    // The terminal vanishes: the master side closes.
+    script.kill().unwrap();
+    script.wait().unwrap();
+    drop(script.stdin.take());
+    wait_gone(pid);
+
+    let done = sb.music_files().len() - 3;
+    assert!((1..NEW).contains(&done), "stopped after {done} copies");
+    assert_eq!(sb.stamps().len(), 1, "a checkpoint was written");
+    let db = gpod::Database::open(&sb.ipod).unwrap();
+    assert_eq!(db.track_count(), 3 + done, "the copies are in the database");
+    drop(db);
+    let o = sb.ok(&["sync", "--yes"]);
+    assert!(
+        out(&o).contains(&format!("copied {} tracks", NEW - done)),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(sb.music_files().len(), 3 + NEW);
+}
+
+impl Sandbox {
+    /// Starts `iprune <args>` (one string, split by the shell) on a pty made
+    /// by `script`. Returns it and a function that waits until the terminal
+    /// shows a text.
+    fn terminal_session(&self, args: &str) -> (std::process::Child, impl Fn(&str) + use<>) {
+        use std::io::Read;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let cmd = format!("'{}' {args}", env!("CARGO_BIN_EXE_iprune"));
+        let base = self.base();
+        let mut script = Command::new("script")
+            .args(["-qec", &cmd, "/dev/null"])
+            .env("HOME", base.join("home"))
+            .env("XDG_CONFIG_HOME", base.join("config"))
+            .env("XDG_DATA_HOME", base.join("data"))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    base.join("bin").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("this test needs `script` (util-linux) to give iprune a terminal");
+        let seen = Arc::new(Mutex::new(String::new()));
+        let mut stdout = script.stdout.take().unwrap();
+        {
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = stdout.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    seen.lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+            });
+        }
+        let wait_for = move |what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !seen.lock().unwrap().contains(what) {
+                assert!(
+                    Instant::now() < deadline,
+                    "no {what:?}: {}",
+                    seen.lock().unwrap()
+                );
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        };
+        (script, wait_for)
+    }
+}
+
+// Prevents (audit M7) the inhibitor dying with the Ctrl+C or the hang-up that a
+// terminal sends to iprune's whole process group, in the middle of the write
+// it covers. The fake logs any INT or HUP that reaches it.
+#[test]
+fn a_ctrl_c_or_hangup_sent_to_the_process_group_does_not_reach_the_inhibitor() {
+    for signal in ["INT", "HUP"] {
+        let sb = with_new_files();
+        let (mut script, wait_for) = sb.terminal_session("sync");
+        wait_for("[y/N]");
+        let pid = sb.iprune_pid().expect("iprune is running at the prompt");
+        std::io::Write::write_all(script.stdin.as_mut().unwrap(), b"y\n").unwrap();
+        wait_for("copying 2/");
+        // The group, as the terminal's Ctrl+C does.
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let pgid: u32 = stat
+            .rsplit(')')
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(2)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(pgid > 1);
+        let st = Command::new("kill")
+            .args([&format!("-{signal}"), "--", &format!("-{pgid}")])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        wait_gone(pid);
+        let _ = script.wait();
+        assert!(
+            !sb.base().join("inhibit.caught").exists(),
+            "{signal}: the inhibitor was in iprune's process group"
+        );
+        // The signal still stopped the sync, cleanly.
+        let done = sb.music_files().len() - 3;
+        assert!(done < NEW, "{signal}: nothing was stopped");
+        assert_eq!(sb.stamps().len(), 1, "{signal}");
+    }
+}
+
+// Prevents (audit L43) `doctor --fix` stopping part way (the orphans kept, the
+// index not fixed) because a print after a hang-up panicked on a closed stdout.
+#[test]
+fn doctor_fix_with_stdout_gone_after_a_hangup_still_deletes_orphans_and_fixes_the_index() {
+    let sb = adopted();
+    sb.lose_files([2]);
+    let orphans = sb.orphans(1);
+    let (tracks_before, _) = sb.mappings();
+    let mut child = sb
+        .command(&["doctor", "--fix", "--yes"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let log = sb.base().join("inhibit.log");
+    // The inhibitor is taken: the command applies, and holds for a moment
+    // before it prints anything more. The terminal goes now.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !log.exists() {
+        assert!(std::time::Instant::now() < deadline, "doctor never applied");
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    drop(stdout);
+    kill("HUP", child.id());
+    let o = child.wait_with_output().unwrap();
+    assert_code(&o, 0);
+    assert!(!orphans[0].exists(), "the orphan was kept: {}", err(&o));
+    assert_eq!(
+        sb.mappings().0,
+        tracks_before - 1,
+        "the index was not fixed: {}",
+        err(&o)
+    );
+    assert!(
+        gpod::Database::open(&sb.ipod)
+            .unwrap()
+            .track_by_dbid(3)
+            .is_none()
+    );
+}
+
+// The warning, not a refusal: a systemd-inhibit that ends at once (no logind)
+// leaves the sync to go ahead, and says so.
+#[test]
+fn a_systemd_inhibit_that_fails_is_warned_about_and_the_sync_still_applies() {
+    let sb = adopted();
+    sb.reverse_road();
+    let tool = sb.base().join("bin/systemd-inhibit");
+    fs::write(&tool, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    let o = sb.ok(&["sync", "--yes"]);
+    assert!(err(&o).contains("could not keep"), "{}", err(&o));
+    assert!(out(&o).contains("verified"), "{}", out(&o));
+    assert_eq!(sb.ipod_playlist("Road"), Some(vec![2, u64::MAX - 1]));
+}
+
+// restore and doctor --fix also hold, and a signal during them does not end
+// them half done: they finish.
+#[test]
+fn a_signal_during_restore_or_doctor_fix_does_not_end_it_half_done() {
+    let sb = adopted();
+    let db_before = sb.itunesdb();
+    sb.reverse_road();
+    sb.ok(&["sync", "--yes"]);
+    let stamp = sb.stamps().remove(0);
+    sb.signal_when_inhibited(&["TERM", "HUP"]);
+    let o = sb.run(&["restore", &stamp, "--yes"]);
+    assert_code(&o, 0);
+    assert!(out(&o).contains("restored iTunesDB"), "{}", out(&o));
+    assert_eq!(sb.itunesdb(), db_before);
+    assert!(!sb.base().join("signals.once").exists(), "set up");
+
+    sb.lose_files([2]);
+    let orphans = sb.orphans(1);
+    sb.signal_when_inhibited(&["TERM", "TERM"]);
+    let o = sb.run(&["doctor", "--fix", "--yes"]);
+    assert_code(&o, 0);
+    assert!(
+        !sb.base().join("signals.once").exists(),
+        "set up: doctor took the inhibitor, so the fake sent the signals"
+    );
+    assert!(!orphans[0].exists(), "{}", err(&o));
+    assert!(
+        gpod::Database::open(&sb.ipod)
+            .unwrap()
+            .track_by_dbid(3)
+            .is_none(),
+        "the entry is removed"
+    );
 }

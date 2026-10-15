@@ -736,11 +736,23 @@ verified, and the mappings of what it holds are recorded. An interrupted
 sync loses at most the copies since the last checkpoint, whose files
 `iprune doctor` finds.
 
-Ctrl+C (the CLI; a second one quits at once, except while the database is
-written and read back) or Stop (the window, shown
-only while there are copies) during the copies finishes the current file,
+Ctrl+C, SIGTERM (logout, shutdown) or SIGHUP (the terminal closed) in the
+CLI, or the same signals or Stop (shown only while there are copies) in the
+window, during the copies finishes the current file,
 writes what was done as a checkpoint and stops; a copy that fails on the
-iPod side does the same. If the checks before the final write fail after a
+iPod side does the same. Until a command starts applying (after its
+confirmation) a signal ends it at once; from then on, in `sync`, `doctor
+--fix` and `restore` alike, it only asks it to stop and it never exits in
+the middle of a write, a second signal included (a copy that hangs is ended
+with `kill -9`, leaving an orphan for `iprune doctor`). Output to a
+terminal that has gone is ignored. While a command applies, and while the
+window's sync runs, a logind block inhibitor (`systemd-inhibit`, module
+`inhibit`, in its own process group so the terminal's Ctrl+C or hang-up
+does not end it) keeps the machine from suspending, shutting down, going
+idle or acting on the lid; the desktop's own inhibit does nothing on
+Hyprland. When it cannot be taken, the CLI says so. A
+forced shutdown or power loss still ends it, and the checkpoint, the
+pending pull, `restore` and `doctor` recover from that. If the checks before the final write fail after a
 checkpoint, that write is not made and the checkpoint stands. Playlists and tag
 updates are then left for the next sync, which plans them again. A plan
 whose copies do not fit is refused before anything is written, and so is
@@ -954,8 +966,10 @@ shown (a change in free space or in the planned copies does not count),
 and runs the M4 playlist sync. It compares against the index, without
 reading the playlists folder again: a file edited after the plan but not
 yet read is left for the next sync, and the window reads such edits
-within half a second anyway. While it writes, neither the dialog nor the window can close and the
-application is held, so the process cannot end mid-write. The result shows
+within half a second anyway. While it writes, neither the dialog nor the window can close, the
+application is held, and suspend, shutdown and the lid are inhibited (see
+section 11.2); a signal acts as Stop, and the window quits once the sync
+is done. The result shows
 the backup stamp, or the error with the restore command. libgpod objects
 never cross threads: each worker opens its own database and its own
 connection to the index (SQLite waits up to 10 s for the other's writes).

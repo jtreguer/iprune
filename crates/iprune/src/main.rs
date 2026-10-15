@@ -1,6 +1,15 @@
 use std::io::{self, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Prints a line, ignoring a terminal that is gone (SIGHUP): once a command
+/// applies, its output must not stop it.
+macro_rules! say {
+    ($($arg:tt)*) => {
+        let _ = writeln!(io::stdout(), $($arg)*);
+    };
+}
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -469,37 +478,18 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
     if !args.yes && !confirm(&format!("Apply this plan to the iPod at {}?", mp.display()))? {
         return Ok(Outcome::Declined);
     }
-    // Ctrl+C finishes the current file, writes what was done and stops.
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // Set while the iPod database is written and read back.
-    let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let (cancel, writing) = (cancel.clone(), writing.clone());
-        // A second Ctrl+C ends at once, except during a write: a hung copy
-        // leaves only an orphan file, which `iprune doctor` finds.
-        let _ = ctrlc::set_handler(move || {
-            use std::sync::atomic::Ordering::Relaxed;
-            if !cancel.swap(true, Relaxed) {
-                eprintln!("\nstopping after the current file (Ctrl+C again to quit now)…");
-            } else if writing.load(Relaxed) {
-                eprintln!("\nwriting the iPod database; it stops once written and verified…");
-            } else {
-                std::process::exit(130);
-            }
-        });
-    }
+    let _inhibit = applying("Writing to the iPod");
     let tty = io::stderr().is_terminal();
     let progress = |p: exec::Progress| {
-        writing.store(
-            matches!(p, exec::Progress::Writing | exec::Progress::Verifying),
-            std::sync::atomic::Ordering::Relaxed,
-        );
         if !tty {
             return;
         }
-        match p {
+        // Errors ignored: once the terminal is gone (SIGHUP), writing to it
+        // fails, and must not stop the sync.
+        let mut err = io::stderr();
+        let _ = match p {
             exec::Progress::Removing { done, total } => {
-                eprint!("\rremoving {done}/{total}          ")
+                write!(err, "\rremoving {done}/{total}          ")
             }
             exec::Progress::Copying {
                 done,
@@ -507,21 +497,22 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
                 bytes,
                 bytes_total,
                 name,
-            } => eprint!(
+            } => write!(
+                err,
                 "\r\x1b[Kcopying {}/{total} ({} of {}) {name}",
                 done + 1,
                 sync::bytes(bytes),
                 sync::bytes(bytes_total)
             ),
-            exec::Progress::Writing => eprint!("\r\x1b[Kwriting the iPod database…"),
-            exec::Progress::Verifying => eprint!("\r\x1b[Kreading it back to verify…"),
-        }
+            exec::Progress::Writing => write!(err, "\r\x1b[Kwriting the iPod database…"),
+            exec::Progress::Verifying => write!(err, "\r\x1b[Kreading it back to verify…"),
+        };
     };
     let done = exec::sync(
-        conn, &config, &paths, &lock, &mp, db, &prepared, &work, opts, &progress, &cancel,
+        conn, &config, &paths, &lock, &mp, db, &prepared, &work, opts, &progress, &CANCEL,
     );
     if tty {
-        eprintln!();
+        let _ = writeln!(io::stderr());
     }
     iprune_core::notify::send(&match &done {
         Ok(o) => iprune_core::notify::synced(o),
@@ -668,6 +659,7 @@ fn run_doctor(fix: bool, yes: bool, allow_mass_removal: bool) -> Result<Outcome>
     // The report is of the iPod as it was read; it may have been swapped
     // or changed while the prompt waited.
     sync::check_identity(&mp, &then)?;
+    let _inhibit = applying("Repairing the iPod");
     // Database entries first, through the sync's backup, checks and
     // verification; then the orphan files, then the index.
     if !report.missing_files.is_empty() {
@@ -690,22 +682,23 @@ fn run_doctor(fix: bool, yes: bool, allow_mass_removal: bool) -> Result<Outcome>
             &work,
             opts,
             &|_| {},
-            &std::sync::atomic::AtomicBool::new(false),
+            &CANCEL,
         )?;
-        println!(
+        say!(
             "removed {} database entries and verified the iPod database; backup {}",
-            done.removed, done.backup.stamp
+            done.removed,
+            done.backup.stamp
         );
     } else {
         drop(db);
     }
     let deleted = doctor::delete_orphans(&report, contents.tracks.len(), allow_mass_removal)?;
     if deleted > 0 {
-        println!("deleted {deleted} orphan files");
+        say!("deleted {deleted} orphan files");
     }
     doctor::fix_index(conn, device, &report)?;
     if !report.stale_mappings.is_empty() || !report.forgotten.is_empty() {
-        println!(
+        say!(
             "dropped {} stale mappings and {} long-missing tracks from the index",
             report.stale_mappings.len(),
             report.forgotten.len()
@@ -790,6 +783,7 @@ fn run_restore(
     {
         return Ok(Outcome::Declined);
     }
+    let _inhibit = applying("Restoring the iPod database");
     let r = exec::restore(
         store.conn(),
         &config,
@@ -799,33 +793,33 @@ fn run_restore(
         stamp,
         discard_play_counts,
     )?;
-    println!(
+    say!(
         "saved what the iPod held as backup {}; statistics pulled for {} tracks ({} plays)",
         r.saved.stamp,
         r.pulled.tracks(),
         r.pulled.plays()
     );
     if !r.set_aside.is_empty() {
-        println!(
+        say!(
             "took {} off the iPod: kept in backup {}",
             r.set_aside.join(" and "),
             r.saved.stamp
         );
     }
-    println!(
+    say!(
         "restored {} and read it back; mappings back to {} tracks and {} playlists",
         r.files.join(", "),
         r.tracks,
         r.playlists
     );
     if r.dropped_tracks > 0 {
-        println!(
+        say!(
             "{} track mappings dropped: their library file is gone",
             r.dropped_tracks
         );
     }
     if r.playlists_to_delete > 0 {
-        println!(
+        say!(
             "{} iPod playlists came back whose library playlist is gone; the next sync deletes them",
             r.playlists_to_delete
         );
@@ -909,7 +903,48 @@ fn snapshot(path: &Path) -> Result<()> {
     }
 }
 
+/// Set once a command starts changing the iPod or the index after its
+/// confirmation: a signal then asks it to stop at the next safe point
+/// instead of ending the process.
+static APPLYING: AtomicBool = AtomicBool::new(false);
+/// Asked to stop: copies end after the current file, and what was done is
+/// written and verified.
+static CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Ctrl+C, SIGTERM (logout, shutdown) and SIGHUP (the terminal closed) end
+/// iprune at once until it applies anything; from then on they only ask it
+/// to stop, and it never exits in the middle of a write. A copy that hangs
+/// is ended with `kill -9`, which leaves an orphan `iprune doctor` finds.
+fn install_signals() {
+    let _ = ctrlc::set_handler(|| {
+        if !APPLYING.load(Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+        let msg = if CANCEL.swap(true, Ordering::SeqCst) {
+            "\nstill finishing: iprune stops once it is safe to"
+        } else {
+            "\nstopping as soon as it is safe to: what was done is written and verified first…"
+        };
+        let _ = writeln!(io::stderr(), "{msg}");
+    });
+}
+
+/// Marks the command as applying, and keeps the machine from suspending or
+/// shutting down until the returned inhibitor is dropped.
+fn applying(why: &str) -> Option<iprune_core::inhibit::Inhibitor> {
+    APPLYING.store(true, Ordering::SeqCst);
+    let held = iprune_core::inhibit::hold(why);
+    if held.is_none() {
+        let _ = writeln!(
+            io::stderr(),
+            "could not keep the machine from sleeping (systemd-inhibit): do not suspend it until this is done"
+        );
+    }
+    held
+}
+
 fn main() -> ExitCode {
+    install_signals();
     let cli = Cli::parse();
     let result = match &cli.command {
         Command::Init {
@@ -963,7 +998,8 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("iprune: {e:#}");
+            // The terminal may be gone (SIGHUP): the exit code still tells.
+            let _ = writeln!(io::stderr(), "iprune: {e:#}");
             let verification = e
                 .downcast_ref::<iprune_core::Error>()
                 .is_some_and(iprune_core::Error::is_check_failure);

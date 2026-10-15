@@ -22,6 +22,9 @@ use data::{Data, DeviceInfo};
 use view_model::{Column, Layout, Layouts, Row};
 
 const APP_ID: &str = "dev.iprune.Iprune";
+
+/// Set by SIGTERM, SIGHUP or SIGINT, see `build`.
+static SIGNALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// What a drag from the grid carries: a value of a private type, so no other
 /// widget (the search field) accepts it. The rows themselves stay in [`Ui`].
 struct DragMarker;
@@ -98,6 +101,8 @@ struct Ui {
     add_menu: gio::Menu,
     /// True while a sync writes to the iPod: the window cannot close.
     writing: Cell<bool>,
+    /// The running sync's Stop flag, which a SIGTERM, SIGHUP or SIGINT sets.
+    cancel: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     /// True while a sync or adoption dialog is open, its worker still
     /// runs, or an eject is under way: one thing at a time with the iPod.
     busy: Cell<bool>,
@@ -1113,7 +1118,10 @@ impl Ui {
         // up until the worker is done.
         dialog.set_deletable(false);
         let hold = self.window.application().map(|a| a.hold());
+        // No suspend, shutdown or lid action until the worker is done.
+        let inhibit = iprune_core::inhibit::hold("Writing to the iPod");
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.cancel.replace(Some(cancel.clone()));
         let progress_page =
             ProgressPage::new(stack, cancel.clone(), !work.tracks.copies.is_empty());
         let (tx, rx) = async_channel::unbounded::<iprune_core::exec::Progress>();
@@ -1137,10 +1145,12 @@ impl Ui {
                 sync_job::apply(&config, &paths, &work, allow, &progress, &cancel)
             })
             .await;
+            drop(inhibit);
             drop(hold);
             dialog.set_deletable(true);
             let Some(ui) = ui.upgrade() else { return };
             ui.writing.set(false);
+            ui.cancel.replace(None);
             let result = joined(result);
             if let Some(note) = match &result {
                 Ok(done) => done.note.clone(),
@@ -1737,6 +1747,7 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         eject_action: RefCell::new(None),
         add_menu,
         writing: Cell::new(false),
+        cancel: RefCell::new(None),
         busy: Cell::new(false),
         planning: Cell::new(false),
         volumes: RefCell::new(None),
@@ -1917,6 +1928,35 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
                 ui.save_layouts();
             }
             glib::Propagation::Proceed
+        });
+    }
+    // SIGTERM (logout, shutdown), SIGHUP and SIGINT: during a sync, the
+    // same as Stop, and the process ends once the worker is done; otherwise
+    // the window quits. The handler only sets a flag (it runs on its own
+    // thread), which the main loop looks at.
+    let _ = ctrlc::set_handler(|| SIGNALLED.store(true, std::sync::atomic::Ordering::SeqCst));
+    {
+        let weak = Rc::downgrade(&ui);
+        glib::timeout_add_local(Duration::from_millis(200), move || {
+            let Some(ui) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            // During a sync the flag stays set: the sync is stopped now,
+            // and the window quits once it is done.
+            if SIGNALLED.load(std::sync::atomic::Ordering::SeqCst) {
+                if ui.writing.get() {
+                    if let Some(c) = &*ui.cancel.borrow() {
+                        c.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else {
+                    SIGNALLED.store(false, std::sync::atomic::Ordering::SeqCst);
+                    ui.save_layouts();
+                    if let Some(app) = ui.window.application() {
+                        app.quit();
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
         });
     }
     // The window owns the state from here.

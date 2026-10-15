@@ -8,6 +8,7 @@ pub mod device;
 pub mod doctor;
 mod error;
 pub mod exec;
+pub mod inhibit;
 pub mod ipod;
 pub mod lock;
 pub mod notify;
