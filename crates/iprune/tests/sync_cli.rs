@@ -89,7 +89,11 @@ impl Sandbox {
         let text = fs::read_to_string(&cfg).unwrap();
         let empty = "mountpoint = \"\"";
         assert!(text.contains(empty), "{text}");
-        fs::write(cfg, text.replace(empty, &format!("mountpoint = {mp:?}"))).unwrap();
+        fs::write(
+            cfg,
+            text.replace(empty, &format!("mountpoint = {mp:?}\nallow_folder = true")),
+        )
+        .unwrap();
     }
 
     /// Replaces a line of the generated config.
@@ -1417,4 +1421,347 @@ fn a_sync_that_fails_while_applying_sends_a_critical_notification() {
     assert_eq!(text.len(), 2, "{lines:?}");
     assert_eq!(text[0], "iPod sync failed");
     assert!(!text[1].is_empty());
+}
+
+// ---- audit step 3: a prompt that waited (H1), damaged paths (L2), folders (M6)
+
+impl Sandbox {
+    /// Runs `iprune args` on a terminal (a pty made by `script`, so the
+    /// confirmation prompt is asked), waits for the `[y/N]` prompt, calls
+    /// `during` while it waits and answers `y`. Returns the exit code and
+    /// what appeared on the terminal.
+    fn run_on_terminal(&self, args: &[&str], during: impl FnOnce()) -> (Option<i32>, String) {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let base = self.base();
+        let path = format!(
+            "{}:{}",
+            base.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let cmd = format!("'{}' {}", env!("CARGO_BIN_EXE_iprune"), args.join(" "));
+        let mut child = Command::new("script")
+            .args(["-qec", &cmd, "/dev/null"])
+            .env("HOME", base.join("home"))
+            .env("XDG_CONFIG_HOME", base.join("config"))
+            .env("XDG_DATA_HOME", base.join("data"))
+            .env("PATH", path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("these tests need `script` (util-linux) to give iprune a terminal");
+        let seen = Arc::new(Mutex::new(String::new()));
+        let reader = {
+            let (seen, mut stdout) = (seen.clone(), child.stdout.take().unwrap());
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = stdout.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    seen.lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !seen.lock().unwrap().contains("[y/N]") {
+            assert!(
+                Instant::now() < deadline && child.try_wait().unwrap().is_none(),
+                "no prompt: {}",
+                seen.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        during();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"y\n").unwrap();
+        stdin.flush().unwrap();
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "no exit");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        drop(stdin);
+        reader.join().unwrap();
+        let text = seen.lock().unwrap().clone();
+        (status.code(), text)
+    }
+
+    /// A Play Counts with no entry yet: what the iPod holds after a play.
+    fn add_play_counts(&self) {
+        let mut b = b"mhdp".to_vec();
+        b.extend(96u32.to_le_bytes());
+        b.extend(28u32.to_le_bytes());
+        b.resize(96, 0);
+        fs::write(self.ipod.join("iPod_Control/iTunes/Play Counts"), b).unwrap();
+    }
+}
+
+// Prevents (audit H1) `sync` writing a plan made before the prompt over an
+// iPod that was played, swapped or rewritten while the prompt waited.
+#[test]
+fn sync_refuses_an_ipod_that_changed_while_its_prompt_waited() {
+    let sb = adopted();
+    sb.reverse_road();
+    let mut during = BTreeMap::new();
+    let (code, text) = sb.run_on_terminal(&["sync"], || {
+        sb.add_play_counts();
+        during = sb.tree(&sb.ipod);
+    });
+    assert_eq!(code, Some(1), "{text}");
+    assert!(text.contains("changed"), "{text}");
+    assert!(
+        text.contains(&sb.ipod.display().to_string()),
+        "the prompt names the iPod: {text}"
+    );
+    assert_eq!(sb.tree(&sb.ipod), during, "the iPod was written");
+    assert!(sb.stamps().is_empty(), "no backup, so no write began");
+    assert_eq!(sb.ipod_playlist("Road"), Some(vec![u64::MAX - 1, 2]));
+
+    // Without a change during the wait the same command applies the edit.
+    let (code, text) = sb.run_on_terminal(&["sync"], || {});
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(sb.ipod_playlist("Road"), Some(vec![2, u64::MAX - 1]));
+}
+
+// Prevents (audit H1) `doctor --fix` repairing from a report of an iPod that
+// is no longer the one it read, on either path: the database repair and the
+// orphans-only one.
+#[test]
+fn doctor_fix_refuses_an_ipod_that_changed_while_its_prompt_waited() {
+    for lose_an_entry in [true, false] {
+        let sb = adopted();
+        if lose_an_entry {
+            sb.lose_files([2]);
+        }
+        let orphans = sb.orphans(1);
+        let mappings = sb.mappings();
+        let mut during = BTreeMap::new();
+        let (code, text) = sb.run_on_terminal(&["doctor", "--fix"], || {
+            sb.add_play_counts();
+            during = sb.tree(&sb.ipod);
+        });
+        let ctx = format!("entry lost: {lose_an_entry}: {text}");
+        assert_eq!(code, Some(1), "{ctx}");
+        assert!(text.contains("changed"), "{ctx}");
+        assert!(
+            text.contains(&sb.ipod.display().to_string()),
+            "the prompt names the iPod: {ctx}"
+        );
+        assert_eq!(sb.tree(&sb.ipod), during, "{ctx}: the iPod was written");
+        assert!(orphans[0].exists(), "{ctx}: an orphan was deleted");
+        assert!(!sb.backups_dir().exists(), "{ctx}: a backup was made");
+        assert_eq!(sb.mappings(), mappings, "{ctx}");
+    }
+}
+
+#[test]
+fn doctor_fix_on_a_terminal_repairs_when_nothing_changed_during_the_prompt() {
+    let sb = adopted();
+    sb.lose_files([2]);
+    let orphans = sb.orphans(1);
+    let (code, text) = sb.run_on_terminal(&["doctor", "--fix"], || {});
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains(&sb.ipod.display().to_string()),
+        "the prompt names the iPod: {text}"
+    );
+    assert!(!orphans[0].exists());
+    assert!(
+        gpod::Database::open(&sb.ipod)
+            .unwrap()
+            .track_by_dbid(3)
+            .is_none()
+    );
+}
+
+/// The adopted world with track 3's path made to leave the iPod, and the
+/// file it names outside it.
+fn with_path_out_of_the_ipod() -> (Sandbox, PathBuf) {
+    let sb = adopted();
+    let outside = sb.base().join("outside.mp3");
+    fs::write(&outside, b"not the iPod's").unwrap();
+    // Four steps up from F00 leave the iPod's folder (its parent is `base`).
+    common::set_ipod_path(
+        &sb.ipod.join("iPod_Control/iTunes/iTunesDB"),
+        2,
+        ":iPod_Control:Music:F00:..:..:..:..:outside.mp3",
+    );
+    (sb, outside)
+}
+
+// Prevents (audit L2) `doctor --fix` treating an entry whose path leaves the
+// iPod as an entry to remove, deleting the file it names.
+#[test]
+fn doctor_lists_an_entry_whose_path_leaves_the_ipod_and_fix_neither_removes_it_nor_its_target() {
+    let (sb, outside) = with_path_out_of_the_ipod();
+    let before = sb.tree(&sb.ipod);
+    let o = sb.ok(&["doctor"]);
+    let text = out(&o);
+    assert!(text.contains("outside.mp3"), "{text}");
+    assert!(text.contains(&format!("{:016x}", 3)), "{text}");
+    assert!(!text.contains("nothing to repair"), "{text}");
+    assert_eq!(sb.tree(&sb.ipod), before);
+
+    let orphans = sb.orphans(1);
+    let o = sb.ok(&["doctor", "--fix", "--yes"]);
+    assert!(!orphans[0].exists(), "the real orphan is still repaired");
+    assert!(
+        gpod::Database::open(&sb.ipod)
+            .unwrap()
+            .track_by_dbid(3)
+            .is_some(),
+        "the entry stays"
+    );
+    assert_eq!(fs::read(&outside).unwrap(), b"not the iPod's");
+    assert!(!out(&o).contains("removed"), "{}", out(&o));
+    // And it is still reported.
+    assert!(out(&sb.ok(&["doctor"])).contains("outside.mp3"));
+}
+
+// ---- M6
+
+impl Sandbox {
+    fn forbid_folders(&self) {
+        self.edit_config("allow_folder = true", "allow_folder = false");
+    }
+}
+
+// Prevents (audit M6) a configured folder, such as a copy of the iPod or the
+// backup, being written as if it were the iPod.
+#[test]
+fn sync_to_a_folder_is_refused_unless_the_config_allows_folders() {
+    let sb = adopted();
+    sb.reverse_road();
+    sb.forbid_folders();
+    let before = sb.tree(&sb.ipod);
+    let o = sb.run(&["sync", "--yes"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("folder"), "{}", err(&o));
+    assert_eq!(sb.tree(&sb.ipod), before);
+    assert!(sb.stamps().is_empty());
+
+    sb.edit_config("allow_folder = false", "allow_folder = true");
+    sb.ok(&["sync", "--yes"]);
+    assert_eq!(sb.ipod_playlist("Road"), Some(vec![2, u64::MAX - 1]));
+}
+
+// With only orphans to delete no sync runs, so the folder check in `doctor`
+// itself is what stops the deletion.
+#[test]
+fn doctor_fix_to_a_folder_is_refused_unless_the_config_allows_folders() {
+    for lose_an_entry in [true, false] {
+        let sb = adopted();
+        if lose_an_entry {
+            sb.lose_files([2]);
+        }
+        let orphans = sb.orphans(1);
+        sb.forbid_folders();
+        let before = sb.tree(&sb.ipod);
+        let o = sb.run(&["doctor", "--fix", "--yes"]);
+        assert_code(&o, 1);
+        assert!(err(&o).contains("folder"), "{}", err(&o));
+        assert_eq!(sb.tree(&sb.ipod), before, "entry lost: {lose_an_entry}");
+        assert!(orphans[0].exists());
+        assert!(!sb.backups_dir().exists());
+        // Reading is not writing: the report still works.
+        let o = sb.ok(&["doctor"]);
+        assert!(out(&o).contains("doctor --fix"), "{}", out(&o));
+
+        sb.edit_config("allow_folder = false", "allow_folder = true");
+        sb.ok(&["doctor", "--fix", "--yes"]);
+        assert!(!orphans[0].exists());
+    }
+}
+
+#[test]
+fn restore_to_a_folder_is_refused_unless_the_config_allows_folders() {
+    let sb = adopted();
+    let stamp = sb.synced();
+    sb.forbid_folders();
+    let ipod_before = sb.tree(&sb.ipod);
+    let backups_before = sb.tree(&sb.backups_dir());
+    let o = sb.run(&["restore", &stamp, "--yes"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("folder"), "{}", err(&o));
+    assert_eq!(sb.tree(&sb.ipod), ipod_before);
+    assert_eq!(sb.tree(&sb.backups_dir()), backups_before);
+
+    sb.edit_config("allow_folder = false", "allow_folder = true");
+    sb.ok(&["restore", &stamp, "--yes"]);
+    assert_eq!(sb.ipod_playlist("Road"), Some(vec![u64::MAX - 1, 2]));
+}
+
+#[test]
+fn a_relative_mountpoint_in_the_config_stops_every_command_that_loads_it() {
+    let sb = adopted();
+    let mp = format!("mountpoint = {:?}", sb.ipod);
+    sb.edit_config(&mp, "mountpoint = \"relative/ipod\"");
+    let before = sb.tree(&sb.ipod);
+    for args in [&["doctor"][..], &["sync", "--plan-only"], &["scan"]] {
+        let o = sb.run(args);
+        assert_code(&o, 1);
+        assert!(
+            err(&o).contains("device.mountpoint"),
+            "{args:?}: {}",
+            err(&o)
+        );
+    }
+    assert_eq!(sb.tree(&sb.ipod), before);
+}
+
+// Prevents (review of step 3) a restore of one iPod's backup onto another iPod
+// swapped in at the same mountpoint before the command.
+#[test]
+fn restore_after_the_ipod_was_swapped_for_another_is_refused_and_changes_nothing() {
+    let sb = adopted();
+    let stamp = sb.synced();
+    fs::write(
+        sb.ipod.join("iPod_Control/Device/SysInfo"),
+        "FirewireGuid: 0x000A2700BBBBBBBB\n",
+    )
+    .unwrap();
+    let ipod_before = sb.tree(&sb.ipod);
+    let backups_before = sb.tree(&sb.backups_dir());
+    for args in [
+        vec!["restore", &stamp, "--yes"],
+        vec!["restore", &stamp, "--yes", "--guid", "0x000A27001234ABCD"],
+    ] {
+        let o = sb.run(&args);
+        assert_code(&o, 1);
+        assert_eq!(sb.tree(&sb.ipod), ipod_before, "{args:?}");
+        assert_eq!(sb.tree(&sb.backups_dir()), backups_before, "{args:?}");
+    }
+}
+
+// Prevents (review of step 3) `doctor --fix` asking to repair what it never
+// repairs: with only a damaged path there is nothing to ask about.
+#[test]
+fn doctor_fix_with_only_a_damaged_path_does_not_ask_and_changes_nothing() {
+    let (sb, outside) = with_path_out_of_the_ipod();
+    // Track 3's own old file is now an orphan the fix would delete: remove
+    // it, so that only the damaged path is left to report.
+    fs::remove_file(sb.ipod.join("iPod_Control/Music/F02/T0002.mp3")).unwrap();
+    let listed = out(&sb.ok(&["doctor"]));
+    assert!(listed.contains("outside.mp3"), "{listed}");
+    assert!(!listed.contains("not in its database"), "{listed}");
+    let before = sb.tree(&sb.ipod);
+    // No --yes and no terminal: a question would be an error (code 1).
+    let o = sb.run(&["doctor", "--fix"]);
+    assert_code(&o, 0);
+    assert!(
+        out(&o).contains("nothing to repair automatically"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(sb.tree(&sb.ipod), before);
+    assert!(!sb.backups_dir().exists());
+    assert_eq!(fs::read(&outside).unwrap(), b"not the iPod's");
 }

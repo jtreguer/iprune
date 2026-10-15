@@ -5,14 +5,21 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::Result;
 use crate::adopt::LibPlaylist;
 
+/// The device whose GUID is `guid`, spelled with or without `0x` and in
+/// either case: libgpod gives `0x…` from `SysInfo` and bare hex from
+/// `SysInfoExtended`, and an iPod can gain the latter after an iTunes
+/// restore.
 pub fn device_id(conn: &Connection, guid: &str) -> Result<Option<i64>> {
-    Ok(conn
-        .query_row(
-            "SELECT id FROM devices WHERE firewire_guid = ?1",
-            [guid],
-            |r| r.get(0),
-        )
-        .optional()?)
+    let want = crate::device::normalize_guid(guid);
+    let mut stmt = conn.prepare("SELECT id, firewire_guid FROM devices ORDER BY id")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (id, g) = row?;
+        if crate::device::normalize_guid(&g) == want {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
 }
 
 /// A known iPod.
@@ -48,9 +55,15 @@ pub fn upsert_device(
     name: Option<&str>,
     model: Option<&str>,
 ) -> Result<i64> {
+    if let Some(id) = device_id(conn, guid)? {
+        conn.execute(
+            "UPDATE devices SET name = ?2, model = ?3 WHERE id = ?1",
+            params![id, name, model],
+        )?;
+        return Ok(id);
+    }
     Ok(conn.query_row(
-        "INSERT INTO devices (firewire_guid, name, model) VALUES (?1, ?2, ?3) \
-         ON CONFLICT(firewire_guid) DO UPDATE SET name = excluded.name, model = excluded.model RETURNING id",
+        "INSERT INTO devices (firewire_guid, name, model) VALUES (?1, ?2, ?3) RETURNING id",
         params![guid, name, model],
         |r| r.get(0),
     )?)

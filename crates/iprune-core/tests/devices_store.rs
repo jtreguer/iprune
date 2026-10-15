@@ -378,6 +378,7 @@ fn mount(mp: &str, fstype: &str, ro: bool) -> Mount {
         mountpoint: mp.into(),
         fstype: fstype.into(),
         read_only: ro,
+        root: "/".into(),
     }
 }
 
@@ -514,4 +515,35 @@ fn normalize_guid_trims_strips_the_prefix_and_upper_cases() {
     }
     // Only a leading prefix goes.
     assert_eq!(normalize_guid("ab0xcd"), "AB0XCD");
+}
+
+// Prevents a device adopted from SysInfo ("0x…") being unknown once the same
+// iPod reports its GUID from SysInfoExtended (bare hex, any case).
+#[test]
+fn a_device_is_found_by_any_spelling_of_its_guid_and_upsert_adds_no_second_row() {
+    let env = Env::new();
+    let conn = env.store.conn();
+    let a = devices::upsert_device(conn, "0x000A27001234ABCD", Some("Old"), None).unwrap();
+    for spelling in [
+        "0x000A27001234ABCD",
+        "000A27001234ABCD",
+        "000a27001234abcd",
+        "0X000a27001234abcd",
+    ] {
+        assert_eq!(
+            devices::device_id(conn, spelling).unwrap(),
+            Some(a),
+            "{spelling}"
+        );
+        let again = devices::upsert_device(conn, spelling, Some("New"), Some("Classic")).unwrap();
+        assert_eq!(again, a, "{spelling}");
+    }
+    let rows = devices::devices(conn).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].name.as_deref(), Some("New"));
+    assert_eq!(rows[0].model.as_deref(), Some("Classic"));
+    // Another iPod is still another iPod.
+    assert_eq!(devices::device_id(conn, "000A27001234ABCE").unwrap(), None);
+    let b = devices::upsert_device(conn, "000A27001234ABCE", None, None).unwrap();
+    assert_ne!(a, b);
 }

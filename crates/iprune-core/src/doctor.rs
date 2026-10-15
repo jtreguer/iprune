@@ -21,6 +21,10 @@ pub struct Report {
     pub orphan_files: Vec<PathBuf>,
     /// `(dbid, "artist - title")` of database entries whose file is gone.
     pub missing_files: Vec<(u64, String)>,
+    /// `(dbid, path)` of database entries whose iPod path is not a plain
+    /// path under the iPod (`..`, empty parts): a damaged database. Reported
+    /// and never repaired, so no deletion follows such a path.
+    pub bad_paths: Vec<(u64, String)>,
     /// `(playlist, managed)` for regular iPod playlists holding a track more
     /// than once when their file (for a managed one) does not.
     pub repeated: Vec<(String, bool)>,
@@ -35,6 +39,7 @@ impl Report {
     pub fn is_clean(&self) -> bool {
         self.orphan_files.is_empty()
             && self.missing_files.is_empty()
+            && self.bad_paths.is_empty()
             && self.repeated.is_empty()
             && self.stale_mappings.is_empty()
             && self.forgotten.is_empty()
@@ -101,6 +106,13 @@ pub fn examine(
         }
     }
     for t in &contents.tracks {
+        if let Some(p) = t.ipod_path.as_deref()
+            && !p.is_empty()
+            && ipod::file_path(mountpoint, p).is_none()
+        {
+            report.bad_paths.push((t.adopt.dbid, p.to_owned()));
+            continue;
+        }
         let exists = t
             .ipod_path
             .as_deref()

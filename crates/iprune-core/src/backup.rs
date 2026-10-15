@@ -295,7 +295,7 @@ fn create_with(
     extra: &[(&str, &[u8])],
     require_db: bool,
 ) -> Result<Backup> {
-    let base = root.join(guid);
+    let base = folder(root, guid);
     fs::create_dir_all(&base).at(&base)?;
     // Folders left by a backup interrupted part way.
     for e in fs::read_dir(&base).at(&base)?.filter_map(|e| e.ok()) {
@@ -374,9 +374,34 @@ pub fn summary(backup: &Backup) -> Option<String> {
     ))
 }
 
+/// The folder of the iPod `guid`'s backups under `root`: the one already
+/// there whose name is the same GUID however spelled (`0x` or not, either
+/// case, as libgpod gives it from `SysInfo` or `SysInfoExtended`), or a new
+/// one named `guid`.
+fn folder(root: &Path, guid: &str) -> PathBuf {
+    let exact = root.join(guid);
+    if exact.is_dir() {
+        return exact;
+    }
+    let want = crate::device::normalize_guid(guid);
+    fs::read_dir(root)
+        .ok()
+        .and_then(|d| {
+            d.filter_map(|e| e.ok())
+                .filter(|e| !e.file_name().as_encoded_bytes().starts_with(b"."))
+                .find(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| crate::device::normalize_guid(n) == want)
+                })
+                .map(|e| e.path())
+        })
+        .unwrap_or(exact)
+}
+
 /// The backups of one iPod, oldest first.
 pub fn list(root: &Path, guid: &str) -> Result<Vec<Backup>> {
-    let base = root.join(guid);
+    let base = folder(root, guid);
     if !base.is_dir() {
         return Ok(Vec::new());
     }
@@ -414,7 +439,7 @@ pub fn prune(root: &Path, guid: &str, keep: usize) -> Result<Vec<PathBuf>> {
         fs::remove_dir_all(&b.dir).at(&b.dir)?;
         removed.push(b.dir);
     }
-    prune_store(&root.join(guid))?;
+    prune_store(&folder(root, guid))?;
     Ok(removed)
 }
 

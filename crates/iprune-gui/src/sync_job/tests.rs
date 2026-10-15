@@ -565,6 +565,52 @@ fn apply_pulls_play_counts_before_writing() {
     assert_eq!((done.stats_tracks, done.plays), (1, 3));
 }
 
+// The window plans, waits for the user, then applies: apply reads the iPod
+// again under the lock, so the identity check (audit H1) compares the iPod
+// with itself and a Play Counts that appeared during the wait is pulled, not
+// refused.
+#[test]
+fn apply_after_plays_arrived_since_the_plan_reads_the_ipod_again_and_pulls_them() {
+    let w = World::new(&[]);
+    w.write_list("Road", &[D2, D1]);
+    let p = w.plan();
+    assert!(!p.work.is_empty(), "set up");
+    let mut b = b"mhdp".to_vec();
+    b.extend(96u32.to_le_bytes());
+    b.extend(28u32.to_le_bytes());
+    b.extend(3u32.to_le_bytes());
+    b.resize(96, 0);
+    for plays in [2u32, 0, 0] {
+        b.extend(plays.to_le_bytes());
+        b.extend(
+            ((if plays > 0 {
+                1_700_000_000i64 + 2_082_844_800
+            } else {
+                0
+            }) as u32)
+                .to_le_bytes(),
+        );
+        b.extend([0u8; 4]);
+        b.extend((if plays > 0 { 80u32 } else { 0 }).to_le_bytes());
+        b.extend([0u8; 4]);
+        b.extend([0u8; 4]);
+        b.extend([0u8; 4]);
+    }
+    fs::write(w.root.join("iPod_Control/iTunes/Play Counts"), b).unwrap();
+    let done = apply(
+        &w.env.cfg,
+        &w.paths,
+        &p.work,
+        false,
+        &|_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!((done.stats_tracks, done.plays), (1, 2));
+    assert_eq!(w.members("Road"), Some(vec![D2, D1]));
+    assert_eq!(w.backups().len(), 1);
+}
+
 // Guards against comparing the whole plan: free space moves whenever anything
 // writes to the iPod's filesystem, and must not refuse an unchanged change set.
 #[test]

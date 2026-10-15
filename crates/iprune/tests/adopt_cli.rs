@@ -81,7 +81,10 @@ impl Sandbox {
         let text = fs::read_to_string(&cfg).unwrap();
         let empty = "mountpoint = \"\"";
         assert!(text.contains(empty), "{text}");
-        let text = text.replace(empty, &format!("mountpoint = {:?}", self.ipod));
+        let text = text.replace(
+            empty,
+            &format!("mountpoint = {:?}\nallow_folder = true", self.ipod),
+        );
         fs::write(cfg, text).unwrap();
     }
 

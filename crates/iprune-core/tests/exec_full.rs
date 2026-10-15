@@ -661,7 +661,12 @@ fn a_file_that_cannot_be_deleted_after_the_write_is_a_warning_and_the_sync_stand
     let out = w.sync().unwrap();
     assert_eq!(out.removed, 1);
     assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
-    assert!(out.warnings[0].contains("deleting"), "{:?}", out.warnings);
+    // A folder is not a track's file: kept, with a warning.
+    assert!(
+        out.warnings[0].contains("kept") && out.warnings[0].contains("not a regular file"),
+        "{:?}",
+        out.warnings
+    );
     assert!(w.track(dbid(3)).is_none(), "the database change stands");
     assert!(w.mapping().len() == 2);
 }
@@ -1824,6 +1829,7 @@ fn restoring_a_backup_after_copies_returns_the_database_and_mappings_and_leaves_
 
     let r = exec::restore(
         w.env.store.conn(),
+        &w.env.cfg,
         &w.paths,
         &w.root,
         GUID,
@@ -2555,6 +2561,7 @@ fn restore(
 ) -> iprune_core::Result<exec::Restored> {
     exec::restore(
         w.env.store.conn(),
+        &w.env.cfg,
         &w.paths,
         &w.root,
         GUID,
@@ -3373,5 +3380,863 @@ mod artwork_tests {
             "expected BackupMismatch, got {e}"
         );
         a_sync_still_goes_through(&w);
+    }
+}
+
+// ---- audit step 3: a prompt that waited (H1), signed databases (M12),
+// deletions that follow a damaged path (L1, L2) and folders as iPods (M6)
+
+mod step3 {
+    use super::*;
+    use iprune_core::config::Config;
+
+    fn sysinfo_path(w: &World) -> PathBuf {
+        w.root.join("iPod_Control/Device/SysInfo")
+    }
+
+    fn itunesdb_path(w: &World) -> PathBuf {
+        w.root.join("iPod_Control/iTunes/iTunesDB")
+    }
+
+    /// Mix cycles through four different member lists, so each call leaves
+    /// the iPod with a playlist to rewrite.
+    fn nudge(w: &World, variant: usize) {
+        let f = &w.files;
+        let lists = [
+            vec![f[2].clone()],
+            vec![f[2].clone(), f[0].clone()],
+            vec![f[0].clone(), f[2].clone()],
+            vec![f[0].clone()],
+        ];
+        w.write_list("Mix", &lists[variant % 4]);
+        w.reload();
+    }
+
+    /// The iPod and the index as they are, for "nothing changed" checks.
+    #[derive(Debug, PartialEq)]
+    struct State {
+        tree: BTreeMap<PathBuf, Vec<u8>>,
+        plays: i64,
+        pending: i64,
+        backups: usize,
+        mapping: BTreeMap<i64, u64>,
+    }
+
+    fn state(w: &World) -> State {
+        State {
+            tree: w.tree(),
+            plays: w.stats_total_plays(),
+            pending: w.pending_pulls(),
+            backups: w.backups().len(),
+            mapping: w.mapping(),
+        }
+    }
+
+    fn sync_with_cfg(
+        w: &World,
+        cfg: &Config,
+        p: &Prepared,
+        work: &FullWork,
+    ) -> iprune_core::Result<Outcome> {
+        exec::sync(
+            w.env.store.conn(),
+            cfg,
+            &w.paths,
+            &iprune_core::lock::ipod(&w.paths).unwrap(),
+            &w.root,
+            w.open(),
+            p,
+            work,
+            Options::default(),
+            &|_| {},
+            &AtomicBool::new(false),
+        )
+    }
+
+    // ---- H1
+
+    /// What the CLI does around its prompt: takes the lock, opens and plans
+    /// (the work to do is a rewritten Mix), lets `change` alter the iPod the
+    /// way something else would while the prompt waits, then applies the
+    /// plan with the database parsed before. It must be refused with nothing
+    /// changed; `undo`, then the same sync run again from scratch, goes through.
+    fn refused_after(setup: impl Fn(&World), change: impl Fn(&World), undo: impl Fn(&World)) {
+        let w = World::new(3);
+        setup(&w);
+        nudge(&w, 1);
+        let lock = iprune_core::lock::ipod(&w.paths).unwrap();
+        let db = w.open();
+        let p = sync::prepare(w.env.store.conn(), &w.env.cfg, &db).unwrap();
+        let work = exec::full_work(&p);
+        assert!(!work.is_empty(), "set up: there is something to write");
+        change(&w);
+        let before = state(&w);
+
+        let e = exec::sync(
+            w.env.store.conn(),
+            &w.env.cfg,
+            &w.paths,
+            &lock,
+            &w.root,
+            db,
+            &p,
+            &work,
+            Options::default(),
+            &|_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(matches!(e, Error::IpodChanged), "{e:?}");
+        assert_eq!(state(&w), before, "the refusal changed something");
+        assert_eq!(w.stats_total_plays(), 0, "plays were pulled");
+
+        // The iPod as it was, run again: it reads the iPod and writes it.
+        undo(&w);
+        drop(lock);
+        let out = w.sync().unwrap();
+        assert!(out.applied > 0);
+        assert_eq!(w.backups().len(), 1);
+    }
+
+    // Prevents (audit H1) writing a database parsed before a prompt over an
+    // iTunesDB another program rewrote while the prompt waited.
+    #[test]
+    fn a_changed_itunesdb_since_it_was_read_is_refused_and_nothing_changes() {
+        refused_after(
+            |_| {},
+            |w| {
+                let mut other = w.open();
+                other.create_playlist("Made by someone else").unwrap();
+                other.write().unwrap();
+            },
+            |_| {},
+        );
+    }
+
+    // Prevents (audit H1) a Play Counts that appeared during the prompt being
+    // overwritten without its plays pulled: they would be lost.
+    #[test]
+    fn a_play_counts_that_appeared_since_it_was_read_is_refused_and_not_pulled() {
+        refused_after(
+            |_| {},
+            |w| w.write_play_counts(&[(4, 1_700_000_000, 80, 0)]),
+            |_| {},
+        );
+    }
+
+    #[test]
+    fn a_play_counts_that_grew_since_it_was_read_is_refused_and_not_pulled() {
+        refused_after(
+            |w| w.write_play_counts(&[(4, 1_700_000_000, 80, 0)]),
+            |w| w.write_play_counts(&[(9, 1_700_000_500, 80, 0)]),
+            |_| {},
+        );
+    }
+
+    #[test]
+    fn a_play_counts_removed_since_it_was_read_is_refused() {
+        refused_after(
+            |w| w.write_play_counts(&[(4, 1_700_000_000, 80, 0)]),
+            |w| fs::remove_file(w.root.join("iPod_Control/iTunes/Play Counts")).unwrap(),
+            |_| {},
+        );
+    }
+
+    // Prevents (audit H1) iPod A's database being written over iPod B plugged
+    // in at the same mountpoint. B has the same iTunesDB bytes here, so only
+    // the GUID tells them apart.
+    #[test]
+    fn a_different_firewire_guid_since_it_was_read_is_refused() {
+        refused_after(
+            |_| {},
+            |w| fs::write(sysinfo_path(w), "FirewireGuid: 0x000A2700BBBBBBBB\n").unwrap(),
+            |w| fs::write(sysinfo_path(w), SYSINFO).unwrap(),
+        );
+    }
+
+    #[test]
+    fn a_vanished_guid_since_it_was_read_is_refused() {
+        refused_after(
+            |_| {},
+            |w| fs::remove_file(sysinfo_path(w)).unwrap(),
+            |w| fs::write(sysinfo_path(w), SYSINFO).unwrap(),
+        );
+    }
+
+    // The identity is the iPod's content, not when it was looked at: putting
+    // the same bytes back is the same iPod.
+    #[test]
+    fn identity_follows_the_content_of_each_part_and_nothing_else() {
+        let w = World::new(3);
+        let first = sync::identity(&w.root).unwrap();
+        assert_eq!(sync::identity(&w.root).unwrap(), first);
+        sync::check_identity(&w.root, &first).unwrap();
+        assert_eq!(w.prepare().identity.as_ref(), Some(&first));
+
+        let db = fs::read(itunesdb_path(&w)).unwrap();
+        let sysinfo = fs::read(sysinfo_path(&w)).unwrap();
+        let mut seen = vec![first.clone()];
+        let mut differs = |what: &str, id: sync::Identity| {
+            assert!(!seen.contains(&id), "{what} did not change the identity");
+            seen.push(id);
+        };
+
+        let mut other = w.open();
+        other.create_playlist("Elsewhere").unwrap();
+        other.write().unwrap();
+        drop(other);
+        differs("the iTunesDB", sync::identity(&w.root).unwrap());
+        fs::write(itunesdb_path(&w), &db).unwrap();
+        assert_eq!(sync::identity(&w.root).unwrap(), first, "same bytes back");
+
+        w.write_play_counts(&[(1, 1_700_000_000, 0, 0)]);
+        differs("a Play Counts", sync::identity(&w.root).unwrap());
+        w.write_play_counts(&[(2, 1_700_000_000, 0, 0)]);
+        differs("other plays", sync::identity(&w.root).unwrap());
+        fs::remove_file(w.root.join("iPod_Control/iTunes/Play Counts")).unwrap();
+        assert_eq!(sync::identity(&w.root).unwrap(), first);
+
+        fs::write(sysinfo_path(&w), "FirewireGuid: 0x000A2700BBBBBBBB\n").unwrap();
+        differs("the GUID", sync::identity(&w.root).unwrap());
+        fs::write(sysinfo_path(&w), &sysinfo).unwrap();
+        assert_eq!(sync::identity(&w.root).unwrap(), first);
+        assert!(matches!(
+            {
+                fs::write(sysinfo_path(&w), "FirewireGuid: 0x000A2700BBBBBBBB\n").unwrap();
+                sync::check_identity(&w.root, &first)
+            },
+            Err(Error::IpodChanged)
+        ));
+    }
+
+    // ---- M12
+
+    /// `(scheme at 0x30, hash58 set)` of the iPod's iTunesDB, read here
+    /// from the bytes rather than through the code under test.
+    fn signature(w: &World) -> (u16, bool) {
+        let b = fs::read(itunesdb_path(w)).unwrap();
+        (
+            u16::from_le_bytes([b[0x30], b[0x31]]),
+            b[0x58..0x6c].iter().any(|x| *x != 0),
+        )
+    }
+
+    const CLASSIC: &str = "ModelNumStr: xC297\nFirewireGuid: 0x000A27001234ABCD\n";
+
+    fn ext(version: &str) -> String {
+        format!(
+            "<plist><dict><key>FireWireGUID</key><string>0x000A27001234ABCD</string>\n<key>DBVersion</key>\n<integer>{version}</integer></dict></plist>"
+        )
+    }
+
+    /// A World whose database libgpod has signed: a Classic model in SysInfo,
+    /// one sync done.
+    fn signed_world() -> World {
+        let w = World::new(3);
+        assert_eq!(signature(&w), (0, false), "set up: the fake is unsigned");
+        fs::write(sysinfo_path(&w), CLASSIC).unwrap();
+        nudge(&w, 1);
+        w.sync().unwrap();
+        assert_eq!(signature(&w), (1, true), "set up: the first sync signed");
+        w
+    }
+
+    fn refused_unsigned(w: &World) -> String {
+        nudge(w, 2);
+        let before = state(w);
+        let p = w.prepare();
+        let work = exec::full_work(&p);
+        assert!(!work.is_empty(), "set up: there is something to write");
+        let e = w
+            .run(
+                &p,
+                &work,
+                Options::default(),
+                &|_| {},
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+        let Error::WouldNotSign(why) = &e else {
+            panic!("expected WouldNotSign, got {e:?}")
+        };
+        assert_eq!(state(w), before, "the refusal changed something");
+        assert_eq!(signature(w), (1, true), "still signed");
+        why.clone()
+    }
+
+    // Prevents (audit M12) a sync reporting success after replacing a signed
+    // database with an unsigned one the iPod then shows as empty.
+    #[test]
+    fn a_signed_database_is_not_written_when_libgpod_would_not_sign_it() {
+        let w = signed_world();
+        // As after a hand edit or a restore: the GUID, no model.
+        fs::write(sysinfo_path(&w), "FirewireGuid: 0x000A27001234ABCD\n").unwrap();
+        let why = refused_unsigned(&w);
+        assert!(why.contains("DBVersion") && why.contains("model"), "{why}");
+
+        // Model back: the same sync goes through and the result is signed.
+        fs::write(sysinfo_path(&w), CLASSIC).unwrap();
+        w.sync().unwrap();
+        assert_eq!(signature(&w), (1, true));
+    }
+
+    #[test]
+    fn a_signed_database_is_not_written_when_sysinfoextended_says_dbversion_2() {
+        let w = signed_world();
+        // The model is known, but the version says the older, unsigned format.
+        fs::write(w.root.join("iPod_Control/Device/SysInfoExtended"), ext("2")).unwrap();
+        let why = refused_unsigned(&w);
+        assert!(why.contains("DBVersion 2"), "{why}");
+    }
+
+    #[test]
+    fn dbversion_3_in_sysinfoextended_is_allowed_to_write_a_signed_database() {
+        let w = signed_world();
+        fs::write(sysinfo_path(&w), "FirewireGuid: 0x000A27001234ABCD\n").unwrap();
+        fs::write(w.root.join("iPod_Control/Device/SysInfoExtended"), ext("3")).unwrap();
+        nudge(&w, 2);
+        // No model, but the version is enough.
+        w.sync().unwrap();
+        assert_eq!(signature(&w), (1, true));
+    }
+
+    // An unsigned database stays unsigned without a fuss: the refusal is only
+    // for downgrading a signed one.
+    #[test]
+    fn an_unsigned_database_is_written_even_when_libgpod_would_not_sign() {
+        let w = World::new(3);
+        nudge(&w, 1);
+        let out = w.sync().unwrap();
+        assert!(out.applied > 0);
+        assert_eq!(signature(&w), (0, false));
+    }
+
+    // Prevents (audit M12) the check on the written file being lost: the
+    // pre-write check trusts the model, libgpod does not sign for it.
+    #[test]
+    fn a_signed_database_written_unsigned_fails_the_verification() {
+        let w = signed_world();
+        // libgpod knows this model (so the pre-write check passes) but writes
+        // no hash for it: an iPod Video, whose firmware checks nothing.
+        fs::write(
+            sysinfo_path(&w),
+            "ModelNumStr: MA002\nFirewireGuid: 0x000A27001234ABCD\n",
+        )
+        .unwrap();
+        nudge(&w, 2);
+        let e = w.sync().unwrap_err();
+        match &e {
+            Error::Verification { problems, .. } => assert!(
+                problems.iter().any(|p| p.contains("signed")),
+                "{problems:?}"
+            ),
+            other => panic!("expected Verification, got {other:?}"),
+        }
+        assert!(!signature(&w).1, "set up: it was written unsigned");
+    }
+
+    // ---- L1, L2: deleting what a damaged database points at
+
+    #[derive(Clone, Copy, Debug)]
+    enum Target {
+        /// The iPod's own database.
+        ItunesDb,
+        /// A file outside the iPod, reached through `..`.
+        Outside,
+        /// The file of another track that stays.
+        Shared,
+        /// Directly in the music folder, not in one of its F00 to F49.
+        MusicRoot,
+        /// Below a music subfolder.
+        TooDeep,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum How {
+        Removed,
+        Recopied,
+    }
+
+    struct Damaged {
+        w: World,
+        out: Outcome,
+        /// What the track's path named.
+        file: PathBuf,
+        /// Its bytes before the sync, for a file that must not change.
+        bytes: Vec<u8>,
+        _victim: Option<tempfile::NamedTempFile>,
+    }
+
+    /// Track 3's path is made to name `target`, then the track is removed (its
+    /// library file deleted) or recopied (new audio), and the sync run.
+    fn damaged(target: Target, how: How) -> Damaged {
+        let mut w = World::new(4);
+        let victim = tempfile::Builder::new()
+            .prefix("iprune-victim-")
+            .tempfile_in(w.root.parent().unwrap())
+            .unwrap();
+        fs::write(victim.path(), b"outside the iPod").unwrap();
+        let name = victim.path().file_name().unwrap().to_str().unwrap();
+        let (path, file) = match target {
+            Target::ItunesDb => (
+                ":iPod_Control:iTunes:iTunesDB".to_owned(),
+                itunesdb_path(&w),
+            ),
+            // Four steps up from F00 leave the iPod's folder.
+            Target::Outside => (
+                format!(":iPod_Control:Music:F00:..:..:..:..:{name}"),
+                victim.path().to_owned(),
+            ),
+            Target::Shared => (
+                ":iPod_Control:Music:F00:T0000.mp3".to_owned(),
+                w.file_of(dbid(1)),
+            ),
+            Target::MusicRoot => (
+                ":iPod_Control:Music:stray.mp3".to_owned(),
+                w.root.join("iPod_Control/Music/stray.mp3"),
+            ),
+            Target::TooDeep => (
+                ":iPod_Control:Music:F05:sub:deep.mp3".to_owned(),
+                w.root.join("iPod_Control/Music/F05/sub/deep.mp3"),
+            ),
+        };
+        if matches!(target, Target::MusicRoot | Target::TooDeep) {
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, b"in the music folder, but not a track's place").unwrap();
+        }
+        common::set_ipod_path(&itunesdb_path(&w), 2, &path);
+        assert_eq!(
+            w.track(dbid(3)).unwrap().ipod_path.as_deref(),
+            Some(path.as_str()),
+            "set up: the database holds the damaged path"
+        );
+        match how {
+            How::Removed => fs::remove_file(&w.files[2]).unwrap(),
+            How::Recopied => {
+                fs::copy(fixture_secs(Kind::Mp3, 3, 3), &w.files[2]).unwrap();
+            }
+        }
+        w.rescan();
+        let bytes = fs::read(&file).unwrap();
+        let out = w
+            .sync()
+            .unwrap_or_else(|e| panic!("{target:?} {how:?}: {e:?}"));
+        Damaged {
+            w,
+            out,
+            file,
+            bytes,
+            _victim: Some(victim),
+        }
+    }
+
+    fn assert_kept(d: &Damaged, target: Target, how: How) {
+        let ctx = format!("{target:?} {how:?}");
+        let kept: Vec<_> = d
+            .out
+            .warnings
+            .iter()
+            .filter(|m| m.contains("kept"))
+            .collect();
+        assert_eq!(kept.len(), 1, "{ctx}: {:?}", d.out.warnings);
+        assert_eq!(d.out.warnings.len(), 1, "{ctx}: {:?}", d.out.warnings);
+        let leaf = d.file.file_name().unwrap().to_str().unwrap();
+        assert!(kept[0].contains(leaf), "{ctx}: {}", kept[0]);
+        assert!(d.file.is_file(), "{ctx}: the target is gone");
+        match how {
+            How::Removed => assert_eq!((d.out.removed, d.out.recopied), (1, 0), "{ctx}"),
+            How::Recopied => assert_eq!((d.out.removed, d.out.recopied), (0, 1), "{ctx}"),
+        }
+        match target {
+            Target::ItunesDb => {
+                // What is there is the database the sync wrote and verified.
+                let c = d.w.contents();
+                let track = c.tracks.iter().find(|t| t.adopt.dbid == dbid(3));
+                match how {
+                    How::Removed => assert!(track.is_none(), "{ctx}"),
+                    How::Recopied => assert_ne!(
+                        track.expect("recopied").ipod_path.as_deref(),
+                        Some(":iPod_Control:iTunes:iTunesDB"),
+                        "{ctx}"
+                    ),
+                }
+            }
+            Target::Outside | Target::Shared | Target::MusicRoot | Target::TooDeep => {
+                assert_eq!(fs::read(&d.file).unwrap(), d.bytes, "{ctx}: modified");
+            }
+        }
+        if let Target::Shared = target {
+            let t = d.w.track(dbid(1)).expect("the other track stays");
+            assert_eq!(
+                t.ipod_path.as_deref(),
+                Some(":iPod_Control:Music:F00:T0000.mp3")
+            );
+        }
+        let p = d.w.prepare();
+        assert!(exec::full_work(&p).is_empty(), "{ctx}: {:?}", p.plan);
+    }
+
+    // Prevents (audit L2) a removed or replaced track's path, read from a
+    // damaged database, deleting the iTunesDB, a file outside the iPod or
+    // the file another track plays.
+    #[test]
+    fn a_removed_track_pointing_at_itunesdb_keeps_it() {
+        let d = damaged(Target::ItunesDb, How::Removed);
+        assert_kept(&d, Target::ItunesDb, How::Removed);
+    }
+
+    #[test]
+    fn a_recopied_track_pointing_at_itunesdb_keeps_it() {
+        let d = damaged(Target::ItunesDb, How::Recopied);
+        assert_kept(&d, Target::ItunesDb, How::Recopied);
+    }
+
+    #[test]
+    fn a_removed_track_pointing_outside_the_ipod_keeps_that_file() {
+        let d = damaged(Target::Outside, How::Removed);
+        assert_kept(&d, Target::Outside, How::Removed);
+    }
+
+    #[test]
+    fn a_recopied_track_pointing_outside_the_ipod_keeps_that_file() {
+        let d = damaged(Target::Outside, How::Recopied);
+        assert_kept(&d, Target::Outside, How::Recopied);
+    }
+
+    // The only place a track's file lives is a folder directly under Music.
+    #[test]
+    fn a_removed_track_pointing_at_the_music_folder_itself_or_below_a_subfolder_keeps_the_file() {
+        for target in [Target::MusicRoot, Target::TooDeep] {
+            let d = damaged(target, How::Removed);
+            assert_kept(&d, target, How::Removed);
+        }
+    }
+
+    // Prevents (audit L1) removing one track deleting the file of another.
+    #[test]
+    fn a_removed_track_sharing_a_file_with_a_kept_track_keeps_the_file() {
+        let d = damaged(Target::Shared, How::Removed);
+        assert_kept(&d, Target::Shared, How::Removed);
+    }
+
+    #[test]
+    fn a_recopied_track_sharing_a_file_with_a_kept_track_keeps_the_file() {
+        let d = damaged(Target::Shared, How::Recopied);
+        assert_kept(&d, Target::Shared, How::Recopied);
+    }
+
+    // The normal case, to show the check is not a blanket refusal.
+    #[test]
+    fn a_removed_tracks_own_file_in_the_music_folder_is_still_deleted() {
+        let mut w = World::new(4);
+        let file = w.file_of(dbid(3));
+        let other = w.file_of(dbid(4));
+        fs::remove_file(&w.files[2]).unwrap();
+        w.rescan();
+        let out = w.sync().unwrap();
+        assert_eq!(out.removed, 1);
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(!file.exists());
+        assert!(other.is_file());
+    }
+
+    // A symlink in the music folder is not a regular file: neither it nor
+    // what it points at (a file in the music folder no track uses) is deleted.
+    #[test]
+    fn a_symlink_in_place_of_the_tracks_file_is_kept_and_its_target_too() {
+        let mut w = World::new(4);
+        let file = w.file_of(dbid(3));
+        let target = w.root.join("iPod_Control/Music/F05/unused.mp3");
+        fs::write(&target, b"precious").unwrap();
+        fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&target, &file).unwrap();
+        fs::remove_file(&w.files[2]).unwrap();
+        w.rescan();
+        let out = w.sync().unwrap();
+        assert_eq!(out.removed, 1);
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert!(out.warnings[0].contains("kept"), "{:?}", out.warnings);
+        assert_eq!(fs::read(&target).unwrap(), b"precious");
+        assert!(file.symlink_metadata().unwrap().is_symlink());
+    }
+
+    // ---- doctor and damaged paths
+
+    #[test]
+    fn doctor_reports_paths_that_leave_the_ipod_and_proposes_no_repair_for_them() {
+        use iprune_core::doctor;
+        let w = World::new(4);
+        let db = itunesdb_path(&w);
+        let bad = [
+            (1, ":iPod_Control:Music:F00:..:..:..:..:elsewhere.mp3"),
+            (2, "iPod_Control:Music:F01:T0001.mp3"),
+            (3, ":..:outside.mp3"),
+        ];
+        for (k, path) in bad {
+            common::set_ipod_path(&db, k, path);
+        }
+        let victim = w.root.parent().unwrap().join("elsewhere.mp3");
+        let existed = victim.exists();
+        let contents = w.contents();
+        let r = doctor::examine(
+            w.env.store.conn(),
+            &w.root,
+            &contents,
+            Some(w.device()),
+            iprune_core::now_unix(),
+        )
+        .unwrap();
+        assert_eq!(
+            r.bad_paths,
+            vec![
+                (dbid(2), bad[0].1.to_owned()),
+                (dbid(3), bad[1].1.to_owned()),
+                (dbid(4), bad[2].1.to_owned()),
+            ]
+        );
+        assert!(
+            r.missing_files.is_empty(),
+            "a damaged path is not a missing file: {:?}",
+            r.missing_files
+        );
+        assert!(!r.is_clean());
+        let p = w.prepare();
+        let work = doctor::repair_work(&p, &r);
+        assert!(work.tracks.removes.is_empty(), "{:?}", work.tracks.removes);
+        assert_eq!(victim.exists(), existed);
+    }
+
+    #[test]
+    fn doctor_calls_an_empty_path_a_missing_file_not_a_damaged_one() {
+        let w = World::new(3);
+        common::set_ipod_path(&itunesdb_path(&w), 1, "");
+        let contents = w.contents();
+        let r = iprune_core::doctor::examine(
+            w.env.store.conn(),
+            &w.root,
+            &contents,
+            Some(w.device()),
+            iprune_core::now_unix(),
+        )
+        .unwrap();
+        assert!(r.bad_paths.is_empty(), "{:?}", r.bad_paths);
+        // An entry with no path at all is an entry with no file.
+        let missing: Vec<u64> = r.missing_files.iter().map(|(d, _)| *d).collect();
+        assert_eq!(missing, vec![dbid(2)]);
+    }
+
+    // ---- M6: a folder is not an iPod
+
+    fn folder_refused(cfg_for_refused: &Config) {
+        let w = World::new(3);
+        nudge(&w, 1);
+        w.write_play_counts(&[(3, 1_700_000_000, 60, 0)]);
+        let p = w.prepare();
+        let work = exec::full_work(&p);
+        assert!(!work.is_empty());
+        let before = state(&w);
+        let e = sync_with_cfg(&w, cfg_for_refused, &p, &work).unwrap_err();
+        assert!(matches!(e, Error::NotWritable(_)), "{e:?}");
+        assert_eq!(state(&w), before, "a refused sync changed something");
+        assert_eq!(w.stats_total_plays(), 0, "the plays were not pulled");
+
+        // The same plan, folders allowed, goes through.
+        let out = sync_with_cfg(&w, &w.env.cfg, &p, &work).unwrap();
+        assert!(out.applied > 0);
+    }
+
+    // Prevents (audit M6) a sync writing a copy of an iPod, or the backup.
+    #[test]
+    fn a_sync_to_a_plain_folder_is_refused_unless_folders_are_allowed() {
+        let w = World::new(3);
+        assert!(w.env.cfg.device.allow_folder, "set up: the tests allow it");
+        let mut cfg = w.env.cfg.clone();
+        cfg.device.allow_folder = false;
+        drop(w);
+        folder_refused(&cfg);
+    }
+
+    #[test]
+    fn a_restore_to_a_plain_folder_is_refused_unless_folders_are_allowed() {
+        let w = World::new(3);
+        nudge(&w, 1);
+        let stamp = w.sync().unwrap().backup.stamp;
+        nudge(&w, 2);
+        w.sync().unwrap();
+        w.write_play_counts(&[(3, 1_700_000_000, 60, 0)]);
+        let before = state(&w);
+        let mut cfg = w.env.cfg.clone();
+        cfg.device.allow_folder = false;
+        let e = exec::restore(
+            w.env.store.conn(),
+            &cfg,
+            &w.paths,
+            &w.root,
+            GUID,
+            &stamp,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(e, Error::NotWritable(_)), "{e:?}");
+        assert_eq!(state(&w), before, "a refused restore changed something");
+        assert_eq!(w.stats_total_plays(), 0);
+
+        assert_eq!(w.playlist("Mix"), Some(vec![dbid(1), dbid(3)]), "set up");
+        restore(&w, &stamp, false).unwrap();
+        assert_ne!(state(&w), before);
+        assert_eq!(w.playlist("Mix"), Some(vec![dbid(3)]), "the backup's Mix");
+    }
+    // Prevents (found by Aldo) a sync failing with NotAdopted once the iPod
+    // gains a SysInfoExtended, where libgpod gives the GUID without "0x".
+    #[test]
+    fn an_ipod_that_gains_a_sysinfoextended_after_adoption_is_still_the_same_device() {
+        let w = World::new(3);
+        // Adopted as "0x000A27001234ABCD"; now reported bare and lower case.
+        fs::write(
+            w.root.join("iPod_Control/Device/SysInfoExtended"),
+            "<plist><dict><key>FireWireGUID</key><string>000a27001234abcd</string></dict></plist>",
+        )
+        .unwrap();
+        assert_eq!(
+            w.contents().firewire_guid.as_deref(),
+            Some("000a27001234abcd")
+        );
+        nudge(&w, 1);
+        let out = w.sync().unwrap();
+        assert!(out.applied > 0);
+        assert_eq!(w.playlist("Mix"), Some(vec![dbid(3), dbid(1)]));
+        assert_eq!(
+            devices::devices(w.env.store.conn()).unwrap().len(),
+            1,
+            "no second device row"
+        );
+    }
+    // Prevents (review of step 3) a restore of iPod A's backup onto iPod B,
+    // swapped in at the same mountpoint while a prompt waited.
+    #[test]
+    fn a_restore_onto_an_ipod_with_another_guid_than_the_backups_is_refused() {
+        let w = World::new(3);
+        nudge(&w, 1);
+        let stamp = w.sync().unwrap().backup.stamp;
+        w.write_play_counts(&[(3, 1_700_000_000, 60, 0)]);
+        // iPod B: same files, another GUID.
+        fs::write(sysinfo_path(&w), "FirewireGuid: 0x000A2700BBBBBBBB\n").unwrap();
+        let before = state(&w);
+        let data = tree(&w.paths.data_dir);
+
+        let e = restore(&w, &stamp, false).unwrap_err();
+        match &e {
+            Error::GuidMismatch { ipod, given } => {
+                assert!(ipod.to_uppercase().ends_with("BBBBBBBB"), "{e}");
+                assert!(given.to_uppercase().ends_with("1234ABCD"), "{e}");
+            }
+            other => panic!("expected GuidMismatch, got {other:?}"),
+        }
+        assert_eq!(state(&w), before, "B was changed");
+        assert_eq!(tree(&w.paths.data_dir), data, "a backup was taken");
+        assert_eq!(w.stats_total_plays(), 0, "plays were pulled");
+        assert_eq!(
+            devices::restoring(w.env.store.conn(), w.device()).unwrap(),
+            None
+        );
+
+        // The right iPod back: the restore goes through.
+        fs::write(sysinfo_path(&w), SYSINFO).unwrap();
+        restore(&w, &stamp, false).unwrap();
+    }
+
+    // The same iPod spelled differently is the same iPod.
+    #[test]
+    fn a_restore_accepts_the_same_guid_in_another_spelling() {
+        let w = World::new(3);
+        nudge(&w, 1);
+        let stamp = w.sync().unwrap().backup.stamp;
+        fs::write(sysinfo_path(&w), "FirewireGuid: 000a27001234abcd\n").unwrap();
+        restore(&w, &stamp, false).unwrap();
+    }
+
+    /// Backup folders of the iPod (not the hidden store), by name.
+    fn backup_folders(w: &World) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(w.paths.data_dir.join("backups"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        v.sort();
+        v
+    }
+
+    // Prevents (review of step 3) one iPod's backups being split in two
+    // folders when its GUID is read from SysInfoExtended after SysInfo:
+    // pruning would count each half.
+    #[test]
+    fn syncs_under_two_spellings_of_the_guid_share_one_folder_and_one_prune() {
+        let mut w = World::new(3);
+        w.env.cfg.sync.keep_backups = 2;
+        let root = w.paths.data_dir.join("backups");
+        nudge(&w, 1);
+        w.sync().unwrap();
+        assert_eq!(backup_folders(&w), vec![GUID.to_owned()]);
+
+        // The GUID now comes from SysInfoExtended, bare.
+        fs::write(
+            w.root.join("iPod_Control/Device/SysInfoExtended"),
+            "<plist><dict><key>FireWireGUID</key><string>000A27001234ABCD</string></dict></plist>",
+        )
+        .unwrap();
+        nudge(&w, 2);
+        w.sync().unwrap();
+        assert_eq!(backup_folders(&w), vec![GUID.to_owned()], "a second folder");
+        assert_eq!(backup::list(&root, "000A27001234ABCD").unwrap().len(), 2);
+
+        nudge(&w, 3);
+        w.sync().unwrap();
+        assert_eq!(backup_folders(&w), vec![GUID.to_owned()]);
+        assert_eq!(
+            backup::list(&root, "000A27001234ABCD").unwrap().len(),
+            2,
+            "pruned to keep_backups across both spellings"
+        );
+    }
+
+    // The artwork store is per iPod: a backup under the other spelling must
+    // find the covers the first one stored, not copy them again elsewhere.
+    #[test]
+    fn a_backup_under_another_spelling_of_the_guid_reuses_the_first_ones_cover_store() {
+        let w = World::new(3);
+        common::add_cover_art(&w.root, SYSINFO);
+        nudge(&w, 1);
+        let first = w.sync().unwrap().backup;
+        let root = w.paths.data_dir.join("backups");
+        let store = root.join(GUID).join(".ithmb");
+        let stored = fs::read_dir(&store).unwrap().count();
+        assert!(stored > 0, "set up: the covers are stored");
+
+        let second =
+            backup::create(&root, "000A27001234ABCD", &w.root, 1_800_000_000, &[]).unwrap();
+        assert_eq!(second.dir.parent(), first.dir.parent(), "same folder");
+        assert_eq!(backup_folders(&w), vec![GUID.to_owned()]);
+        assert_eq!(
+            fs::read_dir(&store).unwrap().count(),
+            stored,
+            "copied again"
+        );
+        // The first backup was taken before libgpod rewrote the files, so
+        // only their content (hash) is compared, not their times.
+        let hashes = |b: &backup::Backup| -> Vec<(String, String)> {
+            let v: serde_json::Value =
+                serde_json::from_slice(&fs::read(b.dir.join("artwork.json")).unwrap()).unwrap();
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|i| {
+                    (
+                        i["name"].as_str().unwrap().to_owned(),
+                        i["hash"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(hashes(&second), hashes(&first), "the same covers");
     }
 }

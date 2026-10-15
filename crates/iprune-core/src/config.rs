@@ -82,6 +82,11 @@ pub struct Sync {
 pub struct Device {
     /// Empty means detect.
     pub mountpoint: PathBuf,
+    /// Let iprune write to a plain folder as if it were an iPod, for tests
+    /// and experiments on copies. Off, writes go only to the root of a
+    /// mounted FAT32 device.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_folder: bool,
 }
 
 impl Default for Library {
@@ -148,6 +153,10 @@ impl Config {
         if !self.playlists.dir.is_absolute() {
             return fail("playlists.dir must be an absolute path");
         }
+        let mp = &self.device.mountpoint;
+        if !mp.as_os_str().is_empty() && !mp.is_absolute() {
+            return fail("device.mountpoint must be an absolute path");
+        }
         Ok(())
     }
 
@@ -201,5 +210,64 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(Config::load(&path), Err(Error::Config { .. })));
+    }
+    fn load_with_device(device: &str) -> Result<Config> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!("[library]\nroots = [\"/m\"]\n[playlists]\ndir = \"/p\"\n[device]\n{device}\n"),
+        )
+        .unwrap();
+        Config::load(&path)
+    }
+
+    // Prevents (audit M6) a relative mountpoint, which would mean a
+    // different folder with every working directory, being accepted.
+    #[test]
+    fn a_relative_device_mountpoint_is_a_config_error() {
+        for bad in ["relative/ipod", "./ipod", "ipod", "../ipod"] {
+            let r = load_with_device(&format!("mountpoint = {bad:?}"));
+            match r {
+                Err(Error::Config { message, .. }) => {
+                    assert!(message.contains("device.mountpoint"), "{bad}: {message}")
+                }
+                other => panic!("{bad}: expected a config error, got {other:?}"),
+            }
+        }
+        // Absolute and empty (detect) are fine.
+        let c = load_with_device("mountpoint = \"/run/media/x/IPOD\"").unwrap();
+        assert_eq!(c.device.mountpoint, Path::new("/run/media/x/IPOD"));
+        assert!(load_with_device("mountpoint = \"\"").is_ok());
+    }
+
+    #[test]
+    fn allow_folder_is_off_by_default_read_when_set_and_never_written_when_off() {
+        assert!(!Config::default().device.allow_folder);
+        assert!(
+            !load_with_device("mountpoint = \"/x\"")
+                .unwrap()
+                .device
+                .allow_folder
+        );
+        let c = load_with_device("mountpoint = \"/x\"\nallow_folder = true").unwrap();
+        assert!(c.device.allow_folder);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut c = Config::default();
+        c.library.roots = vec!["/m".into()];
+        c.playlists.dir = "/p".into();
+        c.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("allow_folder"), "{text}");
+        c.device.allow_folder = true;
+        c.save(&path).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("allow_folder = true")
+        );
+        assert!(Config::load(&path).unwrap().device.allow_folder);
     }
 }

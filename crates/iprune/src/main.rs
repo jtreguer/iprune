@@ -458,9 +458,9 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
     if !work.tracks.copies.is_empty() && !prepared.plan.space.fits {
         bail!("the tracks to copy do not fit on the iPod; nothing was changed");
     }
-    device::check_writable(&mp)?;
+    device::check_writable(&mp, config.device.allow_folder)?;
     drop(out);
-    if !args.yes && !confirm("Apply this plan to the iPod?")? {
+    if !args.yes && !confirm(&format!("Apply this plan to the iPod at {}?", mp.display()))? {
         return Ok(Outcome::Declined);
     }
     // Ctrl+C finishes the current file, writes what was done and stops.
@@ -575,6 +575,7 @@ fn run_doctor(fix: bool, yes: bool, allow_mass_removal: bool) -> Result<Outcome>
     // would make the report wrong (its new files would look orphaned).
     let lock = iprune_core::lock::ipod(&paths)?;
     eprintln!("reading the iPod at {}", mp.display());
+    let then = sync::identity(&mp)?;
     let db = gpod::Database::open(&mp)?;
     let contents = ipod::read(&db);
     let device = match &contents.firewire_guid {
@@ -603,6 +604,12 @@ fn run_doctor(fix: bool, yes: bool, allow_mass_removal: bool) -> Result<Outcome>
     )?;
     print_list(
         &mut out,
+        "database entries with a damaged path (not repaired)",
+        &report.bad_paths,
+        |(d, p)| format!("{d:016x} {p}"),
+    )?;
+    print_list(
+        &mut out,
         "playlists holding a track more than once",
         &report.repeated,
         |(n, managed)| match managed {
@@ -626,17 +633,35 @@ fn run_doctor(fix: bool, yes: bool, allow_mass_removal: bool) -> Result<Outcome>
         writeln!(out, "nothing to repair")?;
         return Ok(Outcome::Done);
     }
+    // Damaged paths are only reported: with nothing else, there is nothing
+    // to ask about.
+    let repairable = doctor::Report {
+        bad_paths: Vec::new(),
+        ..report.clone()
+    };
+    if repairable.is_clean() {
+        writeln!(out, "nothing to repair automatically")?;
+        return Ok(Outcome::Done);
+    }
     if !fix {
         writeln!(out, "run `iprune doctor --fix` to repair")?;
         return Ok(Outcome::Done);
     }
     drop(out);
-    device::check_writable(&mp)?;
+    device::check_writable(&mp, config.device.allow_folder)?;
     doctor::check_orphans(&report, contents.tracks.len(), allow_mass_removal)?;
     doctor::check_missing(&report, contents.tracks.len(), allow_mass_removal)?;
-    if !yes && !confirm("Repair these on the iPod and in the index?")? {
+    if !yes
+        && !confirm(&format!(
+            "Repair these on the iPod at {} and in the index?",
+            mp.display()
+        ))?
+    {
         return Ok(Outcome::Declined);
     }
+    // The report is of the iPod as it was read; it may have been swapped
+    // or changed while the prompt waited.
+    sync::check_identity(&mp, &then)?;
     // Database entries first, through the sync's backup, checks and
     // verification; then the orphan files, then the index.
     if !report.missing_files.is_empty() {
@@ -742,7 +767,7 @@ fn run_restore(
         .into());
     }
     let guid = exec::backup_guid(&paths, read.as_deref().or(guid))?;
-    device::check_writable(&mp)?;
+    device::check_writable(&mp, config.device.allow_folder)?;
     let backups = paths.data_dir.join("backups");
     let what = backup::list(&backups, &guid)?
         .into_iter()
@@ -759,7 +784,15 @@ fn run_restore(
     {
         return Ok(Outcome::Declined);
     }
-    let r = exec::restore(store.conn(), &paths, &mp, &guid, stamp, discard_play_counts)?;
+    let r = exec::restore(
+        store.conn(),
+        &config,
+        &paths,
+        &mp,
+        &guid,
+        stamp,
+        discard_play_counts,
+    )?;
     println!(
         "saved what the iPod held as backup {}; statistics pulled for {} tracks ({} plays)",
         r.saved.stamp,

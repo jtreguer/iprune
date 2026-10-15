@@ -42,7 +42,10 @@ impl Sandbox {
         assert!(text.contains(empty), "{text}");
         fs::write(
             cfg,
-            text.replace(empty, &format!("mountpoint = {:?}", sb.ipod)),
+            text.replace(
+                empty,
+                &format!("mountpoint = {:?}\nallow_folder = true", sb.ipod),
+            ),
         )
         .unwrap();
         sb

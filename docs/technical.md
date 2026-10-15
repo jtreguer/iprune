@@ -173,7 +173,8 @@ remove_unmanaged = false
 keep_backups = 20
 
 [device]
-mountpoint = ""                  # empty means detect
+mountpoint = ""                  # empty means detect; absolute otherwise
+# allow_folder = true            # tests only: write to a plain folder
 ```
 
 ## 5. State and files
@@ -309,9 +310,11 @@ existing mappings.
    and exactly one new file share the hash. Anything ambiguous is an
    addition plus a missing track. The row keeps its id, its path is
    updated, and every `.m3u8` that referenced the old path is rewritten.
-5. Paths that disappeared without a match get `missing_since` set. They are
-   deleted from the index after the next successful sync has removed them from
-   the iPod, so the mapping is never orphaned.
+5. Paths that disappeared without a match get `missing_since` set. Their rows
+   are kept, with their statistics and playlist links, so a file that comes
+   back or turns out to have moved keeps its history. `doctor --fix` drops a
+   row once it has been missing for 30 days and no device maps it (section
+   12).
 6. Filetype for m4a comes from the codec (AAC or ALAC), not the extension.
 7. Paths are stored exactly as on disk, so files can always be opened; the
    library has at least one file whose name is in NFD. Lookups from playlist
@@ -346,6 +349,23 @@ existing mappings.
   since libgpod cannot write a valid Classic database without it anyway.
 - Before parsing, check the filesystem type. The supported iPod is FAT32
   (`vfat`); anything else is refused for writes, as is a read-only mount.
+- Every write (sync, `doctor --fix`, restore) needs the mountpoint to be
+  the root of a `vfat` mount of a `/dev` device in mountinfo. A folder,
+  such as a copy of the iPod or its backup, is refused even when
+  `device.mountpoint` names it; `device.allow_folder = true` lifts this
+  for tests. Reading a folder (`--plan-only`, `adopt`) still works.
+- libgpod signs the Classic's `iTunesDB` (hashing scheme 1 at 0x30, hash
+  at 0x58) only when `SysInfoExtended` gives `DBVersion` 3 or more, or,
+  without one, when it recognises the model from `SysInfo`; the GUID
+  alone is not enough. The iPod shows no music from an unsigned database,
+  so when the current one is signed and libgpod would not sign, a write is
+  refused before it starts, and after it the new header must carry the
+  same scheme and a hash, or the sync fails verification.
+- What the iPod is when read (blake3 of `iTunesDB` and `Play Counts`, the
+  GUID in its device files) is kept with the plan (`sync::Identity`), and
+  `exec::sync` refuses with nothing changed when it differs at write
+  time: an iPod swapped, played or changed by another program while a
+  prompt waited. `doctor --fix` checks it again after its prompt.
 
 ## 10. Adoption algorithm
 
@@ -605,6 +625,9 @@ Order of operations:
    then `itdb_track_remove`. The file is deleted only once a write is
    verified, so a failed write never leaves the old database pointing at a
    deleted file; a crash in between leaves an orphan for `iprune doctor`.
+   Only a regular file directly in a folder of `iPod_Control/Music` that no
+   track of the written database still uses is deleted; any other path a
+   damaged database names is kept with a warning.
    When the plan also copies, the removals are written, verified and their
    files deleted before the first copy, so the space they free (which the
    space check counts) really is free.
@@ -694,7 +717,8 @@ After `itdb_write`, close the database, parse it again from the iPod,
 produce a snapshot in the same text format as the C `snapshot` tool, and
 compare it with the snapshot of the in-memory database taken just before
 the write. A database that cannot be read back counts as a difference. The artwork link (`mhii`) is excluded, since libgpod renumbers it
-on every artwork write. Any difference is printed (up to 20 lines) and the
+on every artwork write. The header's signature is checked as in section 9.
+Any difference is printed (up to 20 lines) and the
 command exits with code 3; the backup stays in place for `iprune restore`
 and the mappings are not updated.
 
@@ -704,7 +728,11 @@ and the mappings are not updated.
 `SysInfoExtended` or `SysInfo`, not from its database, which may be the
 damaged part. With no readable GUID it refuses unless `--guid` names the
 iPod's backup folder, as `iprune backups` lists it: a backup of another
-iPod must never be written onto this one. The confirmation and `iprune
+iPod must never be written onto this one. Just before the first change,
+the GUID in the iPod's device files is read again and must still be the
+backup's (spelled with or without `0x`, in either case): the iPod may have
+been swapped while the prompt waited. Backups of one iPod share one folder
+whatever the spelling libgpod gives its GUID. The confirmation and `iprune
 backups` show each backup's iPod name and track and playlist counts, from
 its `snapshot.txt`. Under the iPod lock, in order:
 
@@ -761,6 +789,9 @@ until `doctor --fix` deletes them.
 
 - files under `iPod_Control/Music` with no database entry (delete),
 - database entries whose file is missing (remove entry),
+- database entries whose iPod path is not a plain path under the iPod
+  (`..`, empty parts): reported only, never repaired, so nothing is
+  deleted by following them,
 - regular playlists with repeated tracks not present in their source file
   (rebuild membership),
 - mappings pointing to dbids not on the iPod (drop mapping),

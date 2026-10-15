@@ -137,6 +137,14 @@ pub enum Error {
         crate::sync::bytes(*free)
     )]
     NoRoomToRestore { needed: u64, free: u64 },
+    #[error(
+        "the iPod changed since it was read (its database, its Play Counts or the iPod itself); nothing was written. Run it again to see the new plan"
+    )]
+    IpodChanged,
+    #[error(
+        "the iPod's database is signed, but libgpod would write it unsigned ({0}), and the iPod would then show no music; nothing was written"
+    )]
+    WouldNotSign(String),
     #[error("the index cannot be upgraded: {0}")]
     Migration(String),
     #[error(

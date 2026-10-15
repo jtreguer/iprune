@@ -5,7 +5,7 @@
 //! it, write it, read it back from the iPod and compare, then record the
 //! new mapping. A failure before the write leaves the iPod untouched.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -472,7 +472,21 @@ impl Writer<'_> {
         let reread = gpod::Database::open(self.mountpoint)
             .map_err(|e| failed(vec![format!("the written database cannot be read: {e}")]))?;
         let mut diffs = verify::differences(&expected, &snapshot(&reread)?, 20);
+        // The files the written database still uses, which no deletion
+        // may touch: `f01/abcd.mp3` under `iPod_Control/Music`, lower-cased.
+        let used: HashSet<String> = reread
+            .tracks()
+            .filter_map(|t| {
+                let p = t.ipod_path()?.to_lowercase();
+                Some(p.strip_prefix(":ipod_control:music:")?.replace(':', "/"))
+            })
+            .collect();
         drop(reread);
+        // A database the iPod would reject shows no music: one that was
+        // signed must still be, with the same scheme.
+        let was = device::signature(&self.backup.dir.join("iTunesDB"))?;
+        let now = device::signature(&device::itunesdb(self.mountpoint))?;
+        diffs.extend(device::signature_lost(was, now));
         if backup::artwork_left_behind(&self.backup.dir, self.mountpoint) {
             diffs.push(
                 "the cover art files were rearranged but ArtworkDB was not rewritten".to_owned(),
@@ -482,6 +496,10 @@ impl Writer<'_> {
             return Err(failed(diffs));
         }
         for f in self.doomed.drain(..) {
+            if let Err(why) = deletable(&f, self.mountpoint, &used) {
+                self.warnings.push(format!("kept {}: {why}", f.display()));
+                continue;
+            }
             if let Err(e) = std::fs::remove_file(&f)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
@@ -490,6 +508,37 @@ impl Writer<'_> {
         }
         Ok(())
     }
+}
+
+/// Whether the file of a removed or replaced track may be deleted: a
+/// regular file directly in a folder of `<mountpoint>/iPod_Control/Music`,
+/// that no track of the written database (`used`, relative to that folder
+/// and lower-cased: FAT ignores case) still points at. A damaged database can name any path, `..` and
+/// `iTunesDB` included. A file already gone is fine.
+fn deletable(
+    f: &Path,
+    mountpoint: &Path,
+    used: &HashSet<String>,
+) -> std::result::Result<(), String> {
+    let meta = match std::fs::symlink_metadata(f) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    let music = std::fs::canonicalize(mountpoint.join("iPod_Control/Music"))
+        .map_err(|e| format!("the music folder: {e}"))?;
+    let real = std::fs::canonicalize(f).map_err(|e| e.to_string())?;
+    let rel_lower = match real.strip_prefix(&music) {
+        Ok(rel) if rel.components().count() == 2 => rel.to_string_lossy().to_lowercase(),
+        _ => return Err("not in a folder of iPod_Control/Music".into()),
+    };
+    if used.contains(&rel_lower) {
+        return Err("another track of the database still uses it".into());
+    }
+    Ok(())
 }
 
 /// A dbid's mapping after a sync, from what was copied or retagged.
@@ -569,13 +618,23 @@ pub fn sync(
 ) -> Result<Outcome> {
     // Held by the caller since before it read the iPod for `prepared`.
     lock.check(paths)?;
-    device::check_writable(mountpoint)?;
+    device::check_writable(mountpoint, cfg.device.allow_folder)?;
+    // The iPod may have been swapped, played or changed by another program
+    // since it was read, while a prompt waited.
+    if let Some(then) = &prepared.identity {
+        crate::sync::check_identity(mountpoint, then)?;
+    }
     let device = devices::device_id(conn, &prepared.guid)?
         .ok_or_else(|| Error::NotAdopted(prepared.guid.clone()))?;
     check_removals(&work.playlists, prepared.playlists_map.len(), opts)?;
     check_track_removals(&work.tracks, prepared.tracks_map.len(), opts)?;
     check_missing_files(&prepared.plan, prepared.tracks_map.len(), opts)?;
     check_artwork(&db, mountpoint)?;
+    if device::signature(&device::itunesdb(mountpoint))?.0 != 0
+        && let Some(why) = device::unsigned_reason(mountpoint, prepared.ipod.model.as_deref())
+    {
+        return Err(Error::WouldNotSign(why));
+    }
     if !work.tracks.copies.is_empty() && !prepared.plan.space.fits {
         return Err(Error::NoSpace);
     }
@@ -1064,6 +1123,7 @@ fn bad_backup(stamp: &str, why: impl std::fmt::Display) -> Error {
 /// after the backup stay as orphans for `iprune doctor`.
 pub fn restore(
     conn: &Connection,
+    cfg: &Config,
     paths: &Paths,
     mountpoint: &Path,
     guid: &str,
@@ -1093,7 +1153,17 @@ pub fn restore(
             .map_err(|e| bad_backup(stamp, format!("iTunesDB: {e}")))
             .and_then(|db| snapshot(&db))?
     };
-    device::check_writable(mountpoint)?;
+    device::check_writable(mountpoint, cfg.device.allow_folder)?;
+    // The iPod mounted now must be the one the backup is of: it may have
+    // been swapped while a prompt waited.
+    if let Some(read) = device::firewire_guid(mountpoint)
+        && device::normalize_guid(&read) != device::normalize_guid(guid)
+    {
+        return Err(Error::GuidMismatch {
+            ipod: read,
+            given: guid.to_owned(),
+        });
+    }
     let device =
         devices::device_id(conn, guid)?.ok_or_else(|| Error::NotAdopted(guid.to_owned()))?;
     // Its artwork list, its stored cover art and the room it needs.

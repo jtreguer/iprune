@@ -8,6 +8,7 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::config::{self, Config};
+use crate::device;
 use crate::error::IoContext;
 use crate::ipod::{self, Contents};
 use crate::plan::{
@@ -28,6 +29,38 @@ pub struct Prepared {
     pub library: HashMap<i64, TrackRow>,
     /// Mappings taken back from tracks a crashed sync left on the iPod.
     pub recovered: usize,
+    /// What the iPod was when it was read, checked again before a write;
+    /// `None` for a database read from a file.
+    pub identity: Option<Identity>,
+}
+
+/// What an iPod is at one moment: its database and `Play Counts` files and
+/// the GUID in its device files. A write refuses an iPod that is no longer
+/// the one read, such as one swapped or played while a prompt waited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    itunesdb: [u8; 32],
+    play_counts: Option<[u8; 32]>,
+    guid: Option<String>,
+}
+
+/// The [`Identity`] of the iPod at `mountpoint` now.
+pub fn identity(mountpoint: &Path) -> Result<Identity> {
+    let db = device::itunesdb(mountpoint);
+    let bytes = std::fs::read(&db).at(&db)?;
+    Ok(Identity {
+        itunesdb: *blake3::hash(&bytes).as_bytes(),
+        play_counts: crate::stats::play_counts(mountpoint)?.live,
+        guid: device::firewire_guid(mountpoint),
+    })
+}
+
+/// Refuses when the iPod at `mountpoint` is no longer `then`.
+pub fn check_identity(mountpoint: &Path, then: &Identity) -> Result<()> {
+    if identity(mountpoint)? != *then {
+        return Err(Error::IpodChanged);
+    }
+    Ok(())
 }
 
 /// Size and free space of the filesystem holding `path`.
@@ -67,6 +100,7 @@ pub fn prepare(conn: &Connection, cfg: &Config, db: &gpod::Database) -> Result<P
         tracks_map = devices::track_mappings(conn, device)?;
     }
     let playlists_map = devices::playlist_mappings(conn, device)?;
+    let identity = db.mountpoint().map(|m| identity(&m)).transpose()?;
     let space = db.mountpoint().map(|m| space(&m)).transpose()?;
     // Entries whose file is gone, such as those a restore brought back after
     // a sync deleted their files: mapped ones in scope are copied again.
@@ -145,6 +179,7 @@ pub fn prepare(conn: &Connection, cfg: &Config, db: &gpod::Database) -> Result<P
         playlists_map,
         recovered,
         library: library.into_iter().map(|t| (t.id, t)).collect(),
+        identity,
     })
 }
 

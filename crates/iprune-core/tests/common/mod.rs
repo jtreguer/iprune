@@ -188,6 +188,8 @@ impl Env {
         let mut cfg = Config::default();
         cfg.library.roots = vec![music.clone()];
         cfg.playlists.dir = lists.clone();
+        // The fake iPods are folders in a temp dir.
+        cfg.device.allow_folder = true;
         Env {
             _dir: dir,
             music,
@@ -515,4 +517,58 @@ pub fn add_cover_art(root: &Path, sysinfo_rest: &str) {
 /// `<dbid hex> <title> <rgb hex>` or `NONE`.
 pub fn read_covers(root: &Path) -> String {
     run_art("show", root)
+}
+
+// ---- damaged databases
+
+fn u32_at(b: &[u8], at: usize) -> usize {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) as usize
+}
+
+fn add_len(b: &mut [u8], at: usize, delta: isize) {
+    let v = (u32_at(b, at) as isize + delta) as u32;
+    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Rewrites, in the iTunesDB file `db`, the iPod path of the `k`-th track in
+/// database order (`:iPod_Control:Music:..`) to `path`, resizing the
+/// containers that hold it. libgpod writes only paths it chose itself, so a
+/// damaged database (a path with `..`, one naming iTunesDB, two tracks
+/// sharing a file) has to be made by editing the bytes.
+pub fn set_ipod_path(db: &Path, k: usize, path: &str) {
+    let mut b = fs::read(db).unwrap();
+    assert_eq!(&b[0..4], b"mhbd");
+    let mut sd = u32_at(&b, 4);
+    // The track list: the mhsd of type 1.
+    while &b[sd..sd + 4] == b"mhsd" && u32_at(&b, sd + 12) != 1 {
+        sd += u32_at(&b, sd + 8);
+    }
+    assert_eq!(&b[sd..sd + 4], b"mhsd", "no track list");
+    let mhlt = sd + u32_at(&b, sd + 4);
+    assert_eq!(&b[mhlt..mhlt + 4], b"mhlt");
+    assert!(k < u32_at(&b, mhlt + 8), "no track {k}");
+    let mut hit = mhlt + u32_at(&b, mhlt + 4);
+    for _ in 0..k {
+        hit += u32_at(&b, hit + 8);
+    }
+    assert_eq!(&b[hit..hit + 4], b"mhit");
+    let mut od = hit + u32_at(&b, hit + 4);
+    for _ in 0..u32_at(&b, hit + 12) {
+        assert_eq!(&b[od..od + 4], b"mhod");
+        if u32_at(&b, od + 12) == 2 {
+            let old = u32_at(&b, od + 28);
+            let units: Vec<u8> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let delta = units.len() as isize - old as isize;
+            let start = od + 40;
+            b.splice(start..start + old, units.iter().copied());
+            b[od + 28..od + 32].copy_from_slice(&(units.len() as u32).to_le_bytes());
+            for at in [od + 8, hit + 8, sd + 8, 8] {
+                add_len(&mut b, at, delta);
+            }
+            fs::write(db, b).unwrap();
+            return;
+        }
+        od += u32_at(&b, od + 8);
+    }
+    panic!("track {k} has no location");
 }

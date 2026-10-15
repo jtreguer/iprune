@@ -1100,11 +1100,27 @@ fn an_unreadable_pending_pull_is_dropped_with_a_warning_and_the_sync_goes_on() {
 // ---- restore
 
 fn restore(w: &World, stamp: &str) -> iprune_core::Result<exec::Restored> {
-    exec::restore(w.env.store.conn(), &w.paths, &w.root, GUID, stamp, false)
+    exec::restore(
+        w.env.store.conn(),
+        &w.env.cfg,
+        &w.paths,
+        &w.root,
+        GUID,
+        stamp,
+        false,
+    )
 }
 
 fn restore_with(w: &World, stamp: &str, discard: bool) -> iprune_core::Result<exec::Restored> {
-    exec::restore(w.env.store.conn(), &w.paths, &w.root, GUID, stamp, discard)
+    exec::restore(
+        w.env.store.conn(),
+        &w.env.cfg,
+        &w.paths,
+        &w.root,
+        GUID,
+        stamp,
+        discard,
+    )
 }
 
 fn mapping_view(w: &World) -> MappingView {

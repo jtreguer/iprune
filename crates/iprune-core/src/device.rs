@@ -11,6 +11,9 @@ pub struct Mount {
     pub mountpoint: PathBuf,
     pub fstype: String,
     pub read_only: bool,
+    /// The folder of the filesystem mounted here: `/` for a whole
+    /// filesystem, another path for a bind mount of a subfolder.
+    pub root: PathBuf,
 }
 
 /// Undoes the octal escapes the kernel uses in mountinfo (`\040` for space).
@@ -42,6 +45,7 @@ fn unescape(s: &str) -> String {
 fn parse_line(line: &str) -> Option<(Mount, String)> {
     let (left, right) = line.split_once(" - ")?;
     let left: Vec<&str> = left.split(' ').collect();
+    let root = unescape(left.get(3)?);
     let mountpoint = unescape(left.get(4)?);
     let options = left.get(5)?;
     let mut right = right.split(' ');
@@ -52,6 +56,7 @@ fn parse_line(line: &str) -> Option<(Mount, String)> {
             mountpoint: PathBuf::from(mountpoint),
             fstype,
             read_only: options.split(',').any(|o| o == "ro"),
+            root: PathBuf::from(root),
         },
         source,
     ))
@@ -140,10 +145,44 @@ pub fn itunesdb(mountpoint: &Path) -> PathBuf {
 /// vfat (FAT32, the only format supported; a real iPod is always mounted at
 /// its root). A folder inside another filesystem (a copy, a test) passes
 /// the format check.
-pub fn check_writable(mountpoint: &Path) -> Result<()> {
+pub fn check_writable(mountpoint: &Path, allow_folder: bool) -> Result<()> {
     let path = Path::new("/proc/self/mountinfo");
     let text = std::fs::read_to_string(path).at(path)?;
+    if !allow_folder {
+        check_device(&text, mountpoint)?;
+    }
     check_mount(&parse_mountinfo(&text), mountpoint)
+}
+
+/// Refuses a `mountpoint` that is not the root of a mounted FAT32 device:
+/// a folder (a copy of an iPod, a backup) must never be written as if it
+/// were one. `device.allow_folder` lifts this for tests.
+fn check_device(mountinfo: &str, mountpoint: &Path) -> Result<()> {
+    let path = std::fs::canonicalize(mountpoint).unwrap_or_else(|_| mountpoint.to_owned());
+    match mountinfo
+        .lines()
+        .filter_map(parse_line)
+        .rfind(|(m, _)| m.mountpoint == path)
+    {
+        Some((m, source))
+            if m.fstype == "vfat" && source.starts_with("/dev/") && m.root == Path::new("/") =>
+        {
+            Ok(())
+        }
+        Some((m, _)) if m.root != Path::new("/") => Err(Error::NotWritable(format!(
+            "{} is a folder of a device mounted elsewhere, not the iPod itself",
+            mountpoint.display()
+        ))),
+        Some((m, source)) => Err(Error::NotWritable(format!(
+            "{} is {} from {source}, and iprune writes only to FAT32 (vfat) iPods",
+            mountpoint.display(),
+            m.fstype
+        ))),
+        None => Err(Error::NotWritable(format!(
+            "{} is a folder, not a mounted iPod; iprune writes only to the iPod itself",
+            mountpoint.display()
+        ))),
+    }
 }
 
 fn check_mount(mounts: &[Mount], mountpoint: &Path) -> Result<()> {
@@ -167,6 +206,63 @@ fn check_mount(mounts: &[Mount], mountpoint: &Path) -> Result<()> {
             m.fstype
         ))),
         _ => Ok(()),
+    }
+}
+
+/// The hashing scheme in an `iTunesDB` header (0 when unsigned, 1 for the
+/// hash the iPod Classic checks) and whether its hash is set. A file too
+/// short to hold them reads as unsigned.
+pub fn signature(itunesdb: &Path) -> Result<(u16, bool)> {
+    use std::io::Read as _;
+    let mut head = Vec::with_capacity(0x6c);
+    std::fs::File::open(itunesdb)
+        .and_then(|f| f.take(0x6c).read_to_end(&mut head))
+        .at(itunesdb)?;
+    if head.len() < 0x6c {
+        return Ok((0, false));
+    }
+    let scheme = u16::from_le_bytes([head[0x30], head[0x31]]);
+    Ok((scheme, head[0x58..0x6c].iter().any(|b| *b != 0)))
+}
+
+/// What is wrong with a database written with signature `now` over one
+/// signed as `was` (see [`signature`]): it must keep the scheme of a signed
+/// one and carry a hash.
+pub fn signature_lost(was: (u16, bool), now: (u16, bool)) -> Option<String> {
+    if was.0 == 0 || (now.0 == was.0 && now.1) {
+        return None;
+    }
+    Some(format!(
+        "the database was signed (scheme {}) and was written {}",
+        was.0,
+        match now {
+            (0, _) => "unsigned".to_owned(),
+            (s, false) if s == was.0 => "without its hash".to_owned(),
+            (s, _) => format!("with scheme {s}"),
+        }
+    ))
+}
+
+/// Why libgpod would write the iPod at `mountpoint` unsigned, if it would.
+/// It signs by `DBVersion` in `SysInfoExtended` (3 or more), or, with no
+/// such key, by the model it recognises from `SysInfo` (`model`, as
+/// [`crate::ipod::read`] gives it).
+pub fn unsigned_reason(mountpoint: &Path, model: Option<&str>) -> Option<String> {
+    let ext = mountpoint.join("iPod_Control/Device/SysInfoExtended");
+    let version = std::fs::read_to_string(ext).ok().and_then(|t| {
+        let after = &t[t.find("<key>DBVersion</key>")? + 20..];
+        let start = after.find("<integer>")? + 9;
+        let end = after[start..].find("</integer>")? + start;
+        after[start..end].trim().parse::<u32>().ok()
+    });
+    match (version, model) {
+        (Some(v), _) if v >= 3 => None,
+        (Some(v), _) => Some(format!("SysInfoExtended gives DBVersion {v}")),
+        (None, Some(_)) => None,
+        (None, None) => Some(
+            "it has no SysInfoExtended with a DBVersion and libgpod does not recognise its model"
+                .into(),
+        ),
     }
 }
 
@@ -518,6 +614,7 @@ garbage line
             mountpoint: PathBuf::from(path),
             fstype: fstype.into(),
             read_only,
+            root: PathBuf::from("/"),
         }
     }
 
@@ -608,5 +705,248 @@ garbage line
         assert!(check_mount(&ro_then_rw, Path::new(p)).is_ok());
         let rw_then_ro = [mount(p, "vfat", false), mount(p, "vfat", true)];
         assert!(check_mount(&rw_then_ro, Path::new(p)).is_err());
+    }
+    // ---- check_device (audit M6): only the root of a vfat /dev mount
+
+    const IPOD_ROOT: &str = "/run/media/julien/IPOD";
+
+    fn device_info() -> String {
+        format!(
+            "\
+22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw
+95 22 8:33 / {IPOD_ROOT} rw,nosuid shared:50 - vfat /dev/sdc1 rw
+96 22 8:34 / /mnt/ext rw - ext4 /dev/sdd1 rw
+97 22 0:50 / /mnt/ram rw - tmpfs tmpfs rw
+98 22 0:51 / /mnt/fuse rw - vfat /devices-are-not-dev rw
+"
+        )
+    }
+
+    fn refused(path: &str) -> String {
+        match check_device(&device_info(), Path::new(path)) {
+            Err(Error::NotWritable(m)) => m,
+            other => panic!("{path}: expected NotWritable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_device_accepts_the_root_of_a_vfat_device_mount() {
+        check_device(&device_info(), Path::new(IPOD_ROOT)).unwrap();
+    }
+
+    #[test]
+    fn check_device_refuses_a_folder_inside_the_mount_and_the_folder_above() {
+        assert!(
+            refused("/run/media/julien/IPOD/iPod_Control").contains("not a mounted iPod"),
+            "inside the mount"
+        );
+        refused("/run/media/julien");
+        // A sibling sharing only a name prefix is not the mount either.
+        refused("/run/media/julien/IPOD2");
+    }
+
+    #[test]
+    fn check_device_refuses_a_mount_that_is_not_vfat_or_not_a_dev_node() {
+        assert!(refused("/mnt/ext").contains("ext4"));
+        assert!(refused("/mnt/ram").contains("tmpfs"));
+        // vfat, but the source is not a node under /dev/ (a loop file
+        // through fuse, a bind of something else).
+        refused("/mnt/fuse");
+    }
+
+    #[test]
+    fn check_device_takes_the_last_entry_for_the_mountpoint() {
+        let over = format!(
+            "{}99 22 0:60 / {IPOD_ROOT} rw - tmpfs tmpfs rw\n",
+            device_info()
+        );
+        assert!(check_device(&over, Path::new(IPOD_ROOT)).is_err());
+        let back = format!("{over}100 22 8:35 / {IPOD_ROOT} rw - vfat /dev/sde1 rw\n");
+        check_device(&back, Path::new(IPOD_ROOT)).unwrap();
+    }
+
+    #[test]
+    fn check_device_refuses_everything_without_mounts() {
+        assert!(check_device("", Path::new(IPOD_ROOT)).is_err());
+    }
+
+    #[test]
+    fn check_writable_refuses_a_plain_folder_unless_folders_are_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        match check_writable(dir.path(), false) {
+            Err(Error::NotWritable(_)) => {}
+            other => panic!("expected NotWritable, got {other:?}"),
+        }
+        check_writable(dir.path(), true).unwrap();
+    }
+
+    // ---- signature (audit M12)
+
+    /// An iTunesDB header of `len` bytes: `scheme` at 0x30, `hash` at 0x58.
+    fn header(len: usize, scheme: u16, hash: &[(usize, u8)]) -> tempfile::NamedTempFile {
+        let mut b = vec![0u8; len];
+        if len >= 4 {
+            b[..4].copy_from_slice(b"mhbd");
+        }
+        if len > 0x32 {
+            b[0x30..0x32].copy_from_slice(&scheme.to_le_bytes());
+        }
+        for (at, v) in hash {
+            b[*at] = *v;
+        }
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), b).unwrap();
+        f
+    }
+
+    #[test]
+    fn signature_of_a_file_too_short_for_the_hash_is_unsigned() {
+        // Everything set, but one byte short of the end of the hash field.
+        let f = header(0x6b, 1, &[(0x58, 9), (0x6a, 9)]);
+        assert_eq!(signature(f.path()).unwrap(), (0, false));
+        let f = header(0, 0, &[]);
+        assert_eq!(signature(f.path()).unwrap(), (0, false));
+    }
+
+    #[test]
+    fn signature_reads_the_scheme_little_endian_and_whether_the_hash_is_set() {
+        let f = header(0x6c, 1, &[]);
+        assert_eq!(signature(f.path()).unwrap(), (1, false), "scheme, no hash");
+        let f = header(0x6c, 1, &[(0x58, 1)]);
+        assert_eq!(signature(f.path()).unwrap(), (1, true), "first hash byte");
+        let f = header(0x6c, 1, &[(0x6b, 1)]);
+        assert_eq!(signature(f.path()).unwrap(), (1, true), "last hash byte");
+        let f = header(0x6c, 0x0102, &[(0x60, 7)]);
+        assert_eq!(signature(f.path()).unwrap(), (0x0102, true));
+        let f = header(0x6c, 0, &[(0x60, 7)]);
+        assert_eq!(
+            signature(f.path()).unwrap(),
+            (0, true),
+            "hash but no scheme"
+        );
+    }
+
+    #[test]
+    fn signature_ignores_bytes_next_to_the_hash_field() {
+        // 0x57 is before the field and 0x6c after it.
+        let f = header(0x80, 1, &[(0x57, 5), (0x6c, 5), (0x7f, 5)]);
+        assert_eq!(signature(f.path()).unwrap(), (1, false));
+    }
+
+    #[test]
+    fn signature_of_a_missing_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(signature(&dir.path().join("iTunesDB")).is_err());
+    }
+
+    // ---- unsigned_reason (audit M12)
+
+    fn ipod_with_ext(ext: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("iPod_Control/Device");
+        std::fs::create_dir_all(&device).unwrap();
+        if let Some(text) = ext {
+            std::fs::write(device.join("SysInfoExtended"), text).unwrap();
+        }
+        dir
+    }
+
+    fn plist(body: &str) -> String {
+        format!("<plist><dict>{body}</dict></plist>")
+    }
+
+    fn db_version(v: &str) -> String {
+        plist(&format!(
+            "<key>FireWireGUID</key><string>000A27001234ABCD</string>\n<key>DBVersion</key>\n<integer>{v}</integer>"
+        ))
+    }
+
+    #[test]
+    fn unsigned_reason_follows_the_db_version_when_there_is_one() {
+        for (v, signs) in [
+            ("2", false),
+            ("0", false),
+            ("3", true),
+            ("4", true),
+            (" 3 ", true),
+        ] {
+            let dir = ipod_with_ext(Some(&db_version(v)));
+            // The model does not matter once the version is known.
+            for model in [None, Some("MC297")] {
+                let r = unsigned_reason(dir.path(), model);
+                assert_eq!(
+                    r.is_none(),
+                    signs,
+                    "DBVersion {v:?}, model {model:?}: {r:?}"
+                );
+            }
+        }
+        let dir = ipod_with_ext(Some(&db_version("2")));
+        let why = unsigned_reason(dir.path(), Some("MC297")).unwrap();
+        assert!(why.contains("DBVersion 2"), "{why}");
+    }
+
+    #[test]
+    fn unsigned_reason_without_a_version_depends_on_the_model_libgpod_knows() {
+        // No SysInfoExtended at all.
+        let dir = ipod_with_ext(None);
+        assert_eq!(unsigned_reason(dir.path(), Some("MC297")), None);
+        assert!(unsigned_reason(dir.path(), None).is_some());
+        // One with other keys, or an unreadable version, is no version.
+        for text in [
+            plist("<key>FireWireGUID</key><string>x</string>"),
+            plist("<key>DBVersion</key><integer>three</integer>"),
+            plist("<key>DBVersion</key>"),
+            String::new(),
+        ] {
+            let dir = ipod_with_ext(Some(&text));
+            assert_eq!(unsigned_reason(dir.path(), Some("MC297")), None, "{text}");
+            assert!(unsigned_reason(dir.path(), None).is_some(), "{text}");
+        }
+    }
+    // ---- bind mounts (check_device) and signature_lost
+
+    #[test]
+    fn check_device_accepts_the_line_a_real_ipod_gives_and_refuses_a_bind_mount() {
+        let real = "95 22 8:33 / /run/media/julien/IPOD\\040DE\\040JUL rw,nosuid,nodev shared:50 - vfat /dev/sdc1 rw,uid=1000\n";
+        check_device(real, Path::new("/run/media/julien/IPOD DE JUL")).unwrap();
+        // A subfolder of the device mounted elsewhere: same fstype and source.
+        let bind = "96 22 8:33 /iPod_Copy /mnt/copy rw - vfat /dev/sdc1 rw\n";
+        match check_device(bind, Path::new("/mnt/copy")) {
+            Err(Error::NotWritable(m)) => assert!(m.contains("folder"), "{m}"),
+            other => panic!("expected NotWritable, got {other:?}"),
+        }
+        // The bind mount mounted last hides the real root at the same place.
+        let both = format!(
+            "{real}97 22 8:33 /sub /run/media/julien/IPOD\\040DE\\040JUL rw - vfat /dev/sdc1 rw\n"
+        );
+        assert!(check_device(&both, Path::new("/run/media/julien/IPOD DE JUL")).is_err());
+    }
+
+    #[test]
+    fn signature_lost_has_a_verdict_for_every_pair() {
+        type Sig = (u16, bool);
+        let cases: [(Sig, Sig, Option<&str>); 9] = [
+            ((0, false), (0, false), None),
+            ((0, false), (1, true), None),
+            ((0, true), (0, false), None),
+            ((1, true), (1, true), None),
+            ((1, true), (0, false), Some("unsigned")),
+            ((1, true), (0, true), Some("unsigned")),
+            ((1, true), (1, false), Some("without its hash")),
+            ((1, true), (2, true), Some("with scheme 2")),
+            ((1, false), (2, false), Some("with scheme 2")),
+        ];
+        for (was, now, want) in cases {
+            let got = signature_lost(was, now);
+            match want {
+                None => assert_eq!(got, None, "{was:?} -> {now:?}"),
+                Some(frag) => {
+                    let m = got.unwrap_or_else(|| panic!("{was:?} -> {now:?}: no verdict"));
+                    assert!(m.ends_with(frag), "{was:?} -> {now:?}: {m}");
+                    assert!(m.contains(&format!("scheme {}", was.0)), "{m}");
+                }
+            }
+        }
     }
 }
