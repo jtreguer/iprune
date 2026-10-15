@@ -353,15 +353,15 @@ impl Ui {
         buttons.append(&cancel);
         buttons.append(&save);
         page.append(&buttons);
-        {
-            let dialog = dialog.clone();
-            cancel.connect_clicked(move |_| dialog.close());
-        }
+        crate::closes(&cancel, dialog);
         {
             let ui = Rc::downgrade(self);
-            let (dialog, stack) = (dialog.clone(), stack.clone());
+            let (dialog, stack) = (dialog.downgrade(), stack.clone());
             save.connect_clicked(move |_| {
-                let (Some(ui), Some(review)) = (ui.upgrade(), review.borrow_mut().take()) else {
+                let (Some(ui), Some(dialog)) = (ui.upgrade(), dialog.upgrade()) else {
+                    return;
+                };
+                let Some(review) = review.borrow_mut().take() else {
                     return;
                 };
                 ui.save_adoption(

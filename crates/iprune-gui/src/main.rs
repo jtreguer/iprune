@@ -4,6 +4,8 @@
 
 mod adopt_dialog;
 mod adopt_job;
+#[cfg(test)]
+mod close_tests;
 mod data;
 mod sync_job;
 mod view_model;
@@ -382,19 +384,18 @@ fn ask_name(
     dialog.set_default_widget(Some(&ok));
     let done = Rc::new(done);
     {
-        let (dialog, entry, done) = (dialog.clone(), entry.clone(), done.clone());
+        let (dialog, entry, done) = (dialog.downgrade(), entry.clone(), done.clone());
         ok.connect_clicked(move |_| {
             let name = entry.text().trim().to_owned();
             if !name.is_empty() {
-                dialog.close();
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
                 done(name);
             }
         });
     }
-    {
-        let dialog = dialog.clone();
-        cancel.connect_clicked(move |_| dialog.close());
-    }
+    closes(&cancel, &dialog);
     dialog.present();
     entry.grab_focus();
 }
@@ -1132,16 +1133,13 @@ impl Ui {
         buttons.append(&cancel);
         buttons.append(&apply);
         page.append(&buttons);
-        {
-            let dialog = dialog.clone();
-            cancel.connect_clicked(move |_| dialog.close());
-        }
+        closes(&cancel, dialog);
         {
             let ui = Rc::downgrade(self);
-            let (dialog, stack, allow) = (dialog.clone(), stack.clone(), allow.clone());
+            let (dialog, stack, allow) = (dialog.downgrade(), stack.clone(), allow.clone());
             let work = planned.work.clone();
             apply.connect_clicked(move |_| {
-                if let Some(ui) = ui.upgrade() {
+                if let (Some(ui), Some(dialog)) = (ui.upgrade(), dialog.upgrade()) {
                     ui.apply_sync(&dialog, &stack, work.clone(), allow.is_active());
                 }
             });
@@ -1482,10 +1480,7 @@ fn result_page(dialog: &gtk::Window, stack: &gtk::Stack, title: &str, text: &str
     body.set_vexpand(true);
     let close = gtk::Button::with_label("Close");
     close.set_halign(gtk::Align::End);
-    {
-        let dialog = dialog.clone();
-        close.connect_clicked(move |_| dialog.close());
-    }
+    closes(&close, dialog);
     page.append(&heading);
     page.append(&body);
     page.append(&close);
@@ -1612,6 +1607,18 @@ fn shortcut(controller: &gtk::ShortcutController, trigger: &str, action: &str) {
         gtk::ShortcutTrigger::parse_string(trigger),
         Some(gtk::NamedAction::new(action)),
     ));
+}
+
+/// `button` closes `dialog`. Through a weak reference: a button inside the
+/// dialog holding it would keep it alive, and its `destroy` handlers, which
+/// end a sync or an adoption, would never run.
+fn closes(button: &gtk::Button, dialog: &gtk::Window) {
+    let dialog = dialog.downgrade();
+    button.connect_clicked(move |_| {
+        if let Some(dialog) = dialog.upgrade() {
+            dialog.close();
+        }
+    });
 }
 
 /// A right-click menu over `widget`, built from `menu`.
