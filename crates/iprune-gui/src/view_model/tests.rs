@@ -138,6 +138,78 @@ fn matches_a_the_that_is_not_first_in_the_query() {
     assert!(r.matches(&Query::new("floyd the wall")));
 }
 
+// ------------------------------------------------------- matches_name
+
+#[test]
+fn matches_name_table() {
+    let cases: Vec<(&str, &str, &str, bool)> = vec![
+        ("empty query keeps all", "", "+Electro-cool", true),
+        (
+            "whitespace-only query keeps all",
+            "  \t ",
+            "+Electro-cool",
+            true,
+        ),
+        (
+            "punctuation-only query keeps all",
+            " -+ ",
+            "Années 90",
+            true,
+        ),
+        ("empty query, empty name", "", "", true),
+        ("non-empty query, empty name", "x", "", false),
+        ("case", "ELECTRO", "+Electro-cool", true),
+        ("case in name", "electro", "+ELECTRO-COOL", true),
+        ("accent in name, plain query", "annees", "Années 90", true),
+        ("accent in query, plain name", "années", "Annees", true),
+        ("accent on both sides", "ANNÉES", "années 90", true),
+        (
+            "leading plus and digit",
+            "udm 1",
+            "+UDM 1 - Infinitif",
+            true,
+        ),
+        ("leading minus", "abigmix", "-ABigMix", true),
+        ("query keeps the sign", "-abigmix", "-ABigMix", true),
+        ("any order", "cool electro", "+Electro-cool", true),
+        (
+            "all words must match",
+            "electro techno",
+            "+Electro-cool",
+            false,
+        ),
+        (
+            "both words present",
+            "electro techno",
+            "+Electro-cool + Techno",
+            true,
+        ),
+        ("partial word", "vital", "+Electro-Vitalic", true),
+        ("word absent", "jazz", "+Electro-cool", false),
+        ("the kept in name", "the wall", "The Wall", true),
+        (
+            "the inside the query",
+            "floyd the wall",
+            "Floyd - The Wall",
+            true,
+        ),
+        ("the alone", "the", "The Wall", true),
+        ("the not in name", "wall the", "Wall Street", false),
+        ("NFD name, NFC query", "années", "Anne\u{301}es 90", true),
+        ("NFC name, NFD query", "anne\u{301}es", "Années 90", true),
+        ("NFD name, plain query", "annees", "Anne\u{301}es 90", true),
+        ("digits only", "90", "Années 90", true),
+        ("different number", "91", "Années 90", false),
+    ];
+    for (what, query, name, want) in cases {
+        assert_eq!(
+            Query::new(query).matches_name(name),
+            want,
+            "{what}: query {query:?} on {name:?}"
+        );
+    }
+}
+
 // ------------------------------------------------------------------ rows
 
 #[test]

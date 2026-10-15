@@ -81,6 +81,14 @@ impl Query {
                 .collect(),
         }
     }
+
+    /// Whether a playlist named `name` is kept by this filter: every word
+    /// is in the name, folded like a track search (case, accents and
+    /// punctuation ignored). An empty filter keeps every playlist.
+    pub fn matches_name(&self, name: &str) -> bool {
+        let folded = fold_keeping_the(name);
+        self.words.iter().all(|w| folded.contains(w.as_str()))
+    }
 }
 
 fn kind_name(k: FileKind) -> &'static str {

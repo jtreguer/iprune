@@ -199,8 +199,10 @@ theme Omarchy sets.
   sidebar to append them, or into a playlist's grid to insert them where they
   are dropped. Dragging inside a playlist sorted by `#` reorders it. Delete
   removes the selected rows from the playlist (never a file from the library).
-  A context menu offers Add to playlist, Remove from playlist and Show in
-  folder. Playlists are created, renamed and deleted from the sidebar. Each
+  A context menu offers Add to playlist (a list of the playlists with a
+  filter field), Remove from playlist and Show in folder. Playlists are
+  created, renamed and deleted from the sidebar, and a filter field above
+  it narrows the playlists shown as you type. Each
   change is written to the `.m3u8` file at once. Sorting a playlist by
   another column changes only the view, never the file.
 - **Syncing.** The Sync button scans, reads the iPod and opens the plan in a

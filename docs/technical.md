@@ -975,7 +975,16 @@ libadwaita's widgets.
   and order are saved per view in `~/.local/state/iprune/ui.toml`.
 - **Sidebar.** A `gtk::ListBox` (about 340 rows) with headers for Library
   and Playlists, and the iPod's state below it. Playlists are drop targets
-  for tracks.
+  for tracks. A filter field above it hides, as you type, the playlists
+  whose name does not hold every word typed (case, accents and punctuation
+  ignored, `Query::matches_name`), except the playlist on screen; Enter
+  shows the first one kept, Escape empties the field.
+- **Add to Playlist.** The grid's menu item opens a popover of its own, not
+  a submenu (a GTK submenu is drawn at the height of the menu it replaces,
+  three rows here): a filter field over a list of every playlist but the
+  one shown, up to 480 pixels high. Typing filters it the same way, the
+  first playlist kept is selected, and Enter or a click adds the selected
+  tracks to it; Down moves into the list.
 - **Drag and drop.** Rows carry library track ids (`gdk::ContentProvider`
   with an application-specific type). A drop on a sidebar playlist calls
   `playlists::add`; a drop inside a playlist grid calls `add` with the drop

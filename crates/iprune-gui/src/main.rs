@@ -97,8 +97,16 @@ struct Ui {
     sync_action: RefCell<Option<gio::SimpleAction>>,
     adopt_action: RefCell<Option<gio::SimpleAction>>,
     eject_action: RefCell<Option<gio::SimpleAction>>,
-    /// The grid menu's Add to Playlist submenu, filled when it opens.
-    add_menu: gio::Menu,
+    /// The sidebar's playlist filter.
+    side_query: RefCell<view_model::Query>,
+    /// The Add to Playlist picker: a filter over a list of the playlists,
+    /// filled when it opens, at the point the grid menu was opened.
+    picker: gtk::Popover,
+    picker_search: gtk::SearchEntry,
+    picker_list: gtk::ListBox,
+    picker_names: RefCell<Vec<String>>,
+    picker_query: RefCell<view_model::Query>,
+    menu_point: Cell<(i32, i32)>,
     /// True while a sync writes to the iPod: the window cannot close.
     writing: Cell<bool>,
     /// The running sync's Stop flag, which a SIGTERM, SIGHUP or SIGINT sets.
@@ -638,24 +646,10 @@ impl Ui {
         for a in self.playlist_actions.borrow().iter() {
             a.set_enabled(current.is_some());
         }
-        // Every playlist but the one shown.
-        self.add_menu.remove_all();
-        for name in self.data.playlist_names().unwrap_or_default() {
-            if Some(&name) == current.as_ref() {
-                continue;
-            }
-            let item = gio::MenuItem::new(Some(&name), None);
-            item.set_action_and_target_value(Some("win.add-to"), Some(&name.to_variant()));
-            self.add_menu.append_item(&item);
-        }
-        if self.add_menu.n_items() == 0 {
-            // No such action: shown greyed out.
-            self.add_menu
-                .append(Some("No other playlist"), Some("win.no-playlist"));
-        }
         let at = cell
             .compute_point(&self.view, &gtk::graphene::Point::new(x as f32, y as f32))
             .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
+        self.menu_point.set((at.x() as i32, at.y() as i32));
         self.row_menu.set_pointing_to(Some(&gdk::Rectangle::new(
             at.x() as i32,
             at.y() as i32,
@@ -663,6 +657,60 @@ impl Ui {
             1,
         )));
         self.row_menu.popup();
+    }
+
+    /// Opens the Add to Playlist picker where the grid menu was: every
+    /// playlist but the one shown, the filter empty and focused.
+    fn open_picker(&self) {
+        let current = self.playlist_name();
+        while let Some(row) = self.picker_list.row_at_index(0) {
+            self.picker_list.remove(&row);
+        }
+        let names: Vec<String> = self
+            .data
+            .playlist_names()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| Some(n) != current.as_ref())
+            .collect();
+        for name in &names {
+            self.picker_list.append(&sidebar_item(name));
+        }
+        *self.picker_names.borrow_mut() = names;
+        self.picker_search.set_text("");
+        *self.picker_query.borrow_mut() = view_model::Query::default();
+        self.picker_list.invalidate_filter();
+        self.select_first_pick();
+        let (x, y) = self.menu_point.get();
+        self.picker
+            .set_pointing_to(Some(&gdk::Rectangle::new(x, y, 1, 1)));
+        self.picker.popup();
+        self.picker_search.grab_focus();
+    }
+
+    /// The first playlist the picker's filter keeps, selected so Enter
+    /// adds to it.
+    fn select_first_pick(&self) -> Option<gtk::ListBoxRow> {
+        let query = self.picker_query.borrow();
+        let names = self.picker_names.borrow();
+        let first = (0..names.len())
+            .find(|&i| query.matches_name(&names[i]))
+            .and_then(|i| self.picker_list.row_at_index(i as i32));
+        self.picker_list.select_row(first.as_ref());
+        first
+    }
+
+    /// Adds the selected tracks to the picker's playlist at `row`.
+    fn pick(&self, row: &gtk::ListBoxRow) {
+        let name = self
+            .picker_names
+            .borrow()
+            .get(row.index() as usize)
+            .cloned();
+        if let Some(name) = name {
+            self.picker.popdown();
+            self.add_selected_to(&name);
+        }
     }
 
     fn show_in_folder(&self) {
@@ -1269,6 +1317,8 @@ impl Ui {
             .position(|s| s.as_ref() == Some(&current))
             .unwrap_or(1);
         *self.sources.borrow_mut() = sources;
+        // The filter ran on each row as it was added, against the old list.
+        self.sidebar.invalidate_filter();
         // Selecting shows it; a reload of the same source is fine.
         if let Some(row) = self.sidebar.row_at_index(index as i32) {
             self.sidebar.select_row(Some(&row));
@@ -1614,8 +1664,7 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     view.set_model(Some(&selection));
     // Opened by each cell's right-click, see `make_column`.
     let grid_menu = gio::Menu::new();
-    let add_menu = gio::Menu::new();
-    grid_menu.append_submenu(Some("Add to Playlist"), &add_menu);
+    grid_menu.append(Some("Add to Playlist…"), Some("win.add-to-playlist"));
     grid_menu.append(Some("Remove from Playlist"), Some("win.remove"));
     grid_menu.append(Some("Show in Folder"), Some("win.show-in-folder"));
     let row_menu = gtk::PopoverMenu::from_model(Some(&grid_menu));
@@ -1624,6 +1673,40 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     {
         let row_menu = row_menu.clone();
         view.connect_destroy(move |_| row_menu.unparent());
+    }
+    // The Add to Playlist picker. A submenu would be as short as the menu
+    // it slides over: a list as high as the screen allows, with a filter.
+    let picker_search = gtk::SearchEntry::new();
+    picker_search.set_placeholder_text(Some("Filter playlists"));
+    let picker_list = gtk::ListBox::new();
+    picker_list.add_css_class("navigation-sidebar");
+    picker_list.set_activate_on_single_click(true);
+    picker_list.set_placeholder(Some(&{
+        let none = gtk::Label::new(Some("No playlist"));
+        none.add_css_class("dim-label");
+        none.set_margin_top(12);
+        none.set_margin_bottom(12);
+        none
+    }));
+    // Typing in the list goes on in the filter.
+    picker_search.set_key_capture_widget(Some(&picker_list));
+    let picker_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .max_content_height(480)
+        .min_content_width(280)
+        .child(&picker_list)
+        .build();
+    let picker_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    picker_box.append(&picker_search);
+    picker_box.append(&picker_scroll);
+    let picker = gtk::Popover::new();
+    picker.set_child(Some(&picker_box));
+    picker.set_parent(&view);
+    picker.set_has_arrow(false);
+    {
+        let picker = picker.clone();
+        view.connect_destroy(move |_| picker.unparent());
     }
 
     // Header: columns menu, title and search.
@@ -1689,7 +1772,14 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     sync_button.set_action_name(Some("win.sync"));
     header.pack_start(&sync_button);
 
+    let side_search = gtk::SearchEntry::new();
+    side_search.set_placeholder_text(Some("Filter playlists"));
+    side_search.set_margin_start(8);
+    side_search.set_margin_end(8);
+    side_search.set_margin_top(8);
+    side_search.set_margin_bottom(4);
     let side = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    side.append(&side_search);
     let side_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
@@ -1745,7 +1835,13 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         sync_action: RefCell::new(None),
         adopt_action: RefCell::new(None),
         eject_action: RefCell::new(None),
-        add_menu,
+        side_query: RefCell::new(view_model::Query::default()),
+        picker,
+        picker_search: picker_search.clone(),
+        picker_list: picker_list.clone(),
+        picker_names: RefCell::new(Vec::new()),
+        picker_query: RefCell::new(view_model::Query::default()),
+        menu_point: Cell::new((0, 0)),
         writing: Cell::new(false),
         cancel: RefCell::new(None),
         busy: Cell::new(false),
@@ -1787,15 +1883,79 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     *ui.adopt_action.borrow_mut() = Some(adopt);
     let eject = action(window, "eject", &ui, |ui| ui.eject());
     *ui.eject_action.borrow_mut() = Some(eject);
-    {
-        let add_to = gio::SimpleAction::new("add-to", Some(glib::VariantTy::STRING));
-        let weak = Rc::downgrade(&ui);
-        add_to.connect_activate(move |_, target| {
-            if let (Some(ui), Some(name)) = (weak.upgrade(), target.and_then(|t| t.str())) {
-                ui.add_selected_to(name);
+    // Opened once the grid menu has closed, where it was.
+    action(window, "add-to-playlist", &ui, |ui| {
+        let weak = Rc::downgrade(ui);
+        glib::idle_add_local_once(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.open_picker();
             }
         });
-        window.add_action(&add_to);
+    });
+    {
+        let weak = Rc::downgrade(&ui);
+        picker_list.set_filter_func(move |row| {
+            let Some(ui) = weak.upgrade() else {
+                return true;
+            };
+            let names = ui.picker_names.borrow();
+            names
+                .get(row.index() as usize)
+                .is_none_or(|n| ui.picker_query.borrow().matches_name(n))
+        });
+    }
+    {
+        let weak = Rc::downgrade(&ui);
+        picker_search.connect_search_changed(move |s| {
+            let Some(ui) = weak.upgrade() else { return };
+            *ui.picker_query.borrow_mut() = view_model::Query::new(&s.text());
+            ui.picker_list.invalidate_filter();
+            ui.select_first_pick();
+        });
+    }
+    {
+        // Enter adds to the first playlist shown.
+        let weak = Rc::downgrade(&ui);
+        picker_search.connect_activate(move |_| {
+            let Some(ui) = weak.upgrade() else { return };
+            if let Some(row) = ui.picker_list.selected_row() {
+                ui.pick(&row);
+            }
+        });
+    }
+    {
+        let weak = Rc::downgrade(&ui);
+        picker_search.connect_stop_search(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.picker.popdown();
+            }
+        });
+    }
+    {
+        // Down goes from the filter into the list.
+        let weak = Rc::downgrade(&ui);
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            let Some(ui) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            if key == gdk::Key::Down
+                && let Some(row) = ui.picker_list.selected_row()
+            {
+                row.grab_focus();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        picker_search.add_controller(keys);
+    }
+    {
+        let weak = Rc::downgrade(&ui);
+        picker_list.connect_row_activated(move |_, row| {
+            if let Some(ui) = weak.upgrade() {
+                ui.pick(row);
+            }
+        });
     }
     ui.refresh_device();
     // An iPod plugged in or out updates the panel and the Sync button.
@@ -1891,6 +2051,53 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
             }
         });
     }
+    // The sidebar's filter hides the playlists it does not keep; the
+    // headers, Music and the playlist on screen (one just created or
+    // renamed, say) stay.
+    {
+        let weak = Rc::downgrade(&ui);
+        sidebar.set_filter_func(move |row| {
+            let Some(ui) = weak.upgrade() else {
+                return true;
+            };
+            match ui.sources.borrow().get(row.index() as usize) {
+                Some(Some(Source::Playlist(name))) => {
+                    let shown = ui
+                        .current
+                        .try_borrow()
+                        .is_ok_and(|c| matches!(&*c, Source::Playlist(n) if n == name));
+                    shown || ui.side_query.borrow().matches_name(name)
+                }
+                _ => true,
+            }
+        });
+    }
+    {
+        let weak = Rc::downgrade(&ui);
+        side_search.connect_search_changed(move |s| {
+            let Some(ui) = weak.upgrade() else { return };
+            *ui.side_query.borrow_mut() = view_model::Query::new(&s.text());
+            ui.sidebar.invalidate_filter();
+        });
+    }
+    {
+        // Enter shows the first playlist kept.
+        let weak = Rc::downgrade(&ui);
+        side_search.connect_activate(move |_| {
+            let Some(ui) = weak.upgrade() else { return };
+            let query = ui.side_query.borrow().clone();
+            let first = ui
+                .sources
+                .borrow()
+                .iter()
+                .position(|s| matches!(s, Some(Source::Playlist(n)) if query.matches_name(n)));
+            if let Some(row) = first.and_then(|i| ui.sidebar.row_at_index(i as i32)) {
+                ui.sidebar.select_row(Some(&row));
+            }
+        });
+    }
+    // Escape empties it.
+    side_search.connect_stop_search(|s| s.set_text(""));
     {
         let weak = Rc::downgrade(&ui);
         search.connect_search_changed(move |s| {
