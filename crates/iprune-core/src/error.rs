@@ -127,6 +127,16 @@ pub enum Error {
         stamp: String,
         saved: String,
     },
+    #[error(
+        "the iPod's artwork database cannot be read ({files} cover art files, {lost} tracks whose cover is no longer found): a write would delete the cover art. Nothing was written; `iprune backups` and `iprune restore` can put back an earlier ArtworkDB"
+    )]
+    ArtworkUnreadable { files: usize, lost: usize },
+    #[error(
+        "restoring needs {} free on the iPod for its temporary copies and it has {}; nothing was changed",
+        crate::sync::bytes(*needed),
+        crate::sync::bytes(*free)
+    )]
+    NoRoomToRestore { needed: u64, free: u64 },
     #[error("the index cannot be upgraded: {0}")]
     Migration(String),
     #[error(

@@ -182,7 +182,8 @@ mountpoint = ""                  # empty means detect
 |---|---|
 | `~/.local/share/iprune/iprune.sqlite` | library index, mappings, statistics |
 | `~/.local/share/iprune/stats.csv` | play statistics, rewritten after each sync |
-| `~/.local/share/iprune/backups/<guid>/<timestamp>/` | `iTunesDB`, `ArtworkDB`, `Play Counts` if present, `plan.json`, `snapshot.txt` |
+| `~/.local/share/iprune/backups/<guid>/<timestamp>/` | `iTunesDB`, `ArtworkDB`, `Play Counts` if present, `artwork.json`, `plan.json`, `snapshot.txt` |
+| `~/.local/share/iprune/backups/<guid>/.ithmb/<blake3>` | the iPod's `.ithmb` cover art files, one copy per content, shared by the backups that list them |
 | `<ipod>/iPod_Control/iprune/manifest.json` | copy of the device mapping, written after each sync |
 | `/mnt/seagate-1tb/Playlists/*.m3u8` | playlists, the source of truth |
 
@@ -581,7 +582,24 @@ Order of operations:
    `backups/<guid>/<YYYYMMDD-HHMMSS>/`, with `plan.json`, `work.json` (the
    operations applied), `snapshot.txt` (before) and `mappings.json` (the
    device's mappings). The folder is filled under a hidden name and renamed
-   when complete.
+   when complete. The `F*_*.ithmb` files of `iPod_Control/Artwork` go to
+   the iPod's `.ithmb` store, named by their blake3, and `artwork.json`
+   lists them (name, size, time, hash): `ArtworkDB` holds offsets into
+   them, and libgpod rewrites them in place on a write (it moves
+   thumbnails into the slots of removed ones and truncates). A file with
+   the name, size and time it had in the previous backup is not read
+   again; the others are hashed, and copied only when their content is not
+   stored yet. Pruning backups deletes stored files no backup lists. After
+   the write, `.ithmb` files that changed size, or a new one, beside an
+   `ArtworkDB` still equal to the backup's count as a verification failure:
+   libgpod does not report a failed `ArtworkDB` write.
+   Before that, the write is refused if libgpod could not read the artwork
+   (`check_artwork`): `.ithmb` files while no track holds a thumbnail and
+   some point at an artwork entry without one, or more than 5 tracks, and
+   more than a tenth of those with artwork, that point at an entry without
+   one. `.ithmb` files no track points at are leftovers libgpod deletes;
+   they are in the backup. A missing or damaged `ArtworkDB`
+   parses that way, and the write would then delete every `.ithmb` file.
 4. `itdb_start_sync`.
 5. Remove tracks: drop from all playlists, master and smart ones included,
    then `itdb_track_remove`. The file is deleted only once a write is
@@ -609,8 +627,8 @@ Order of operations:
 9. Run the pre-write checks (section 11.3). On failure, stop without writing
    and exit with code 3.
 10. Take the snapshot of the changed database, then `itdb_write`. libgpod
-    writes several files; if it fails, the iPod's `iTunesDB` and `ArtworkDB`
-    are compared with the backup. Unchanged: the pull is undone and the error
+    writes several files; if it fails, the iPod's `iTunesDB`, `ArtworkDB`
+    and `.ithmb` files are compared with the backup. Unchanged: the pull is undone and the error
     reported. Changed: the error names the backup to restore (exit code 3),
     and the pull stays pending for the next sync to settle as above.
 11. `itdb_stop_sync`.
@@ -706,7 +724,8 @@ its `snapshot.txt`. Under the iPod lock, in order:
    which index tracks by position, are deleted from the iPod once the
    backup of step 2 is checked to hold them, and the pull is settled.
    On-The-Go lists are not restored.
-5. `ArtworkDB` then `iTunesDB` are copied next to their targets under
+5. The `.ithmb` files the backup lists (from the store), `ArtworkDB`, then
+   `iTunesDB` are copied next to their targets under
    temporary names and compared, then renamed over them, `iTunesDB` last.
 6. The iPod's database is read back and compared with the backup's
    `iTunesDB` read from a copy on its own, so no `Play Counts` is applied
@@ -935,6 +954,6 @@ can be checked against the backup with the existing C tools.
 | Struct layout mismatch with the installed headers | bindgen at build time against the system headers; M0 test against the real database |
 | Large database write is slow (22 MB `iTunesDB`) | measured in M0; checkpoints sized accordingly |
 | libgpod does not understand some iTunes smart playlist rules ("Unknown action type 1" on write) and may rewrite them | checked in M4 on a copy of the real `iTunesDB` (2026-10-13): parsed and written back unchanged, the 12 smart playlists' header and rule records (`mhod` 50 and 51) are byte-identical and the snapshot is identical. The only bytes that change are the album and artist list ids (`mhia`, `mhii`), regenerated on every write, and a few `mhbd` header fields. Parse 33 ms, write 255 ms |
-| Artwork database corruption | iprune never touches artwork; `ArtworkDB` backed up with every sync |
+| Artwork database corruption | iprune adds and edits no artwork, but libgpod rewrites `ArtworkDB` and the `.ithmb` files on every write; both are backed up together and restored together, and a write is refused when the artwork could not be read |
 | Losing play counts | pulled and committed before any write, exported to CSV |
 | FairPlay files (one in the library, "Bailemos") may not play on an iPod that is not authorised for that Apple account | the planner skips unmapped ones and leaves mapped ones in place; M5 decides whether copying them is worth offering |

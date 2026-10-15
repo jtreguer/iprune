@@ -445,3 +445,74 @@ fn target_tmp() -> &'static Path {
             .unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp")),
     )
 }
+
+// ---- cover art on a fake iPod
+
+/// Compiles `c_art.c` once per test binary.
+fn art_tool() -> PathBuf {
+    static TOOL: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    TOOL.get_or_init(|| {
+        let flags = Command::new("pkg-config")
+            .args([
+                "--cflags",
+                "--libs",
+                "libgpod-1.0",
+                "gdk-pixbuf-2.0",
+                "glib-2.0",
+            ])
+            .output()
+            .expect("pkg-config");
+        assert!(
+            flags.status.success(),
+            "pkg-config libgpod-1.0 gdk-pixbuf-2.0"
+        );
+        let flags = String::from_utf8(flags.stdout).unwrap();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/c_art.c");
+        let dir = target_tmp().join("c-tools");
+        fs::create_dir_all(&dir).unwrap();
+        let out = dir.join(format!("c_art-{}", std::process::id()));
+        let status = Command::new("gcc")
+            .arg("-o")
+            .arg(&out)
+            .arg(&src)
+            .args(flags.split_whitespace())
+            .status()
+            .expect("gcc");
+        assert!(status.success(), "compiling {}", src.display());
+        out
+    })
+    .clone()
+}
+
+fn run_art(verb: &str, root: &Path) -> String {
+    let o = Command::new(art_tool())
+        .arg(verb)
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "c_art {verb}: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    String::from_utf8(o.stdout).unwrap()
+}
+
+/// Turns the fake iPod at `root` into an artwork-capable one (a Classic model
+/// in `SysInfo`, which keeps `sysinfo_rest`, the GUID line) and gives every
+/// track but the one with dbid 0x9999 its own colour cover, written by
+/// libgpod: an `ArtworkDB` and `F*_*.ithmb` files.
+pub fn add_cover_art(root: &Path, sysinfo_rest: &str) {
+    fs::write(
+        root.join("iPod_Control/Device/SysInfo"),
+        format!("ModelNumStr: xC297\n{sysinfo_rest}"),
+    )
+    .unwrap();
+    run_art("add", root);
+}
+
+/// What libgpod reads back as each track's cover: one line per track,
+/// `<dbid hex> <title> <rgb hex>` or `NONE`.
+pub fn read_covers(root: &Path) -> String {
+    run_art("show", root)
+}

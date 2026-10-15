@@ -568,3 +568,642 @@ fn summary_is_none_without_a_readable_snapshot() {
         assert_eq!(backup::summary(&b), None, "{bad:?}");
     }
 }
+
+// ---- cover art: the .ithmb files (audit H3)
+
+fn hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+impl Ipod {
+    fn ithmb(&self, name: &str, bytes: &[u8]) -> PathBuf {
+        let p = self.root().join("iPod_Control/Artwork").join(name);
+        fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    fn ithmb_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(self.root().join("iPod_Control/Artwork"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+fn store(data: &Path) -> PathBuf {
+    data.join(GUID).join(".ithmb")
+}
+
+fn stored_names(data: &Path) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(store(data))
+        .map(|rd| {
+            rd.map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+#[test]
+fn ithmb_files_are_listed_whatever_their_case_and_dot_files_and_other_names_are_not() {
+    let ipod = Ipod::new();
+    ipod.ithmb("F1060_1.ithmb", b"a");
+    ipod.ithmb("F1055_1.ITHMB", b"b");
+    ipod.ithmb("f1068_1.Ithmb", b"c");
+    ipod.ithmb(".iprune-restore-F1060_1.ithmb", b"temp");
+    ipod.ithmb("._F1060_1.ithmb", b"appledouble");
+    ipod.ithmb("F1060_1.ithmb.bak", b"x");
+    ipod.ithmb("ithmb", b"x");
+    fs::write(ipod.artwork(), "db").unwrap();
+    fs::create_dir(ipod.root().join("iPod_Control/Artwork/F9_9.ithmb")).unwrap();
+
+    let names: Vec<String> = backup::ithmb_files(ipod.root())
+        .unwrap()
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["F1055_1.ITHMB", "F1060_1.ithmb", "f1068_1.Ithmb"]);
+}
+
+#[test]
+fn ithmb_files_of_an_ipod_without_an_artwork_folder_is_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(backup::ithmb_files(dir.path()).unwrap().is_empty());
+}
+
+#[test]
+fn a_backup_stores_each_ithmb_file_under_its_hash_and_lists_it() {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    ipod.ithmb("F1060_1.ithmb", b"big thumbnails");
+    ipod.ithmb("F1055_1.ithmb", b"small ones");
+    let data = root();
+    let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+
+    let list = backup::artwork_list(&b.dir).expect("an artwork list");
+    assert_eq!(list.len(), 2);
+    for (name, bytes) in [
+        ("F1055_1.ithmb", &b"small ones"[..]),
+        ("F1060_1.ithmb", &b"big thumbnails"[..]),
+    ] {
+        let item = list.iter().find(|i| i.name == name).expect(name);
+        assert_eq!(item.size, bytes.len() as u64);
+        assert_eq!(item.hash, hash(bytes));
+        assert_eq!(
+            fs::read(store(data.path()).join(&item.hash)).unwrap(),
+            bytes
+        );
+    }
+    let mut want = vec![hash(b"small ones"), hash(b"big thumbnails")];
+    want.sort();
+    assert_eq!(stored_names(data.path()), want, "no temporary file left");
+}
+
+#[test]
+fn an_ipod_without_ithmb_files_gets_an_empty_list_and_no_store() {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    let data = root();
+    let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    assert_eq!(backup::artwork_list(&b.dir), Some(vec![]));
+    assert!(!store(data.path()).exists());
+}
+
+#[test]
+fn files_with_the_same_content_are_stored_once_and_so_are_unchanged_files_of_a_later_backup() {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    ipod.ithmb("F1_1.ithmb", b"same");
+    ipod.ithmb("F2_1.ithmb", b"same");
+    ipod.ithmb("F3_1.ithmb", b"other");
+    let data = root();
+    let first = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    assert_eq!(stored_names(data.path()).len(), 2, "two contents");
+    let mtime = |h: &str| {
+        fs::metadata(store(data.path()).join(h))
+            .unwrap()
+            .modified()
+            .unwrap()
+    };
+    let m = mtime(&hash(b"same"));
+
+    // Nothing changes: the second backup lists the same hashes, adds nothing.
+    let second = backup::create(data.path(), GUID, ipod.root(), 200, &[]).unwrap();
+    assert_eq!(
+        backup::artwork_list(&second.dir),
+        backup::artwork_list(&first.dir)
+    );
+    assert_eq!(stored_names(data.path()).len(), 2);
+    assert_eq!(mtime(&hash(b"same")), m, "the stored file is not rewritten");
+
+    // One file changes: its new content is stored, the old one is kept for
+    // the first backup.
+    ipod.ithmb("F3_1.ithmb", b"changed");
+    let third = backup::create(data.path(), GUID, ipod.root(), 300, &[]).unwrap();
+    let names = stored_names(data.path());
+    assert_eq!(names.len(), 3, "{names:?}");
+    for h in [hash(b"same"), hash(b"other"), hash(b"changed")] {
+        assert!(names.contains(&h));
+    }
+    let item = |b: &Backup, n: &str| {
+        backup::artwork_list(&b.dir)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.name == n)
+            .unwrap()
+            .hash
+    };
+    assert_eq!(item(&first, "F3_1.ithmb"), hash(b"other"));
+    assert_eq!(item(&third, "F3_1.ithmb"), hash(b"changed"));
+}
+
+// A file with the name, size and time of the previous backup's is not read
+// again: here it cannot be read at all, and the backup still succeeds.
+#[test]
+#[cfg(unix)]
+fn an_ithmb_file_unchanged_since_the_last_backup_is_not_read_again() {
+    use std::os::unix::fs::PermissionsExt;
+    let ipod = Ipod::new();
+    ipod.full("x");
+    let f = ipod.ithmb("F1_1.ithmb", b"large and slow to read");
+    let data = root();
+    let first = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = fs::File::open(&f).is_ok();
+    let second = backup::create(data.path(), GUID, ipod.root(), 200, &[]);
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
+    if readable {
+        eprintln!("running as root: permissions do not block reads, test skipped");
+        return;
+    }
+    let second = second.unwrap();
+    assert_eq!(
+        backup::artwork_list(&second.dir),
+        backup::artwork_list(&first.dir)
+    );
+}
+
+fn two_backups_sharing_a_file(ipod: &Ipod, data: &Path) -> (Backup, Backup) {
+    ipod.full("x");
+    ipod.ithmb("F1_1.ithmb", b"only in the first");
+    ipod.ithmb("F2_1.ithmb", b"in both");
+    let first = backup::create(data, GUID, ipod.root(), 100, &[]).unwrap();
+    fs::remove_file(ipod.root().join("iPod_Control/Artwork/F1_1.ithmb")).unwrap();
+    ipod.ithmb("F3_1.ithmb", b"only in the second");
+    let second = backup::create(data, GUID, ipod.root(), 200, &[]).unwrap();
+    (first, second)
+}
+
+#[test]
+fn prune_deletes_only_the_stored_files_no_backup_lists() {
+    let ipod = Ipod::new();
+    let data = root();
+    let (first, second) = two_backups_sharing_a_file(&ipod, data.path());
+    assert_eq!(stored_names(data.path()).len(), 3);
+
+    // Nothing pruned, nothing deleted.
+    assert!(backup::prune(data.path(), GUID, 2).unwrap().is_empty());
+    assert_eq!(stored_names(data.path()).len(), 3);
+
+    assert_eq!(
+        backup::prune(data.path(), GUID, 1).unwrap(),
+        vec![first.dir]
+    );
+    let mut want = vec![hash(b"in both"), hash(b"only in the second")];
+    want.sort();
+    assert_eq!(stored_names(data.path()), want);
+    // What the kept backup lists is all there, byte for byte.
+    for i in backup::artwork_list(&second.dir).unwrap() {
+        assert_eq!(
+            fs::read(store(data.path()).join(&i.hash)).unwrap().len() as u64,
+            i.size
+        );
+    }
+}
+
+#[test]
+fn prune_does_not_touch_another_ipods_store() {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    ipod.ithmb("F1_1.ithmb", b"theirs");
+    let data = root();
+    backup::create(data.path(), "OTHER", ipod.root(), 100, &[]).unwrap();
+    two_backups_sharing_a_file(&ipod, data.path());
+    backup::prune(data.path(), GUID, 1).unwrap();
+    assert!(
+        data.path()
+            .join("OTHER/.ithmb")
+            .join(hash(b"theirs"))
+            .is_file()
+    );
+}
+
+#[test]
+fn prune_keeps_every_stored_file_when_a_backups_list_cannot_be_read() {
+    let ipod = Ipod::new();
+    let data = root();
+    let (first, second) = two_backups_sharing_a_file(&ipod, data.path());
+    fs::write(second.dir.join("artwork.json"), "{ not json").unwrap();
+    backup::prune(data.path(), GUID, 1).unwrap();
+    assert!(!first.dir.exists());
+    assert_eq!(
+        stored_names(data.path()).len(),
+        3,
+        "an unreadable list may need any of them"
+    );
+}
+
+#[test]
+fn prune_keeps_the_files_of_a_backup_that_is_not_listed() {
+    let ipod = Ipod::new();
+    let data = root();
+    // The copy a restore takes of an iPod with no iTunesDB: not listed.
+    ipod.ithmb("F9_1.ithmb", b"kept by the unlisted one");
+    let unlisted = backup::create_before_restore(data.path(), GUID, ipod.root(), 50, &[]).unwrap();
+    // The file leaves the iPod: only the unlisted backup refers to it now.
+    fs::remove_file(ipod.root().join("iPod_Control/Artwork/F9_1.ithmb")).unwrap();
+    assert!(backup::list(data.path(), GUID).unwrap().is_empty());
+    let (first, _second) = two_backups_sharing_a_file(&ipod, data.path());
+    backup::prune(data.path(), GUID, 1).unwrap();
+    assert!(!first.dir.exists());
+    assert!(unlisted.dir.exists());
+    assert!(
+        store(data.path())
+            .join(hash(b"kept by the unlisted one"))
+            .is_file()
+    );
+}
+
+#[test]
+fn prune_ignores_a_backup_taken_before_artwork_lists_existed() {
+    let ipod = Ipod::new();
+    let data = root();
+    let (first, second) = two_backups_sharing_a_file(&ipod, data.path());
+    // Make the second look like an old backup, with no list at all.
+    fs::remove_file(second.dir.join("artwork.json")).unwrap();
+    backup::prune(data.path(), GUID, 1).unwrap();
+    assert!(!first.dir.exists());
+    assert!(
+        stored_names(data.path()).is_empty(),
+        "nothing lists them, and the old backup does not need them"
+    );
+}
+
+fn restore_setup() -> (Ipod, tempfile::TempDir, Backup) {
+    let ipod = Ipod::new();
+    ipod.full("old");
+    ipod.ithmb("F1_1.ithmb", b"old thumbnails one");
+    ipod.ithmb("F2_1.ithmb", b"old thumbnails two");
+    let data = root();
+    let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    ipod.full("new");
+    ipod.ithmb("F1_1.ithmb", b"rearranged");
+    fs::remove_file(ipod.root().join("iPod_Control/Artwork/F2_1.ithmb")).unwrap();
+    (ipod, data, b)
+}
+
+fn read(ipod: &Ipod, name: &str) -> Vec<u8> {
+    fs::read(ipod.root().join("iPod_Control/Artwork").join(name)).unwrap()
+}
+
+#[test]
+fn restore_puts_the_ithmb_files_back_with_the_artworkdb() {
+    let (ipod, data, b) = restore_setup();
+    let done = backup::restore_files(&b, ipod.root()).unwrap();
+    assert!(
+        done.contains(&"ArtworkDB") && done.contains(&"iTunesDB"),
+        "{done:?}"
+    );
+    assert_eq!(read(&ipod, "F1_1.ithmb"), b"old thumbnails one");
+    assert_eq!(read(&ipod, "F2_1.ithmb"), b"old thumbnails two");
+    assert_eq!(read(&ipod, "ArtworkDB"), b"art old");
+    assert_eq!(fs::read_to_string(ipod.db()).unwrap(), "db old");
+    // The store is only read.
+    assert_eq!(stored_names(data.path()).len(), 2);
+    assert!(
+        ipod.ithmb_names().iter().all(|n| !n.starts_with(".iprune")),
+        "{:?}",
+        ipod.ithmb_names()
+    );
+}
+
+// Prevents (audit H3) restoring cover art from a store file that rotted:
+// the restore stops before it renames anything.
+#[test]
+fn a_corrupted_store_file_makes_restore_refuse_before_any_rename() {
+    let (ipod, data, b) = restore_setup();
+    let victim = store(data.path()).join(hash(b"old thumbnails two"));
+    fs::write(&victim, b"old thumbnails twp").unwrap();
+    let e = backup::restore_files(&b, ipod.root()).unwrap_err();
+    assert!(
+        matches!(&e, Error::BackupMismatch(p) if *p == victim),
+        "{e:?}"
+    );
+    // Nothing on the iPod changed, the first file (good in the store) included.
+    assert_eq!(read(&ipod, "F1_1.ithmb"), b"rearranged");
+    assert!(!ipod.root().join("iPod_Control/Artwork/F2_1.ithmb").exists());
+    assert_eq!(read(&ipod, "ArtworkDB"), b"art new");
+    assert_eq!(fs::read_to_string(ipod.db()).unwrap(), "db new");
+    assert!(
+        ipod.ithmb_names().iter().all(|n| !n.starts_with(".iprune")),
+        "temporary copies are removed: {:?}",
+        ipod.ithmb_names()
+    );
+}
+
+#[test]
+fn a_missing_store_file_makes_restore_refuse_before_any_rename() {
+    let (ipod, data, b) = restore_setup();
+    fs::remove_file(store(data.path()).join(hash(b"old thumbnails one"))).unwrap();
+    assert!(backup::restore_files(&b, ipod.root()).is_err());
+    assert_eq!(read(&ipod, "F1_1.ithmb"), b"rearranged");
+    assert_eq!(read(&ipod, "ArtworkDB"), b"art new");
+    assert_eq!(fs::read_to_string(ipod.db()).unwrap(), "db new");
+    assert!(ipod.ithmb_names().iter().all(|n| !n.starts_with(".iprune")));
+}
+
+// The order of the renames: .ithmb files, then ArtworkDB, then iTunesDB. When
+// the ArtworkDB cannot be replaced, the files it needs are back already and
+// the iTunesDB is still the new one.
+#[test]
+fn restore_renames_the_ithmb_files_before_the_artworkdb_and_the_itunesdb_last() {
+    let (ipod, _data, b) = restore_setup();
+    fs::remove_file(ipod.artwork()).unwrap();
+    fs::create_dir(ipod.artwork()).unwrap();
+    fs::write(ipod.artwork().join("inside"), "x").unwrap();
+    assert!(backup::restore_files(&b, ipod.root()).is_err());
+    assert_eq!(read(&ipod, "F1_1.ithmb"), b"old thumbnails one");
+    assert_eq!(fs::read_to_string(ipod.db()).unwrap(), "db new");
+}
+
+#[test]
+fn restoring_a_backup_without_an_artwork_list_leaves_the_ithmb_files_alone() {
+    let (ipod, _data, b) = restore_setup();
+    fs::remove_file(b.dir.join("artwork.json")).unwrap();
+    let done = backup::restore_files(&b, ipod.root()).unwrap();
+    assert_eq!(done, vec!["ArtworkDB", "iTunesDB"]);
+    assert_eq!(read(&ipod, "F1_1.ithmb"), b"rearranged");
+    assert_eq!(read(&ipod, "ArtworkDB"), b"art old");
+}
+
+#[test]
+fn artwork_unchanged_compares_names_and_content_with_the_backups_list() {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    let f1 = ipod.ithmb("F1_1.ithmb", b"one one");
+    ipod.ithmb("F2_1.ithmb", b"two two");
+    let data = root();
+    let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    assert!(backup::artwork_unchanged(&b.dir, ipod.root()));
+
+    // Rewritten with the same bytes (new time): still the same cover art.
+    fs::write(&f1, b"one one").unwrap();
+    assert!(backup::artwork_unchanged(&b.dir, ipod.root()));
+
+    // Same size, one byte different.
+    fs::write(&f1, b"one onf").unwrap();
+    assert!(!backup::artwork_unchanged(&b.dir, ipod.root()), "content");
+    // Truncated, as libgpod does after moving thumbnails.
+    fs::write(&f1, b"one").unwrap();
+    assert!(!backup::artwork_unchanged(&b.dir, ipod.root()), "size");
+    // Back as it was.
+    fs::write(&f1, b"one one").unwrap();
+    assert!(backup::artwork_unchanged(&b.dir, ipod.root()));
+    // A file libgpod removed.
+    fs::remove_file(&f1).unwrap();
+    assert!(!backup::artwork_unchanged(&b.dir, ipod.root()), "removed");
+    // A file libgpod created.
+    fs::write(&f1, b"one one").unwrap();
+    ipod.ithmb("F9_1.ithmb", b"new");
+    assert!(!backup::artwork_unchanged(&b.dir, ipod.root()), "added");
+}
+
+#[test]
+fn artwork_unchanged_is_true_for_a_backup_taken_before_artwork_lists_existed() {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    ipod.ithmb("F1_1.ithmb", b"one");
+    let data = root();
+    let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    fs::remove_file(b.dir.join("artwork.json")).unwrap();
+    ipod.ithmb("F1_1.ithmb", b"completely different");
+    assert!(backup::artwork_unchanged(&b.dir, ipod.root()));
+}
+
+// ---- artwork_left_behind (audit H3)
+
+fn left_behind_setup() -> (Ipod, tempfile::TempDir, Backup) {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    ipod.ithmb("F1_1.ithmb", b"one one one");
+    ipod.ithmb("F2_1.ithmb", b"two two two");
+    let data = root();
+    let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    (ipod, data, b)
+}
+
+#[test]
+fn artwork_left_behind_is_false_for_a_backup_without_a_list() {
+    let (ipod, _d, b) = left_behind_setup();
+    fs::remove_file(b.dir.join("artwork.json")).unwrap();
+    ipod.ithmb("F1_1.ithmb", b"short");
+    assert!(!backup::artwork_left_behind(&b.dir, ipod.root()));
+}
+
+#[test]
+fn artwork_left_behind_is_false_when_nothing_changed() {
+    let (ipod, _d, b) = left_behind_setup();
+    assert!(!backup::artwork_left_behind(&b.dir, ipod.root()));
+    // Same size, other bytes: not a rearrangement the size check sees.
+    ipod.ithmb("F1_1.ithmb", b"ONE ONE ONE");
+    assert!(!backup::artwork_left_behind(&b.dir, ipod.root()));
+}
+
+#[test]
+fn artwork_left_behind_is_false_when_artworkdb_was_rewritten_too() {
+    let (ipod, _d, b) = left_behind_setup();
+    ipod.ithmb("F1_1.ithmb", b"short");
+    fs::write(ipod.artwork(), "art rewritten").unwrap();
+    assert!(!backup::artwork_left_behind(&b.dir, ipod.root()));
+}
+
+#[test]
+fn artwork_left_behind_is_true_when_sizes_changed_and_artworkdb_is_the_same() {
+    let (ipod, _d, b) = left_behind_setup();
+    ipod.ithmb("F1_1.ithmb", b"short");
+    assert!(backup::artwork_left_behind(&b.dir, ipod.root()));
+}
+
+#[test]
+fn artwork_left_behind_is_true_when_a_file_is_added_and_artworkdb_is_the_same() {
+    let (ipod, _d, b) = left_behind_setup();
+    let extra = ipod.ithmb("F9_1.ithmb", b"new");
+    assert!(backup::artwork_left_behind(&b.dir, ipod.root()), "added");
+    fs::remove_file(extra).unwrap();
+    assert!(!backup::artwork_left_behind(&b.dir, ipod.root()));
+    // A file no thumbnail used is deleted by libgpod with ArtworkDB as it
+    // was: a correct write, not a failed one.
+    fs::remove_file(ipod.root().join("iPod_Control/Artwork/F2_1.ithmb")).unwrap();
+    assert!(!backup::artwork_left_behind(&b.dir, ipod.root()), "removed");
+}
+
+// ---- review changes: hashing first, unchanged files, space, unreadable list, prune
+
+// The store already holds this content: nothing is written to it (here it
+// could not be: the folder is read-only), even though the file's time moved.
+#[test]
+#[cfg(unix)]
+fn a_file_whose_content_is_in_the_store_is_not_copied_again_when_only_its_time_changed() {
+    use std::os::unix::fs::PermissionsExt;
+    let ipod = Ipod::new();
+    ipod.full("x");
+    let f = ipod.ithmb("F1_1.ithmb", b"thumbnails");
+    let data = root();
+    let first = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    // Same bytes, new time: the name/size/time shortcut does not apply.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(&f, b"thumbnails").unwrap();
+    let st = store(data.path());
+    fs::set_permissions(&st, fs::Permissions::from_mode(0o555)).unwrap();
+    let blocked = fs::File::create(st.join(".probe")).is_err();
+    let second = backup::create(data.path(), GUID, ipod.root(), 200, &[]);
+    fs::set_permissions(&st, fs::Permissions::from_mode(0o755)).unwrap();
+    if !blocked {
+        eprintln!("running as root: permissions do not block writes, test skipped");
+        return;
+    }
+    let second = second.unwrap();
+    let hashes = |b: &Backup| -> Vec<String> {
+        backup::artwork_list(&b.dir)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.hash)
+            .collect()
+    };
+    assert_eq!(hashes(&second), hashes(&first));
+    assert_eq!(stored_names(data.path()), vec![hash(b"thumbnails")]);
+}
+
+// Restoring leaves a cover art file alone when the iPod already holds the
+// listed content: here its store copy is gone, and the restore still works.
+#[test]
+fn restore_does_not_touch_an_ithmb_file_that_already_has_the_listed_content() {
+    let (ipod, data, b) = restore_setup();
+    // F2 comes back to its backed up content by itself; F1 is still wrong.
+    let f2 = ipod.ithmb("F2_1.ithmb", b"old thumbnails two");
+    let before = fs::metadata(&f2).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::remove_file(store(data.path()).join(hash(b"old thumbnails two"))).unwrap();
+
+    backup::restore_files(&b, ipod.root()).unwrap();
+    assert_eq!(read(&ipod, "F1_1.ithmb"), b"old thumbnails one");
+    assert_eq!(read(&ipod, "F2_1.ithmb"), b"old thumbnails two");
+    assert_eq!(
+        fs::metadata(&f2).unwrap().modified().unwrap(),
+        before,
+        "not replaced"
+    );
+}
+
+fn set_listed_size(b: &Backup, name: &str, size: u64) {
+    let path = b.dir.join("artwork.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for item in v.as_array_mut().unwrap() {
+        if item["name"] == name {
+            item["size"] = size.into();
+        }
+    }
+    fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+}
+
+// A restore that cannot fit its temporary copies is refused up front. The
+// list claims a file larger than any disk can have free.
+#[test]
+fn restore_refuses_when_the_temporary_copies_do_not_fit_and_changes_nothing() {
+    let (ipod, _data, b) = restore_setup();
+    set_listed_size(&b, "F1_1.ithmb", 1 << 62);
+    let e = backup::restore_files(&b, ipod.root()).unwrap_err();
+    assert!(
+        matches!(&e, Error::NoRoomToRestore { needed, .. } if *needed >= 1 << 62),
+        "{e:?}"
+    );
+    assert_eq!(read(&ipod, "F1_1.ithmb"), b"rearranged");
+    assert_eq!(read(&ipod, "ArtworkDB"), b"art new");
+    assert_eq!(fs::read_to_string(ipod.db()).unwrap(), "db new");
+    assert!(ipod.ithmb_names().iter().all(|n| !n.starts_with(".iprune")));
+}
+
+// A list that exists but cannot be read must not be taken for a backup made
+// before lists were kept: that would restore ArtworkDB without its files.
+#[test]
+fn restore_refuses_an_unreadable_artwork_list_and_changes_nothing() {
+    let (ipod, _data, b) = restore_setup();
+    fs::write(b.dir.join("artwork.json"), "{ not json").unwrap();
+    let e = backup::restore_files(&b, ipod.root()).unwrap_err();
+    assert!(
+        matches!(&e, Error::Io { path, .. } if path.ends_with("artwork.json")),
+        "{e:?}"
+    );
+    assert_eq!(read(&ipod, "F1_1.ithmb"), b"rearranged");
+    assert_eq!(read(&ipod, "ArtworkDB"), b"art new");
+    assert_eq!(fs::read_to_string(ipod.db()).unwrap(), "db new");
+}
+
+#[test]
+fn an_unreadable_artwork_list_is_an_error_a_missing_one_is_none_and_unchanged_is_false() {
+    let (ipod, _data, b) = restore_setup();
+    assert!(backup::artwork_list_checked(&b.dir).unwrap().is_some());
+    fs::write(b.dir.join("artwork.json"), "[1, 2").unwrap();
+    assert!(backup::artwork_list_checked(&b.dir).is_err());
+    assert_eq!(backup::artwork_list(&b.dir), None);
+    assert!(!backup::artwork_unchanged(&b.dir, ipod.root()));
+    fs::remove_file(b.dir.join("artwork.json")).unwrap();
+    assert!(backup::artwork_list_checked(&b.dir).unwrap().is_none());
+    assert!(backup::artwork_unchanged(&b.dir, ipod.root()));
+}
+
+#[test]
+fn prune_deletes_unlisted_and_leftover_partial_store_files_even_when_it_removes_no_backup() {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    ipod.ithmb("F1_1.ithmb", b"listed");
+    let data = root();
+    backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    let st = store(data.path());
+    fs::write(st.join(".partial-F2_1.ithmb"), "half a copy").unwrap();
+    fs::write(st.join(hash(b"orphan")), "orphan").unwrap();
+
+    assert!(backup::prune(data.path(), GUID, 5).unwrap().is_empty());
+    assert_eq!(
+        stored_names(data.path()),
+        vec![hash(b"listed")],
+        "only what a backup lists is left"
+    );
+}
+
+// A truncated store file is found by the plan, before anything is staged
+// (checking its content only when copying would come after the caller's
+// first changes).
+#[test]
+fn a_truncated_store_file_is_refused_by_the_plan_and_by_restore() {
+    let (ipod, data, b) = restore_setup();
+    let victim = store(data.path()).join(hash(b"old thumbnails one"));
+    fs::write(&victim, b"old thumb").unwrap();
+    let e = backup::plan_restore(&b, ipod.root()).unwrap_err();
+    assert!(
+        matches!(&e, Error::BackupMismatch(p) if *p == victim),
+        "{e:?}"
+    );
+    let e = backup::restore_files(&b, ipod.root()).unwrap_err();
+    assert!(
+        matches!(&e, Error::BackupMismatch(p) if *p == victim),
+        "{e:?}"
+    );
+    assert_eq!(read(&ipod, "F1_1.ithmb"), b"rearranged");
+    assert_eq!(read(&ipod, "ArtworkDB"), b"art new");
+    assert_eq!(fs::read_to_string(ipod.db()).unwrap(), "db new");
+    assert!(ipod.ithmb_names().iter().all(|n| !n.starts_with(".iprune")));
+}

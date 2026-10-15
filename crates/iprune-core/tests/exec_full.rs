@@ -2553,22 +2553,14 @@ fn restore(
     stamp: &str,
     discard_play_counts: bool,
 ) -> iprune_core::Result<exec::Restored> {
-    // Tries again while the lock reports busy: a helper program forked by
-    // another test thread can briefly hold a copy of a released lock file.
-    for _ in 0..200 {
-        match exec::restore(
-            w.env.store.conn(),
-            &w.paths,
-            &w.root,
-            GUID,
-            stamp,
-            discard_play_counts,
-        ) {
-            Err(Error::IpodBusy) => std::thread::sleep(std::time::Duration::from_millis(5)),
-            other => return other,
-        }
-    }
-    unreachable!("the iPod lock stayed busy")
+    exec::restore(
+        w.env.store.conn(),
+        &w.paths,
+        &w.root,
+        GUID,
+        stamp,
+        discard_play_counts,
+    )
 }
 
 /// A World where a sync removed track 1 (library file `s1.mp3` deleted), and
@@ -2835,5 +2827,551 @@ fn the_missing_files_guard_counts_only_missing_files_and_a_tenth_of_the_managed_
             exec::check_missing_files(&plan(missing, changed), managed, allow).is_ok(),
             "the flag allows it"
         );
+    }
+}
+
+// ---- cover art: ArtworkDB, the .ithmb files and backups of them (audit H9, H3)
+
+mod artwork_tests {
+    use super::*;
+    use common::{add_cover_art, read_covers};
+
+    /// A World whose iPod has a cover on every track but the unmanaged one.
+    fn art_world(n: usize) -> World {
+        let w = World::new(n);
+        add_cover_art(&w.root, SYSINFO);
+        w
+    }
+
+    fn artwork_dir(w: &World) -> BTreeMap<PathBuf, Vec<u8>> {
+        tree(&w.root.join("iPod_Control/Artwork"))
+    }
+
+    fn ithmbs(w: &World) -> BTreeMap<PathBuf, Vec<u8>> {
+        artwork_dir(w)
+            .into_iter()
+            .filter(|(p, _)| p.extension().is_some_and(|e| e == "ithmb"))
+            .collect()
+    }
+
+    fn mix_gets_a_second_track(w: &World) {
+        w.write_list("Mix", &[w.files[0].clone(), w.files[1].clone()]);
+        w.reload();
+    }
+
+    fn backups_dir(w: &World) -> PathBuf {
+        w.paths.data_dir.join("backups")
+    }
+
+    // Prevents (audit H9) a sync deleting every cover on the iPod because
+    // its ArtworkDB was gone or unreadable: libgpod then sees no thumbnails
+    // and deletes the .ithmb files nothing refers to.
+    fn damaged_artworkdb_is_refused_and_nothing_changes(damage: impl Fn(&Path)) {
+        let w = art_world(4);
+        let artdb = w.root.join("iPod_Control/Artwork/ArtworkDB");
+        assert!(artdb.is_file());
+        assert!(!ithmbs(&w).is_empty(), "set up: covers exist");
+        w.write_play_counts(&[
+            (2, 1_700_000_000, 80, 0),
+            (0, 0, 0, 0),
+            (0, 0, 0, 0),
+            (0, 0, 0, 0),
+            (0, 0, 0, 0),
+        ]);
+        damage(&artdb);
+        mix_gets_a_second_track(&w);
+        let before = w.tree();
+
+        let e = w.sync().unwrap_err();
+        match &e {
+            Error::ArtworkUnreadable { files, lost } => {
+                assert!(*files > 0, "{e}");
+                assert_eq!(*lost, 4, "every track with a cover lost it: {e}");
+            }
+            other => panic!("expected ArtworkUnreadable, got {other}"),
+        }
+        // Not a check failure of a written database: nothing was written.
+        assert!(!e.is_check_failure(), "no write, so not exit code 3");
+        // Every file on the iPod is as it was, the .ithmb files included.
+        assert_eq!(w.tree(), before);
+        // No backup, no pull, no changed playlist.
+        assert!(w.backups().is_empty());
+        assert!(!backups_dir(&w).exists(), "no backup folder at all");
+        assert_eq!(w.stats_total_plays(), 0);
+        assert_eq!(w.pending_pulls(), 0);
+    }
+
+    #[test]
+    fn a_sync_refuses_when_artworkdb_is_missing_and_deletes_no_cover() {
+        damaged_artworkdb_is_refused_and_nothing_changes(|artdb| fs::remove_file(artdb).unwrap());
+    }
+
+    #[test]
+    fn a_sync_refuses_when_artworkdb_is_garbage_and_deletes_no_cover() {
+        damaged_artworkdb_is_refused_and_nothing_changes(|artdb| {
+            fs::write(artdb, b"this is not an ArtworkDB, not even close\0\0\0").unwrap();
+        });
+    }
+
+    #[test]
+    fn a_sync_refuses_when_artworkdb_is_empty_and_deletes_no_cover() {
+        damaged_artworkdb_is_refused_and_nothing_changes(|artdb| fs::write(artdb, b"").unwrap());
+    }
+
+    #[test]
+    fn a_sync_goes_ahead_when_the_artwork_is_healthy_and_keeps_every_cover() {
+        let w = art_world(4);
+        let covers = read_covers(&w.root);
+        let ithmb_before = ithmbs(&w);
+        mix_gets_a_second_track(&w);
+        let out = w.sync().unwrap();
+        assert_eq!(out.stopped, None);
+        assert_eq!(w.playlist("Mix").unwrap(), vec![dbid(1), dbid(2)]);
+        assert_eq!(read_covers(&w.root), covers, "every cover is still found");
+        assert_eq!(
+            ithmbs(&w),
+            ithmb_before,
+            "a playlist edit leaves the .ithmb files alone"
+        );
+        assert_eq!(w.backups().len(), 1);
+    }
+
+    #[test]
+    fn an_ipod_without_any_artwork_still_syncs() {
+        // The plain fake iPod: no ArtworkDB, no .ithmb file, no thumbnails.
+        let w = World::new(3);
+        mix_gets_a_second_track(&w);
+        w.sync().unwrap();
+        assert_eq!(w.playlist("Mix").unwrap(), vec![dbid(1), dbid(2)]);
+    }
+
+    // ---- audit H3: the .ithmb files libgpod rewrites on every write
+
+    /// Removes the first managed track (its cover is first in the .ithmb
+    /// files) from the library and syncs with removals allowed.
+    fn sync_removing_the_first_track(w: &mut World) -> iprune_core::Result<Outcome> {
+        fs::remove_file(&w.files[0]).unwrap();
+        w.rescan();
+        let p = w.prepare();
+        let work = exec::full_work(&p);
+        w.run(
+            &p,
+            &work,
+            Options {
+                allow_mass_removal: true,
+            },
+            &|_| {},
+            &AtomicBool::new(false),
+        )
+    }
+
+    fn store_of(w: &World) -> PathBuf {
+        backups_dir(w).join(GUID).join(".ithmb")
+    }
+
+    fn stored(w: &World) -> BTreeMap<String, Vec<u8>> {
+        fs::read_dir(store_of(w))
+            .map(|rd| {
+                rd.map(|e| e.unwrap())
+                    .map(|e| {
+                        (
+                            e.file_name().to_string_lossy().into_owned(),
+                            fs::read(e.path()).unwrap(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // Prevents (audit H3) a backup that holds the old ArtworkDB but not the
+    // .ithmb files it points into: libgpod moves thumbnails around on a write.
+    #[test]
+    fn removing_a_track_with_a_cover_rearranges_the_ithmb_files_and_the_backup_keeps_the_old_ones()
+    {
+        let mut w = art_world(4);
+        let ithmb_before = ithmbs(&w);
+        let artdb_before = artwork_dir(&w);
+        let covers_before = read_covers(&w.root);
+        let out = sync_removing_the_first_track(&mut w).unwrap();
+        assert_eq!(out.removed, 1);
+
+        // The scenario is real: libgpod did rewrite the files.
+        assert_ne!(
+            ithmbs(&w),
+            ithmb_before,
+            "set up: the removal must rearrange the .ithmb files"
+        );
+
+        // The backup's store holds exactly the content from before the write,
+        // under its hash, and the list says which file is which.
+        let b = w.backups().pop().unwrap();
+        let list = backup::artwork_list(&b.dir).expect("an artwork list");
+        assert_eq!(list.len(), ithmb_before.len());
+        let store = stored(&w);
+        let distinct: std::collections::BTreeSet<_> = ithmb_before.values().collect();
+        assert_eq!(store.len(), distinct.len(), "one stored file per content");
+        for (path, bytes) in &ithmb_before {
+            let name = path.file_name().unwrap().to_string_lossy();
+            let item = list
+                .iter()
+                .find(|i| i.name == *name)
+                .unwrap_or_else(|| panic!("{name} not listed"));
+            assert_eq!(item.size, bytes.len() as u64);
+            assert_eq!(
+                item.hash,
+                blake3::hash(bytes).to_hex().to_string(),
+                "{name}"
+            );
+            assert_eq!(&store[&item.hash], bytes, "{name} stored as it was");
+        }
+        assert_eq!(
+            fs::read(b.dir.join("ArtworkDB")).unwrap(),
+            artdb_before[Path::new("ArtworkDB")]
+        );
+
+        // Restoring that backup makes the covers consistent again: same
+        // .ithmb bytes, same ArtworkDB, every track shows its own colour.
+        assert_ne!(
+            read_covers(&w.root),
+            covers_before,
+            "set up: after the write"
+        );
+        backup::restore_files(&b, &w.root).unwrap();
+        assert_eq!(ithmbs(&w), ithmb_before);
+        assert_eq!(artwork_dir(&w), artdb_before);
+        assert_eq!(read_covers(&w.root), covers_before);
+    }
+
+    #[test]
+    fn a_second_sync_that_changes_no_cover_stores_no_new_ithmb_file() {
+        let w = art_world(4);
+        mix_gets_a_second_track(&w);
+        w.sync().unwrap();
+        let store1 = stored(&w);
+        let list1 = backup::artwork_list(&w.backups()[0].dir).unwrap();
+        assert!(!store1.is_empty());
+        let mtimes = |w: &World| -> BTreeMap<String, std::time::SystemTime> {
+            fs::read_dir(store_of(w))
+                .unwrap()
+                .map(|e| e.unwrap())
+                .map(|e| {
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        e.metadata().unwrap().modified().unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let mtimes1 = mtimes(&w);
+
+        // Another playlist-only change: a second backup is taken.
+        w.write_list("Mix", &[w.files[2].clone()]);
+        w.reload();
+        w.sync().unwrap();
+        let backups = w.backups();
+        assert_eq!(backups.len(), 2);
+        let list2 = backup::artwork_list(&backups[1].dir).unwrap();
+        assert_eq!(
+            list2.iter().map(|i| (&i.name, &i.hash)).collect::<Vec<_>>(),
+            list1.iter().map(|i| (&i.name, &i.hash)).collect::<Vec<_>>(),
+            "the same covers, the same hashes"
+        );
+        assert_eq!(stored(&w), store1, "no new file in the store");
+        assert_eq!(mtimes(&w), mtimes1, "and none rewritten");
+        let leftovers: Vec<_> = fs::read_dir(store_of(&w))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    // Prevents (audit H3c) a write that fails after libgpod rearranged the
+    // .ithmb files, but before ArtworkDB and iTunesDB changed, being reported
+    // as "nothing was written" and the stats pull being undone.
+    #[test]
+    #[cfg(unix)]
+    fn a_write_that_fails_after_the_ithmb_files_moved_is_reported_as_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut w = art_world(4);
+        let ithmb_before = ithmbs(&w);
+        let artdb = fs::read(w.root.join("iPod_Control/Artwork/ArtworkDB")).unwrap();
+        let itunesdb = fs::read(w.root.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+        w.write_play_counts(&[
+            (3, 1_700_000_000, 80, 0),
+            (0, 0, 0, 0),
+            (0, 0, 0, 0),
+            (0, 0, 0, 0),
+            (0, 0, 0, 0),
+        ]);
+        // libgpod rewrites the .ithmb files first, then ArtworkDB, then
+        // iTunesDB. ArtworkDB can be neither written in place (read-only
+        // file) nor replaced (read-only folder) and libgpod does not fail for
+        // that; the iTunes folder is read-only too, which makes the write
+        // fail. Only the .ithmb files (rewritten in place) change.
+        let target = w.root.join("iPod_Control/Artwork/ArtworkDB");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+        struct Restore(PathBuf, u32);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+            }
+        }
+        let _guard = Restore(target.clone(), 0o644);
+        let itunes = w.root.join("iPod_Control/iTunes");
+        fs::set_permissions(&itunes, fs::Permissions::from_mode(0o555)).unwrap();
+        let _guard2 = Restore(itunes.clone(), 0o755);
+        let art_dir = w.root.join("iPod_Control/Artwork");
+        fs::set_permissions(&art_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let _guard3 = Restore(art_dir, 0o755);
+        if fs::OpenOptions::new().append(true).open(&target).is_ok()
+            || fs::File::create(itunes.join(".probe")).is_ok()
+        {
+            let _ = fs::remove_file(itunes.join(".probe"));
+            eprintln!("running as root: permissions do not block writes, test skipped");
+            return;
+        }
+        let res = sync_removing_the_first_track(&mut w);
+        drop(_guard3);
+        drop(_guard2);
+        drop(_guard);
+
+        // Set up: ArtworkDB and iTunesDB did not change, the .ithmb files did.
+        assert_eq!(
+            fs::read(w.root.join("iPod_Control/Artwork/ArtworkDB")).unwrap(),
+            artdb
+        );
+        assert_eq!(
+            fs::read(w.root.join("iPod_Control/iTunes/iTunesDB")).unwrap(),
+            itunesdb
+        );
+        assert_ne!(ithmbs(&w), ithmb_before, "set up: libgpod moved thumbnails");
+
+        let e = res.unwrap_err();
+        let stamp = w.backups().last().unwrap().stamp.clone();
+        match &e {
+            Error::WriteIncomplete { stamp: s, .. } => assert_eq!(*s, stamp),
+            other => panic!("expected WriteIncomplete, got {other}"),
+        }
+        // The pull is left pending, not undone as for an untouched iPod.
+        assert_eq!(w.pending_pulls(), 1);
+    }
+
+    // Prevents (audit H3) a sync reporting success when libgpod rearranged the
+    // .ithmb files but silently failed to write ArtworkDB: the covers would be
+    // scrambled and the music files of removed tracks deleted.
+    #[test]
+    #[cfg(unix)]
+    fn a_silently_unwritten_artworkdb_after_a_rearrangement_fails_verification_and_restore_repairs_it()
+     {
+        use std::os::unix::fs::PermissionsExt;
+        let mut w = art_world(4);
+        let ithmb_before = ithmbs(&w);
+        let art_before = artwork_dir(&w);
+        let covers_before = read_covers(&w.root);
+        let doomed = w.file_of(dbid(1));
+        assert!(doomed.is_file());
+        let target = w.root.join("iPod_Control/Artwork/ArtworkDB");
+        // The file read-only is not enough (libgpod replaces it); the folder
+        // is read-only too, so ArtworkDB can be neither written nor replaced,
+        // while the existing .ithmb files are still rewritten in place.
+        let art_dir = w.root.join("iPod_Control/Artwork");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&art_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::OpenOptions::new().append(true).open(&target).is_ok()
+            || fs::File::create(art_dir.join(".probe")).is_ok()
+        {
+            let _ = fs::remove_file(art_dir.join(".probe"));
+            fs::set_permissions(&art_dir, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("running as root: permissions do not block writes, test skipped");
+            return;
+        }
+        let res = sync_removing_the_first_track(&mut w);
+        fs::set_permissions(&art_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Set up: the .ithmb files moved, ArtworkDB did not.
+        assert_ne!(ithmbs(&w), ithmb_before, "set up: libgpod moved thumbnails");
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            art_before[Path::new("ArtworkDB")],
+            "set up: ArtworkDB was not rewritten"
+        );
+
+        let e = res.unwrap_err();
+        let stamp = w.backups().last().unwrap().stamp.clone();
+        match &e {
+            Error::Verification { stamp: s, problems } => {
+                assert_eq!(*s, stamp);
+                assert!(!problems.is_empty());
+            }
+            other => panic!("expected Verification, got {other}"),
+        }
+        assert!(e.is_check_failure(), "exit code 3");
+        assert!(doomed.is_file(), "the removed track's file was not deleted");
+
+        // The backup puts the covers right.
+        assert_ne!(read_covers(&w.root), covers_before, "set up: scrambled");
+        let b = w.backups().pop().unwrap();
+        backup::restore_files(&b, &w.root).unwrap();
+        assert_eq!(ithmbs(&w), ithmb_before);
+        assert_eq!(read_covers(&w.root), covers_before);
+    }
+
+    // An iPod with .ithmb files nothing points at (no track has a cover) is
+    // not refused, and the files are left as they are by a playlist edit.
+    #[test]
+    fn leftover_ithmb_files_no_track_points_at_do_not_stop_a_sync() {
+        let w = World::new(3);
+        let dir = w.root.join("iPod_Control/Artwork");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("F1060_1.ithmb"), vec![9u8; 2048]).unwrap();
+        mix_gets_a_second_track(&w);
+        w.sync().unwrap();
+        assert_eq!(w.playlist("Mix").unwrap(), vec![dbid(1), dbid(2)]);
+        assert_eq!(
+            fs::read(dir.join("F1060_1.ithmb")).unwrap(),
+            vec![9u8; 2048]
+        );
+    }
+
+    // ---- exec::restore refuses before it changes anything (audit H3)
+
+    /// A sync removed a track with a cover (so the live `.ithmb` files differ
+    /// from the backup's), and the iPod has played since: a live Play Counts.
+    fn removed_with_art_and_played() -> (World, backup::Backup) {
+        let mut w = art_world(4);
+        sync_removing_the_first_track(&mut w).unwrap();
+        w.write_play_counts(&[
+            (2, 1_700_000_000, 0, 0),
+            (1, 1_700_000_100, 0, 0),
+            (0, 0, 0, 0),
+            (0, 0, 0, 0),
+        ]);
+        let b = w.backups().pop().unwrap();
+        (w, b)
+    }
+
+    /// The listed files whose live content differs, with their store paths.
+    fn needed_store_files(w: &World, b: &backup::Backup) -> Vec<(String, PathBuf)> {
+        backup::artwork_list(&b.dir)
+            .unwrap()
+            .into_iter()
+            .filter(|i| {
+                fs::read(w.root.join("iPod_Control/Artwork").join(&i.name))
+                    .map(|live| blake3::hash(&live).to_hex().to_string() != i.hash)
+                    .unwrap_or(true)
+            })
+            .map(|i| (i.name, store_of(w).join(i.hash)))
+            .collect()
+    }
+
+    fn backup_folders(w: &World) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(backups_dir(w).join(GUID))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Runs `exec::restore` and checks that it refused and changed nothing.
+    fn refused_restore_changes_nothing(w: &World, b: &backup::Backup) -> Error {
+        let counts = w.root.join("iPod_Control/iTunes/Play Counts");
+        let counts_before = fs::read(&counts).unwrap();
+        let tree_before = w.tree();
+        let folders_before = backup_folders(w);
+        let e = restore(w, &b.stamp, false).unwrap_err();
+        assert_eq!(
+            devices::restoring(w.env.store.conn(), w.device()).unwrap(),
+            None,
+            "no restore marker"
+        );
+        assert_eq!(
+            fs::read(&counts).unwrap(),
+            counts_before,
+            "Play Counts stays"
+        );
+        assert_eq!(w.stats_total_plays(), 0, "no stats pulled");
+        assert_eq!(w.pending_pulls(), 0);
+        assert_eq!(backup_folders(w), folders_before, "no new backup folder");
+        assert_eq!(w.tree(), tree_before, "the iPod is unchanged");
+        e
+    }
+
+    fn a_sync_still_goes_through(w: &World) {
+        w.write_list("Mix", &[w.files[2].clone(), w.files[3].clone()]);
+        w.reload();
+        w.sync()
+            .expect("a sync is not blocked after a refused restore");
+    }
+
+    #[test]
+    fn restore_with_an_unreadable_artwork_list_refuses_before_changing_anything() {
+        let (w, b) = removed_with_art_and_played();
+        assert!(!needed_store_files(&w, &b).is_empty(), "set up");
+        fs::write(b.dir.join("artwork.json"), "{ not json").unwrap();
+        let e = refused_restore_changes_nothing(&w, &b);
+        assert!(
+            matches!(&e, Error::Io { path, .. } if path.ends_with("artwork.json")),
+            "{e}"
+        );
+        a_sync_still_goes_through(&w);
+    }
+
+    #[test]
+    fn restore_with_a_deleted_store_file_refuses_before_changing_anything() {
+        let (w, b) = removed_with_art_and_played();
+        let needed = needed_store_files(&w, &b);
+        assert!(!needed.is_empty(), "set up");
+        let gone = &needed[0].1;
+        fs::remove_file(gone).unwrap();
+        let e = refused_restore_changes_nothing(&w, &b);
+        match &e {
+            Error::Io { path, source } => {
+                assert_eq!(path, gone);
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected Io NotFound, got {other}"),
+        }
+        a_sync_still_goes_through(&w);
+    }
+
+    #[test]
+    fn restore_without_room_for_its_copies_refuses_before_changing_anything() {
+        let (w, b) = removed_with_art_and_played();
+        let (name, _) = needed_store_files(&w, &b).remove(0);
+        let path = b.dir.join("artwork.json");
+        let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for item in v.as_array_mut().unwrap() {
+            if item["name"] == name.as_str() {
+                item["size"] = (1u64 << 62).into();
+            }
+        }
+        fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        let e = refused_restore_changes_nothing(&w, &b);
+        match &e {
+            Error::NoRoomToRestore { needed, free } => assert!(needed > free, "{e}"),
+            other => panic!("expected NoRoomToRestore, got {other}"),
+        }
+        a_sync_still_goes_through(&w);
+    }
+
+    #[test]
+    fn restore_with_a_truncated_store_file_refuses_before_changing_anything() {
+        let (w, b) = removed_with_art_and_played();
+        let needed = needed_store_files(&w, &b);
+        assert!(!needed.is_empty(), "set up");
+        let victim = &needed[0].1;
+        let bytes = fs::read(victim).unwrap();
+        assert!(bytes.len() > 1, "set up");
+        fs::write(victim, &bytes[..bytes.len() / 2]).unwrap();
+        let e = refused_restore_changes_nothing(&w, &b);
+        assert!(
+            matches!(&e, Error::BackupMismatch(p) if p == victim),
+            "expected BackupMismatch, got {e}"
+        );
+        a_sync_still_goes_through(&w);
     }
 }

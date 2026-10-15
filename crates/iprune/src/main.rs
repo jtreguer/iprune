@@ -775,7 +775,7 @@ fn run_restore(
     }
     println!(
         "restored {} and read it back; mappings back to {} tracks and {} playlists",
-        r.files.join(" and "),
+        r.files.join(", "),
         r.tracks,
         r.playlists
     );

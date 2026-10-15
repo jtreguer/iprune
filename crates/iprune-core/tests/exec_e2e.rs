@@ -1103,17 +1103,8 @@ fn restore(w: &World, stamp: &str) -> iprune_core::Result<exec::Restored> {
     exec::restore(w.env.store.conn(), &w.paths, &w.root, GUID, stamp, false)
 }
 
-/// Like `exec::restore`, trying again while the iPod lock reports busy. The
-/// tests start helper programs from other threads; one forked at the wrong
-/// moment holds a copy of a just released lock file for a few milliseconds.
 fn restore_with(w: &World, stamp: &str, discard: bool) -> iprune_core::Result<exec::Restored> {
-    for _ in 0..200 {
-        match exec::restore(w.env.store.conn(), &w.paths, &w.root, GUID, stamp, discard) {
-            Err(Error::IpodBusy) => std::thread::sleep(std::time::Duration::from_millis(5)),
-            other => return other,
-        }
-    }
-    unreachable!("the iPod lock stayed busy")
+    exec::restore(w.env.store.conn(), &w.paths, &w.root, GUID, stamp, discard)
 }
 
 fn mapping_view(w: &World) -> MappingView {

@@ -41,8 +41,14 @@ fn lock_file(paths: &Paths) -> PathBuf {
     paths.data_dir.join("ipod.lock")
 }
 
-/// Takes the lock without waiting; refused with [`Error::IpodBusy`] while
-/// another iprune holds it.
+/// How long [`ipod`] waits for a lock held only briefly: a program started
+/// by another thread of this process holds a copy of the lock's file until
+/// it runs, for a few milliseconds after the lock was released. Another
+/// iprune holds it for the length of a sync.
+const BRIEF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Takes the lock, waiting at most [`BRIEF`]; refused with
+/// [`Error::IpodBusy`] while another iprune holds it.
 pub fn ipod(paths: &Paths) -> Result<IpodLock> {
     std::fs::create_dir_all(&paths.data_dir).at(&paths.data_dir)?;
     let path = lock_file(paths);
@@ -52,13 +58,23 @@ pub fn ipod(paths: &Paths) -> Result<IpodLock> {
         .write(true)
         .open(&path)
         .at(&path)?;
-    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(IpodLock { _file: file, path }),
-        Err(e) if e == rustix::io::Errno::WOULDBLOCK => Err(Error::IpodBusy),
-        Err(e) => Err(Error::Io {
-            path,
-            source: e.into(),
-        }),
+    let start = std::time::Instant::now();
+    loop {
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(IpodLock { _file: file, path }),
+            Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
+                if start.elapsed() >= BRIEF {
+                    return Err(Error::IpodBusy);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(Error::Io {
+                    path,
+                    source: e.into(),
+                });
+            }
+        }
     }
 }
 

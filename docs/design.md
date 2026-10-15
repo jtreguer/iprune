@@ -51,8 +51,9 @@ predictable is worse than no sync tool.**
 ## 4. Non-goals
 
 - Playback, and any integration with music players (Rhythmbox, Strawberry).
-- Cover art. Artwork already on the iPod is left as it is; iprune never adds
-  or changes artwork.
+- Cover art. iprune never adds or edits artwork. libgpod still rewrites the
+  artwork files when it writes the database, so iprune backs them up with
+  the database and refuses to write when it cannot read them.
 - Importing statistics from the iTunes export. The iPod's counts are used.
 - Tag editing. Use a tag editor (Picard, Kid3, beets); iprune rereads tags.
 - Video, podcasts, audiobooks, photos.
@@ -328,5 +329,6 @@ Answers to the questions left open in the first draft (2026-10-13):
    supported.
 2. Rhythmbox and Strawberry are out of scope. The `.m3u8` folder is the only
    place playlists live, and iprune is the tool that edits them.
-3. No cover art. iprune does not add, change or remove artwork.
+3. No cover art. iprune does not add or edit artwork; what libgpod rewrites
+   is backed up and restored with the database.
 4. Play statistics come from the iPod only. The iTunes export is not imported.

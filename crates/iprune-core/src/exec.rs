@@ -289,6 +289,29 @@ pub fn check_missing_files(plan: &Plan, mapped: usize, opts: Options) -> Result<
     Ok(())
 }
 
+/// Refuses to write a database whose artwork libgpod could not read. A
+/// missing or damaged `ArtworkDB` parses as tracks without thumbnails, and
+/// the write then deletes every `.ithmb` file no thumbnail refers to: all
+/// cover art. Seen as `.ithmb` files while no track holds a thumbnail and
+/// some point at an artwork entry (`mhii_link`) without one, or as many
+/// tracks doing so. `.ithmb` files no track points at are leftovers libgpod
+/// may delete: they are in the backup.
+pub fn check_artwork(db: &gpod::Database, mountpoint: &Path) -> Result<()> {
+    let (mut with, mut lost) = (0usize, 0usize);
+    for t in db.tracks() {
+        if t.has_thumbnails() {
+            with += 1;
+        } else if t.mhii_link() != 0 {
+            lost += 1;
+        }
+    }
+    let files = backup::ithmb_files(mountpoint)?.len();
+    if (files > 0 && with == 0 && lost > 0) || (lost > 5 && lost * 10 > with + lost) {
+        return Err(Error::ArtworkUnreadable { files, lost });
+    }
+    Ok(())
+}
+
 /// `work.json` in a backup: what the sync was about to apply.
 #[derive(Serialize)]
 struct WorkFile<'a> {
@@ -340,27 +363,30 @@ fn apply(db: &mut gpod::Database, ops: &[Op]) -> Result<HashMap<i64, u64>> {
     Ok(created)
 }
 
-/// Whether the iPod's database files still equal the backup's copies.
+/// Whether the iPod's database files, and the `.ithmb` files libgpod
+/// rewrites before them, still equal the backup's copies.
 fn untouched(backup: &Backup, mountpoint: &Path) -> bool {
-    [
-        ("iTunesDB", "iPod_Control/iTunes/iTunesDB"),
-        ("ArtworkDB", "iPod_Control/Artwork/ArtworkDB"),
-    ]
-    .iter()
-    .all(|(name, rel)| {
-        let (saved, now) = (
-            std::fs::read(backup.dir.join(name)),
-            std::fs::read(mountpoint.join(rel)),
-        );
-        match (saved, now) {
-            (Ok(a), Ok(b)) => a == b,
-            // A file absent from both is unchanged.
-            (Err(a), Err(b)) => {
-                a.kind() == std::io::ErrorKind::NotFound && b.kind() == std::io::ErrorKind::NotFound
+    backup::artwork_unchanged(&backup.dir, mountpoint)
+        && [
+            ("iTunesDB", "iPod_Control/iTunes/iTunesDB"),
+            ("ArtworkDB", "iPod_Control/Artwork/ArtworkDB"),
+        ]
+        .iter()
+        .all(|(name, rel)| {
+            let (saved, now) = (
+                std::fs::read(backup.dir.join(name)),
+                std::fs::read(mountpoint.join(rel)),
+            );
+            match (saved, now) {
+                (Ok(a), Ok(b)) => a == b,
+                // A file absent from both is unchanged.
+                (Err(a), Err(b)) => {
+                    a.kind() == std::io::ErrorKind::NotFound
+                        && b.kind() == std::io::ErrorKind::NotFound
+                }
+                _ => false,
             }
-            _ => false,
-        }
-    })
+        })
 }
 
 /// A checkpoint or the final write between a sync's changes and its record.
@@ -445,8 +471,13 @@ impl Writer<'_> {
         };
         let reread = gpod::Database::open(self.mountpoint)
             .map_err(|e| failed(vec![format!("the written database cannot be read: {e}")]))?;
-        let diffs = verify::differences(&expected, &snapshot(&reread)?, 20);
+        let mut diffs = verify::differences(&expected, &snapshot(&reread)?, 20);
         drop(reread);
+        if backup::artwork_left_behind(&self.backup.dir, self.mountpoint) {
+            diffs.push(
+                "the cover art files were rearranged but ArtworkDB was not rewritten".to_owned(),
+            );
+        }
         if !diffs.is_empty() {
             return Err(failed(diffs));
         }
@@ -544,6 +575,7 @@ pub fn sync(
     check_removals(&work.playlists, prepared.playlists_map.len(), opts)?;
     check_track_removals(&work.tracks, prepared.tracks_map.len(), opts)?;
     check_missing_files(&prepared.plan, prepared.tracks_map.len(), opts)?;
+    check_artwork(&db, mountpoint)?;
     if !work.tracks.copies.is_empty() && !prepared.plan.space.fits {
         return Err(Error::NoSpace);
     }
@@ -1064,6 +1096,8 @@ pub fn restore(
     device::check_writable(mountpoint)?;
     let device =
         devices::device_id(conn, guid)?.ok_or_else(|| Error::NotAdopted(guid.to_owned()))?;
+    // Its artwork list, its stored cover art and the room it needs.
+    let plan = backup::plan_restore(&backup, mountpoint)?;
 
     // What the iPod holds now, before anything changes.
     let current = gpod::Database::open(mountpoint).ok();
@@ -1124,7 +1158,7 @@ pub fn restore(
     // The pull stands from here: its `Play Counts` is gone from the iPod.
     let set_aside = backup::set_aside(&kept, mountpoint)?;
     stats::settle(conn, device)?;
-    let files = backup::restore_files(&backup, mountpoint)?;
+    let files = backup::restore_planned(&backup, mountpoint, plan)?;
     let reread = gpod::Database::open(mountpoint).map_err(|e| Error::RestoreVerification {
         problems: vec![format!("the restored database cannot be read: {e}")],
         stamp: stamp.to_owned(),

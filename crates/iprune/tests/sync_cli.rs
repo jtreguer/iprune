@@ -412,6 +412,8 @@ impl Sandbox {
         let mut v: Vec<String> = fs::read_dir(dir)
             .map(|d| {
                 d.map(|e| e.unwrap().file_name().into_string().unwrap())
+                    // Hidden: the `.ithmb` store, partial backups.
+                    .filter(|n| !n.starts_with('.'))
                     .collect()
             })
             .unwrap_or_default();
