@@ -908,11 +908,16 @@ fn versions(env: &Env) -> Vec<(String, i64)> {
 }
 
 /// Turns the index into one that the previous version of iprune left: no
-/// `tags_version` column, schema version 6. Opening it again migrates it.
+/// `tags_version` column nor iPod selections, schema version 6. Opening it
+/// again migrates it.
 fn downgrade_to_version_6(env: &mut Env) {
     let conn = env.store.conn();
-    conn.execute_batch("ALTER TABLE tracks DROP COLUMN tags_version")
-        .unwrap();
+    conn.execute_batch(
+        "ALTER TABLE tracks DROP COLUMN tags_version;
+         DROP TABLE device_scope_playlists;
+         ALTER TABLE devices DROP COLUMN scope;",
+    )
+    .unwrap();
     conn.pragma_update(None, "user_version", 6).unwrap();
     env.store = Store::open(&index_path(env)).unwrap();
 }

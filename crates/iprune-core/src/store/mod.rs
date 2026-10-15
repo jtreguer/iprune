@@ -20,6 +20,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0005_stable_ids.sql"),
     include_str!("migrations/0006_synced_rating.sql"),
     include_str!("migrations/0007_tags_version.sql"),
+    include_str!("migrations/0008_device_scope.sql"),
 ];
 
 /// First line of a migration that rebuilds tables: it runs with foreign
@@ -449,6 +450,11 @@ pub fn rename_playlist(conn: &Connection, old: &str, new: &str, file: &Path) -> 
         conn.execute(
             "UPDATE playlists SET name = ?2, file = ?3 WHERE name = ?1",
             params![old, new, path_str(file)],
+        )?;
+        // An iPod's selection names the playlist; it follows the rename.
+        conn.execute(
+            "UPDATE OR REPLACE device_scope_playlists SET name = ?2 WHERE name = ?1",
+            params![old, new],
         )?;
         Ok(())
     })

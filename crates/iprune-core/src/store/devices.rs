@@ -4,6 +4,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::Result;
 use crate::adopt::LibPlaylist;
+use crate::config::Scope;
 
 /// The device whose GUID is `guid`, spelled with or without `0x` and in
 /// either case: libgpod gives `0x…` from `SysInfo` and bare hex from
@@ -76,6 +77,71 @@ pub fn mapped_track_count(conn: &Connection, device_id: i64) -> Result<usize> {
         |r| r.get(0),
     )?;
     Ok(n as usize)
+}
+
+/// What an iPod syncs, as set for it from the window or `iprune scope`.
+/// `playlists` is sorted, and empty for [`Scope::All`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceScope {
+    pub kind: Scope,
+    pub playlists: Vec<String>,
+}
+
+/// The selection set for `device_id`; `None` when none was, and the iPod
+/// follows `[sync]` in the config.
+pub fn scope(conn: &Connection, device_id: i64) -> Result<Option<DeviceScope>> {
+    let kind: Option<String> = conn.query_row(
+        "SELECT scope FROM devices WHERE id = ?1",
+        [device_id],
+        |r| r.get(0),
+    )?;
+    let kind = match kind.as_deref() {
+        None => return Ok(None),
+        Some("all") => Scope::All,
+        Some("playlists") => Scope::Playlists,
+        Some("except") => Scope::Except,
+        Some(other) => {
+            return Err(crate::Error::BadScope(format!(
+                "the index holds an unknown selection {other:?} for this iPod"
+            )));
+        }
+    };
+    let mut stmt =
+        conn.prepare("SELECT name FROM device_scope_playlists WHERE device_id = ?1 ORDER BY name")?;
+    let playlists = stmt
+        .query_map([device_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Some(DeviceScope { kind, playlists }))
+}
+
+/// Sets what `device_id` syncs; `None` makes it follow the config again.
+pub fn set_scope(conn: &Connection, device_id: i64, scope: Option<&DeviceScope>) -> Result<()> {
+    crate::store::savepoint(conn, || {
+        let kind = scope.map(|s| match s.kind {
+            Scope::All => "all",
+            Scope::Playlists => "playlists",
+            Scope::Except => "except",
+        });
+        conn.execute(
+            "UPDATE devices SET scope = ?2 WHERE id = ?1",
+            params![device_id, kind],
+        )?;
+        conn.execute(
+            "DELETE FROM device_scope_playlists WHERE device_id = ?1",
+            [device_id],
+        )?;
+        for name in scope
+            .filter(|s| s.kind != Scope::All)
+            .map(|s| s.playlists.as_slice())
+            .unwrap_or_default()
+        {
+            conn.execute(
+                "INSERT OR IGNORE INTO device_scope_playlists (device_id, name) VALUES (?1, ?2)",
+                params![device_id, name],
+            )?;
+        }
+        Ok(())
+    })
 }
 
 /// One mapped track: the library id, the iPod's dbid, the iPod's tag hash

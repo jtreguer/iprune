@@ -10,8 +10,10 @@ use common::{Env, Kind};
 use iprune_core::Error;
 use iprune_core::adopt::{Adoption, IpodTrack, PlaylistAdoption, PlaylistMatch};
 use iprune_core::adoption::{self, Run};
+use iprune_core::config::Scope;
 use iprune_core::device::{Mount, parse_mountinfo};
 use iprune_core::ipod::{self, Contents};
+use iprune_core::playlists;
 use iprune_core::store::devices::{self, PlaylistMapping, TrackMapping};
 use iprune_core::store::{self, TrackRow};
 use iprune_core::tags::Tags;
@@ -636,4 +638,157 @@ fn a_forced_readoption_of_a_track_with_a_stats_row_but_no_rating_takes_the_ipods
         )
         .unwrap();
     assert_eq!((plays, rating), (7, Some(80)));
+}
+
+// ---- per-device scope
+
+fn sc(kind: Scope, names: &[&str]) -> devices::DeviceScope {
+    devices::DeviceScope {
+        kind,
+        playlists: names.iter().map(|n| (*n).to_owned()).collect(),
+    }
+}
+
+fn scope_rows(conn: &rusqlite::Connection, dev: i64) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM device_scope_playlists WHERE device_id = ?1 ORDER BY name")
+        .unwrap();
+    stmt.query_map([dev], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[test]
+fn a_new_device_has_no_scope_of_its_own() {
+    let env = Env::new();
+    let conn = env.store.conn();
+    let dev = devices::upsert_device(conn, "G1", None, None).unwrap();
+    assert_eq!(devices::scope(conn, dev).unwrap(), None);
+}
+
+#[test]
+fn a_scope_round_trips_for_each_kind_with_sorted_unique_names() {
+    let env = Env::new();
+    let conn = env.store.conn();
+    let dev = devices::upsert_device(conn, "G1", None, None).unwrap();
+    let cases = [
+        (
+            sc(Scope::Playlists, &["Zed", "Alpha", "Zed", "Mid"]),
+            sc(Scope::Playlists, &["Alpha", "Mid", "Zed"]),
+        ),
+        (
+            sc(Scope::Except, &["B", "A", "B"]),
+            sc(Scope::Except, &["A", "B"]),
+        ),
+        (sc(Scope::Playlists, &[]), sc(Scope::Playlists, &[])),
+        (sc(Scope::Except, &[]), sc(Scope::Except, &[])),
+        // All stores no names, even when given some.
+        (sc(Scope::All, &["Ignored"]), sc(Scope::All, &[])),
+    ];
+    for (set, want) in cases {
+        devices::set_scope(conn, dev, Some(&set)).unwrap();
+        assert_eq!(
+            devices::scope(conn, dev).unwrap(),
+            Some(want.clone()),
+            "{set:?}"
+        );
+        assert_eq!(scope_rows(conn, dev), want.playlists, "{set:?}");
+    }
+}
+
+#[test]
+fn setting_a_scope_replaces_the_names_and_none_clears_them() {
+    let env = Env::new();
+    let conn = env.store.conn();
+    let dev = devices::upsert_device(conn, "G1", None, None).unwrap();
+    devices::set_scope(conn, dev, Some(&sc(Scope::Playlists, &["A", "B"]))).unwrap();
+    devices::set_scope(conn, dev, Some(&sc(Scope::Except, &["C"]))).unwrap();
+    assert_eq!(scope_rows(conn, dev), vec!["C"]);
+    devices::set_scope(conn, dev, None).unwrap();
+    assert_eq!(devices::scope(conn, dev).unwrap(), None);
+    assert!(scope_rows(conn, dev).is_empty());
+}
+
+#[test]
+fn scopes_are_per_device() {
+    let env = Env::new();
+    let conn = env.store.conn();
+    let a = devices::upsert_device(conn, "G1", None, None).unwrap();
+    let b = devices::upsert_device(conn, "G2", None, None).unwrap();
+    devices::set_scope(conn, a, Some(&sc(Scope::Playlists, &["X", "Y"]))).unwrap();
+    devices::set_scope(conn, b, Some(&sc(Scope::Except, &["X"]))).unwrap();
+    assert_eq!(
+        devices::scope(conn, a).unwrap(),
+        Some(sc(Scope::Playlists, &["X", "Y"]))
+    );
+    assert_eq!(
+        devices::scope(conn, b).unwrap(),
+        Some(sc(Scope::Except, &["X"]))
+    );
+    // Changing or clearing one leaves the other alone.
+    devices::set_scope(conn, a, None).unwrap();
+    assert_eq!(devices::scope(conn, a).unwrap(), None);
+    assert_eq!(
+        devices::scope(conn, b).unwrap(),
+        Some(sc(Scope::Except, &["X"]))
+    );
+    devices::set_scope(conn, b, Some(&sc(Scope::All, &[]))).unwrap();
+    assert_eq!(devices::scope(conn, a).unwrap(), None);
+}
+
+#[test]
+fn an_unknown_stored_kind_is_a_bad_scope_not_a_default() {
+    let env = Env::new();
+    let conn = env.store.conn();
+    let dev = devices::upsert_device(conn, "G1", None, None).unwrap();
+    conn.execute("UPDATE devices SET scope = 'sideways' WHERE id = ?1", [dev])
+        .unwrap();
+    let err = devices::scope(conn, dev).unwrap_err();
+    assert!(
+        matches!(err, Error::BadScope(ref m) if m.contains("sideways")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn renaming_a_playlist_renames_it_in_every_devices_scope() {
+    let env = Env::new();
+    let conn = env.store.conn();
+    playlists::create(conn, &env.cfg, "Old").unwrap();
+    playlists::create(conn, &env.cfg, "Other").unwrap();
+    let a = devices::upsert_device(conn, "G1", None, None).unwrap();
+    let b = devices::upsert_device(conn, "G2", None, None).unwrap();
+    let c = devices::upsert_device(conn, "G3", None, None).unwrap();
+    devices::set_scope(conn, a, Some(&sc(Scope::Playlists, &["Old", "Other"]))).unwrap();
+    devices::set_scope(conn, b, Some(&sc(Scope::Except, &["Old"]))).unwrap();
+    devices::set_scope(conn, c, Some(&sc(Scope::Playlists, &["Other"]))).unwrap();
+    playlists::rename(conn, &env.cfg, "Old", "New").unwrap();
+    assert_eq!(
+        devices::scope(conn, a).unwrap(),
+        Some(sc(Scope::Playlists, &["New", "Other"]))
+    );
+    assert_eq!(
+        devices::scope(conn, b).unwrap(),
+        Some(sc(Scope::Except, &["New"]))
+    );
+    assert_eq!(
+        devices::scope(conn, c).unwrap(),
+        Some(sc(Scope::Playlists, &["Other"]))
+    );
+}
+
+#[test]
+fn renaming_onto_a_name_already_in_the_scope_leaves_one_entry() {
+    let env = Env::new();
+    let conn = env.store.conn();
+    playlists::create(conn, &env.cfg, "Old").unwrap();
+    // "New" has no file, but the scope still lists it.
+    let a = devices::upsert_device(conn, "G1", None, None).unwrap();
+    devices::set_scope(conn, a, Some(&sc(Scope::Playlists, &["New", "Old"]))).unwrap();
+    playlists::rename(conn, &env.cfg, "Old", "New").unwrap();
+    assert_eq!(
+        devices::scope(conn, a).unwrap(),
+        Some(sc(Scope::Playlists, &["New"]))
+    );
 }

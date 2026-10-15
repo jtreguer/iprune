@@ -13,8 +13,8 @@ macro_rules! say {
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use iprune_core::config::{Config, PathStyle, Paths};
-use iprune_core::store::Store;
+use iprune_core::config::{Config, PathStyle, Paths, Scope as ConfigScope};
+use iprune_core::store::{Store, devices};
 use iprune_core::{adoption, backup, device, exec, playlists, scan, sync};
 
 /// Exit code when the user answers no to a confirmation.
@@ -121,6 +121,17 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Show or set what an iPod syncs: the whole library, only some
+    /// playlists, or all but some. Each iPod has its own; one never set
+    /// follows [sync] in the config.
+    Scope {
+        #[command(subcommand)]
+        set: Option<ScopeCommand>,
+        /// The iPod, by its GUID as `iprune backups` lists it, instead of
+        /// the connected one.
+        #[arg(long, value_name = "GUID", global = true)]
+        guid: Option<String>,
+    },
     /// List and edit playlists.
     #[command(subcommand)]
     Playlist(PlaylistCommand),
@@ -175,6 +186,24 @@ enum PlaylistCommand {
         from: usize,
         to: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum ScopeCommand {
+    /// Sync the whole library.
+    All,
+    /// Sync only these playlists and their tracks.
+    Only {
+        #[arg(required = true)]
+        playlists: Vec<String>,
+    },
+    /// Sync the whole library but these playlists and their tracks.
+    Except {
+        #[arg(required = true)]
+        playlists: Vec<String>,
+    },
+    /// Follow [sync] in the config again.
+    Default,
 }
 
 /// Whether a command ran to the end or the user declined.
@@ -815,6 +844,72 @@ fn run_backups() -> Result<()> {
     Ok(())
 }
 
+fn run_scope(set: Option<&ScopeCommand>, guid: Option<&str>) -> Result<()> {
+    let (config, store) = load()?;
+    let conn = store.conn();
+    let (guid, mountpoint) = match guid {
+        Some(g) => (g.to_owned(), None),
+        None => {
+            let mp = find_mountpoint(&config)?;
+            let g = device::firewire_guid(&mp).ok_or(iprune_core::Error::NoFirewireGuid)?;
+            (g, Some(mp))
+        }
+    };
+    let id = devices::device_id(conn, &guid)?
+        .ok_or_else(|| iprune_core::Error::NotAdopted(guid.clone()))?;
+    playlists::sync_from_disk(conn, &config, false)?;
+    let library = iprune_core::store::all_tracks(conn)?;
+    let lists = devices::library_playlists(conn)?;
+    let chosen = |kind, names: &[String]| {
+        let mut playlists = names.to_vec();
+        playlists.sort();
+        playlists.dedup();
+        devices::DeviceScope { kind, playlists }
+    };
+    let new = match set {
+        None => None,
+        Some(ScopeCommand::All) => Some(Some(chosen(ConfigScope::All, &[]))),
+        Some(ScopeCommand::Only { playlists }) => {
+            Some(Some(chosen(ConfigScope::Playlists, playlists)))
+        }
+        Some(ScopeCommand::Except { playlists }) => {
+            Some(Some(chosen(ConfigScope::Except, playlists)))
+        }
+        Some(ScopeCommand::Default) => Some(None),
+    };
+    if let Some(new) = new {
+        if let Some(why) = new
+            .as_ref()
+            .and_then(|s| sync::scope_problem(s, true, &library, &lists))
+        {
+            bail!("{why}; nothing changed");
+        }
+        devices::set_scope(conn, id, new.as_ref())?;
+    }
+    let (scope, own) = sync::device_scope(conn, &config, id)?;
+    let row = devices::devices(conn)?.into_iter().find(|d| d.id == id);
+    let name = row
+        .as_ref()
+        .and_then(|d| d.name.clone())
+        .unwrap_or_else(|| "iPod".into());
+    let guid = row.map_or(guid, |d| d.firewire_guid);
+    let mut out = io::stdout().lock();
+    writeln!(out, "{name} ({guid})")?;
+    let from = if own {
+        "set for this iPod"
+    } else {
+        "from [sync] in the config"
+    };
+    writeln!(out, "syncs {}, {from}", scope.describe())?;
+    let (tracks, bytes) = scope.size(&library, &lists);
+    let room = mountpoint
+        .and_then(|m| sync::space(&m).ok())
+        .map(|s| format!("; the iPod holds {}", sync::bytes(s.capacity)))
+        .unwrap_or_default();
+    writeln!(out, "{tracks} tracks, {}{room}", sync::bytes(bytes))?;
+    Ok(())
+}
+
 fn run_restore(
     stamp: &str,
     guid: Option<&str>,
@@ -1080,6 +1175,9 @@ fn main() -> ExitCode {
             *discard_play_counts,
             *yes,
         ),
+        Command::Scope { set, guid } => {
+            run_scope(set.as_ref(), guid.as_deref()).map(|()| Outcome::Done)
+        }
         Command::Playlist(cmd) => playlist(cmd),
         Command::Snapshot { path } => snapshot(path).map(|()| Outcome::Done),
     };

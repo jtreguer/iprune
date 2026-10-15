@@ -166,9 +166,9 @@ exclude_extensions = ["m4v", "mp4", "mov"]
 dir = "/mnt/seagate-1tb/Playlists"
 path_style = "absolute"          # or "relative" to the playlists dir
 
-[sync]
-scope = "all"                    # or "playlists"
-playlists = []                   # used when scope = "playlists"
+[sync]                           # for an iPod with no selection of its own
+scope = "all"                    # or "playlists", or "except"
+playlists = []                   # kept ("playlists") or left out ("except")
 remove_unmanaged = false
 keep_backups = 20
 
@@ -240,7 +240,15 @@ CREATE TABLE devices (
   firewire_guid TEXT NOT NULL UNIQUE,
   name TEXT, model TEXT,
   last_sync_at  INTEGER,
-  restoring     TEXT                          -- stamp of an unfinished restore
+  restoring     TEXT,                         -- stamp of an unfinished restore
+  scope         TEXT                          -- 'all', 'playlists', 'except';
+                                              -- NULL follows [sync]
+);
+
+CREATE TABLE device_scope_playlists (           -- the playlists a scope names
+  device_id INTEGER NOT NULL REFERENCES devices(id),
+  name      TEXT NOT NULL,
+  PRIMARY KEY (device_id, name)
 );
 
 CREATE TABLE device_tracks (
@@ -538,8 +546,11 @@ pub fn plan(input: &PlanInput) -> Plan;
 
 Rules, in the order the planner applies them:
 
-1. Scope: every present track, or the present members of the configured
-   playlists.
+1. Scope: every present track; the present members of the playlists
+   kept; or every present track except the members of the playlists left
+   out, even when another playlist holds them. The scope is the iPod's
+   own (`devices.scope`), else `[sync]` in the config. Only the playlists
+   kept, or all but those left out, go to the iPod.
 2. A track in scope with no mapping, or whose mapped dbid is gone from the
    iPod (a stale mapping), is copied. An unmapped FairPlay file is skipped:
    the iPod may not be authorised to play it. Section 18 has the open
@@ -595,8 +606,15 @@ removed only after its new copy is written. The peak, bytes copied minus
 bytes removed, must fit in the iPod's free space with a margin of 1% of its
 capacity; otherwise `fits` is false and the plan must not be applied.
 
-`prepare` refuses a `playlists` scope that is empty or names a playlist that
-does not exist, since it would plan the removal of every managed track. For
+`prepare` refuses a `playlists` scope that is empty, holds no present
+track or names a playlist that does not exist, since it would plan the
+removal of every managed track, and an `except` scope that names a
+playlist that does not exist or leaves out every present track. Renaming
+a playlist with iprune renames it in every iPod's scope. A deleted
+playlist, or one renamed by another program, keeps its old name there,
+and the iPod is refused until its scope is changed: dropping the name
+silently would remove the playlist's tracks from an iPod that kept only
+some playlists. For
 M4: the executor also asks for confirmation, and a plan that removes more
 than a tenth of the managed tracks needs an explicit flag.
 
@@ -943,6 +961,7 @@ iprune scan
 iprune adopt [--file <iTunesDB>] [--accept-proposals]
 iprune sync [--plan-only] [--verbose] [--json] [--yes] [--allow-mass-removal]
 iprune playlist list|show|new|rm|rename|add|remove|move ...
+iprune scope [all | only PLAYLIST... | except PLAYLIST... | default] [--guid GUID]
 iprune device info
 iprune backups
 iprune restore <stamp> [--guid GUID] [--mountpoint DIR] [--discard-play-counts] [--yes]
@@ -951,6 +970,11 @@ iprune snapshot <mountpoint|iTunesDB>
 iprune eject
 iprune                    (no arguments: prints help; the window is iprune-gui)
 ```
+
+`scope` shows or sets what an adopted iPod syncs, the connected one or
+the one `--guid` names, with the number of tracks and bytes it selects
+and, when connected, the iPod's size. `default` makes it follow `[sync]`
+again. A scope that `prepare` would refuse is not saved.
 
 `init --force` changes an existing config: the library folders and the
 playlists folder given replace the old ones, `--path-style` when given, and
@@ -1058,6 +1082,12 @@ library file for two iPod tracks, or one an accepted match holds, is shown
 and Save refused until resolved (`adopt::resolve_choices`). Save checks the
 iPod mounted is still the one reviewed and calls `adoption::choose` and
 `adoption::save`; an iPod already adopted is refused, as without `--force`.
+An adopted iPod, connected or not, gets a Selection button: a dialog of
+three choices (the whole library, only the playlists checked, the whole
+library except them), the playlists with a filter, and the number of
+tracks and bytes selected against the iPod's size, updated as boxes are
+checked. Save stores the scope for that iPod as `iprune scope` does; the
+panel shows it in a few words.
 Eject runs `device::eject` on a worker: the block device mounted at the
 mountpoint, from mountinfo, is unmounted then powered off with `udisksctl`.
 Sync, Adopt and Eject share one busy flag: one of them at a time. Across

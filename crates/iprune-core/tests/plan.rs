@@ -103,6 +103,8 @@ struct World {
     playlists_map: Vec<PlaylistMapping>,
     /// `Some(names)` is `Scope::Playlists(names)`.
     scope: Option<Vec<String>>,
+    /// `Some(names)` is `Scope::Except(names)`; wins over `scope`.
+    except: Option<Vec<String>>,
     remove_unmanaged: bool,
     space: Option<Space>,
     files_missing: std::collections::HashSet<u64>,
@@ -164,6 +166,7 @@ impl World {
 
     fn plan(&self) -> Plan {
         let names = self.scope.clone();
+        let except = self.except.clone();
         plan::plan(&PlanInput {
             library: &self.library,
             playlists: &self.playlists,
@@ -171,9 +174,10 @@ impl World {
             device: &self.device,
             tracks_map: &self.tracks_map,
             playlists_map: &self.playlists_map,
-            scope: match &names {
-                None => Scope::All,
-                Some(n) => Scope::Playlists(n),
+            scope: match (&except, &names) {
+                (Some(n), _) => Scope::Except(n),
+                (None, None) => Scope::All,
+                (None, Some(n)) => Scope::Playlists(n),
             },
             remove_unmanaged: self.remove_unmanaged,
             space: self.space,
@@ -2249,4 +2253,154 @@ fn a_new_playlist_with_no_ipod_namesake_is_no_takeover() {
     w.ipod_playlist(7, "Other", &[0xA2]);
     w.playlist(10, "Mix", &ids(&[1]), None);
     assert!(w.plan().takeovers.is_empty());
+}
+
+// ---- Except scope
+
+fn strings(names: &[&str]) -> Vec<String> {
+    names.iter().map(|n| (*n).to_owned()).collect()
+}
+
+/// Prevents an excluded playlist's tracks reaching the iPod through a kept
+/// playlist that also holds them.
+#[test]
+fn except_keeps_a_track_off_even_when_a_kept_playlist_holds_it() {
+    let mut w = World::default();
+    w.fresh(1).fresh(2).fresh(3).fresh(4);
+    w.playlist(10, "Kids", &ids(&[1, 2]), None);
+    w.playlist(11, "Keep", &ids(&[2, 3]), None);
+    w.except = Some(strings(&["Kids"]));
+    let p = w.plan();
+    let copied: Vec<i64> = p.copy.iter().map(|c| c.track_id).collect();
+    assert_eq!(copied, vec![3, 4]);
+    assert_eq!(p.expected.track_count, 2);
+    // Only the kept playlist is created, with the track in scope.
+    assert_eq!(names(&p), vec![("create", "Keep".to_owned())]);
+    let PlaylistOp::Create { members, .. } = &p.playlists[0] else {
+        panic!("{:?}", p.playlists)
+    };
+    assert_eq!(members, &vec![Member::New(3)]);
+    // The member left out of the kept playlist is reported, once.
+    assert_eq!(
+        p.entries_skipped,
+        vec![EntrySkipped {
+            playlist: "Keep".into(),
+            position: 1,
+            reason: EntryReason::TrackSkipped,
+        }]
+    );
+}
+
+#[test]
+fn except_deletes_a_mapped_excluded_playlist_and_removes_its_tracks() {
+    let mut w = World::default();
+    w.synced(1, 0xA1).synced(2, 0xA2).synced(3, 0xA3);
+    w.ipod_playlist(7, "Kids", &[0xA1, 0xA2]);
+    w.ipod_playlist(8, "Keep", &[0xA2, 0xA3]);
+    w.playlist(10, "Kids", &ids(&[1, 2]), Some("Kids"));
+    w.playlist(11, "Keep", &ids(&[2, 3]), Some("Keep"));
+    w.except = Some(strings(&["Kids"]));
+    let p = w.plan();
+    assert_eq!(
+        p.playlists[0],
+        PlaylistOp::Delete {
+            playlist_id: Some(10),
+            ipod_id: 7,
+            name: "Kids".into(),
+            reason: PlaylistDeleteReason::OutOfScope,
+        }
+    );
+    let removed: Vec<(u64, RemoveReason)> = p.remove.iter().map(|r| (r.dbid, r.reason)).collect();
+    assert_eq!(
+        removed,
+        vec![
+            (0xA1, RemoveReason::OutOfScope),
+            (0xA2, RemoveReason::OutOfScope)
+        ]
+    );
+    assert!(p.copy.is_empty());
+    // The kept playlist stays, now with the one track left.
+    let keep = p
+        .expected
+        .playlists
+        .iter()
+        .find(|e| e.name == "Keep")
+        .unwrap();
+    assert_eq!(keep.members, vec![Member::Track(0xA3)]);
+    assert_eq!(p.expected.track_count, 1);
+    assert!(p.expected.playlists.iter().all(|e| e.name != "Kids"));
+}
+
+#[test]
+fn except_naming_nothing_plans_exactly_what_all_plans() {
+    let mut w = World::default();
+    w.synced(1, 0xA1).fresh(2).fresh(3);
+    w.ipod_playlist(7, "Mix", &[0xA1]);
+    w.playlist(10, "Mix", &ids(&[1, 2]), Some("Mix"));
+    w.playlist(11, "Other", &ids(&[3]), None);
+    let all = w.plan();
+    w.except = Some(Vec::new());
+    assert_eq!(w.plan(), all);
+}
+
+#[test]
+fn except_naming_a_playlist_that_does_not_exist_excludes_nothing() {
+    let mut w = World::default();
+    w.fresh(1).playlist(10, "Mix", &ids(&[1]), None);
+    w.except = Some(strings(&["Nope"]));
+    assert_eq!(w.plan().copy.len(), 1);
+}
+
+#[test]
+fn in_scope_cases() {
+    let mut library: Vec<TrackRow> = (1..=4).map(|i| lib_track(i, SIZE, MS)).collect();
+    library[3].missing_since = Some(9);
+    let lists = vec![
+        lib_playlist(10, "A", &[Some(1), Some(2), None]),
+        lib_playlist(11, "B", &[Some(2), Some(4)]),
+    ];
+    let a = strings(&["A"]);
+    let ab = strings(&["A", "B"]);
+    let ghost = strings(&["Ghost"]);
+    let cases: Vec<(&str, Scope, Vec<i64>)> = vec![
+        ("all skips missing", Scope::All, vec![1, 2, 3]),
+        ("only A", Scope::Playlists(&a), vec![1, 2]),
+        (
+            "only A and B ignores the missing member",
+            Scope::Playlists(&ab),
+            vec![1, 2],
+        ),
+        ("only a ghost", Scope::Playlists(&ghost), vec![]),
+        ("except A", Scope::Except(&a), vec![3]),
+        ("except A and B", Scope::Except(&ab), vec![3]),
+        ("except a ghost", Scope::Except(&ghost), vec![1, 2, 3]),
+        ("except nothing", Scope::Except(&[]), vec![1, 2, 3]),
+    ];
+    for (what, scope, want) in cases {
+        let got: Vec<i64> = plan::in_scope(&library, &lists, scope)
+            .into_iter()
+            .collect();
+        assert_eq!(got, want, "{what}");
+    }
+}
+
+#[test]
+fn takes_playlist_per_kind() {
+    let kept = strings(&["Kept"]);
+    let cases = [
+        (Scope::All, "Kept", true),
+        (Scope::All, "Other", true),
+        (Scope::Playlists(&kept), "Kept", true),
+        (Scope::Playlists(&kept), "Other", false),
+        (Scope::Playlists(&[]), "Kept", false),
+        (Scope::Except(&kept), "Kept", false),
+        (Scope::Except(&kept), "Other", true),
+        (Scope::Except(&[]), "Kept", true),
+        // Names are compared exactly.
+        (Scope::Playlists(&kept), "kept", false),
+        (Scope::Except(&kept), "kept", true),
+    ];
+    for (scope, name, want) in cases {
+        assert_eq!(scope.takes_playlist(name), want, "{scope:?} {name}");
+    }
 }

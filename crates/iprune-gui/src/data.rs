@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
-use iprune_core::config::{Config, Paths};
+use iprune_core::adopt::LibPlaylist;
+use iprune_core::config::{Config, Paths, Scope};
 use iprune_core::stats::{self, TrackStats};
-use iprune_core::store::{self, Store, devices};
+use iprune_core::store::{self, Store, TrackRow, devices};
 use iprune_core::{device, playlists, sync};
 
 use crate::view_model::{self, Row};
@@ -33,6 +34,21 @@ pub struct DeviceInfo {
     pub free: Option<u64>,
     pub capacity: Option<u64>,
     pub last_sync: Option<i64>,
+    /// The device row of an adopted iPod.
+    pub id: Option<i64>,
+    /// What it syncs, in a few words, for an adopted iPod.
+    pub selection: Option<String>,
+}
+
+/// A selection in a few words, for the sidebar.
+pub fn selection_summary(s: &devices::DeviceScope) -> String {
+    let n = s.playlists.len();
+    let playlists = if n == 1 { "playlist" } else { "playlists" };
+    match s.kind {
+        Scope::Playlists => format!("syncs {n} {playlists}"),
+        Scope::Except if n > 0 => format!("syncs all but {n} {playlists}"),
+        Scope::All | Scope::Except => "syncs the whole library".into(),
+    }
 }
 
 impl Data {
@@ -168,6 +184,30 @@ impl Data {
         Ok(playlists::delete(self.store.conn(), &self.config, name)?)
     }
 
+    /// What the iPod `id` syncs, and whether it was set for it (false: it
+    /// follows the config).
+    pub fn selection(&self, id: i64) -> Result<(devices::DeviceScope, bool)> {
+        Ok(sync::device_scope(self.store.conn(), &self.config, id)?)
+    }
+
+    /// The library and playlists a selection is sized against.
+    pub fn selection_inputs(&self) -> Result<(Vec<TrackRow>, Vec<LibPlaylist>)> {
+        let conn = self.store.conn();
+        Ok((store::all_tracks(conn)?, devices::library_playlists(conn)?))
+    }
+
+    /// Sets what the iPod `id` syncs. Refuses a selection that names a
+    /// playlist that is gone or keeps playlists holding no track.
+    pub fn set_selection(&self, id: i64, s: &devices::DeviceScope) -> Result<()> {
+        let conn = self.store.conn();
+        let (library, lists) = self.selection_inputs()?;
+        if let Some(why) = sync::scope_problem(s, true, &library, &lists) {
+            bail!("{why}");
+        }
+        devices::set_scope(conn, id, Some(s))?;
+        Ok(())
+    }
+
     /// The iPod to show: a mounted one that iprune adopted, else a mounted
     /// one it did not, else the first adopted one, not connected.
     pub fn device(&self) -> Result<Option<DeviceInfo>> {
@@ -203,6 +243,10 @@ impl Data {
                 free: space.map(|s| s.free),
                 capacity: space.map(|s| s.capacity),
                 last_sync: row.last_sync_at,
+                id: Some(row.id),
+                selection: Some(selection_summary(
+                    &sync::device_scope(conn, &self.config, row.id)?.0,
+                )),
             })
         };
         if let Some((m, row)) = mounted.iter().find_map(|(m, g)| Some((m, known_of(g)?))) {
@@ -218,6 +262,8 @@ impl Data {
                 free: space.map(|s| s.free),
                 capacity: space.map(|s| s.capacity),
                 last_sync: None,
+                id: None,
+                selection: None,
             }));
         }
         known.first().map(|row| info(row, None)).transpose()

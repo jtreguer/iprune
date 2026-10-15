@@ -7,6 +7,7 @@ mod adopt_job;
 #[cfg(test)]
 mod close_tests;
 mod data;
+mod selection_dialog;
 mod style;
 mod sync_job;
 mod view_model;
@@ -99,6 +100,9 @@ struct Ui {
     device_box: gtk::Box,
     sync_action: RefCell<Option<gio::SimpleAction>>,
     adopt_action: RefCell<Option<gio::SimpleAction>>,
+    selection_action: RefCell<Option<gio::SimpleAction>>,
+    /// The iPod the sidebar shows, as last read.
+    device: RefCell<Option<DeviceInfo>>,
     eject_action: RefCell<Option<gio::SimpleAction>>,
     /// The sidebar's playlist filter.
     side_query: RefCell<view_model::Query>,
@@ -359,6 +363,9 @@ fn device_text(d: &DeviceInfo) -> String {
         )),
         _ if !d.connected => lines.push("not connected".into()),
         _ => {}
+    }
+    if let Some(selection) = &d.selection {
+        lines.push(selection.clone());
     }
     if d.adopted {
         lines.push(match d.last_sync {
@@ -934,6 +941,7 @@ impl Ui {
             self.device_box.remove(&child);
         }
         let device = self.data.device().ok().flatten();
+        *self.device.borrow_mut() = device.clone();
         let free = !self.busy.get();
         let connected = device.as_ref().is_some_and(|d| d.connected);
         let adopted = device.as_ref().is_some_and(|d| d.adopted);
@@ -941,6 +949,10 @@ impl Ui {
             (&self.sync_action, connected && adopted),
             (&self.adopt_action, connected && !adopted),
             (&self.eject_action, connected),
+            (
+                &self.selection_action,
+                device.as_ref().is_some_and(|d| d.id.is_some()),
+            ),
         ] {
             if let Some(a) = &*action.borrow() {
                 a.set_enabled(on && free);
@@ -964,10 +976,20 @@ impl Ui {
         }
         self.device_box.append(&heading);
         self.device_box.append(&label);
-        if d.connected {
+        if d.connected || d.id.is_some() {
             let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             buttons.set_margin_start(12);
             buttons.set_margin_bottom(12);
+            if d.id.is_some() {
+                let selection = gtk::Button::with_label("Selection…");
+                selection.set_tooltip_text(Some("Choose what this iPod syncs"));
+                selection.set_action_name(Some("win.selection"));
+                buttons.append(&selection);
+            }
+            if !d.connected {
+                self.device_box.append(&buttons);
+                return;
+            }
             if !d.adopted {
                 let adopt = gtk::Button::with_label("Adopt…");
                 adopt.set_tooltip_text(Some("Match the tracks on the iPod to library files"));
@@ -980,6 +1002,36 @@ impl Ui {
             buttons.append(&eject);
             self.device_box.append(&buttons);
         }
+    }
+
+    /// Opens the dialog that sets what the iPod in the sidebar syncs.
+    fn choose_selection(self: &Rc<Self>) {
+        let Some(d) = self.device.borrow().clone() else {
+            return;
+        };
+        let Some(id) = d.id else { return };
+        let input = self.data.selection(id).and_then(|(current, _)| {
+            let (library, playlists) = self.data.selection_inputs()?;
+            Ok(selection_dialog::Input {
+                ipod_name: d.name.clone(),
+                capacity: d.capacity,
+                current,
+                library,
+                playlists,
+            })
+        });
+        let input = match input {
+            Ok(i) => i,
+            Err(e) => return self.show_error("The selection could not be read", &e),
+        };
+        let ui = Rc::downgrade(self);
+        selection_dialog::show(&self.window, input, move |s| {
+            let Some(ui) = ui.upgrade() else { return };
+            if let Err(e) = ui.data.set_selection(id, &s) {
+                ui.show_error("The selection was not saved", &e);
+            }
+            ui.refresh_device();
+        });
     }
 
     /// Unmounts the iPod and powers it off, on a worker.
@@ -1906,6 +1958,8 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         device_box: device_box.clone(),
         sync_action: RefCell::new(None),
         adopt_action: RefCell::new(None),
+        selection_action: RefCell::new(None),
+        device: RefCell::new(None),
         eject_action: RefCell::new(None),
         side_query: RefCell::new(view_model::Query::default()),
         picker,
@@ -1958,6 +2012,8 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     *ui.sync_action.borrow_mut() = Some(sync);
     let adopt = action(window, "adopt", &ui, |ui| ui.open_adopt());
     *ui.adopt_action.borrow_mut() = Some(adopt);
+    let selection = action(window, "selection", &ui, |ui| ui.choose_selection());
+    *ui.selection_action.borrow_mut() = Some(selection);
     let eject = action(window, "eject", &ui, |ui| ui.eject());
     *ui.eject_action.borrow_mut() = Some(eject);
     // Opened once the grid menu has closed, where it was.

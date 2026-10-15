@@ -599,3 +599,170 @@ fn reload_stats_picks_up_rows_written_after_open() {
     assert_eq!(rows.iter().map(|r| r.plays).sum::<u32>(), 7, "{got:?}");
     assert_eq!(rows.iter().filter(|r| r.plays == 7).count(), 1);
 }
+
+// ------------------------------------------------------------- selection
+
+fn picked(kind: Scope, names: &[&str]) -> devices::DeviceScope {
+    devices::DeviceScope {
+        kind,
+        playlists: names.iter().map(|n| (*n).to_owned()).collect(),
+    }
+}
+
+#[test]
+fn selection_summary_for_every_kind_in_singular_and_plural() {
+    let cases = [
+        (picked(Scope::All, &[]), "syncs the whole library"),
+        (picked(Scope::Playlists, &["A"]), "syncs 1 playlist"),
+        (
+            picked(Scope::Playlists, &["A", "B", "C"]),
+            "syncs 3 playlists",
+        ),
+        (picked(Scope::Except, &["A"]), "syncs all but 1 playlist"),
+        (
+            picked(Scope::Except, &["A", "B"]),
+            "syncs all but 2 playlists",
+        ),
+        // Excluding nothing is the whole library.
+        (picked(Scope::Except, &[]), "syncs the whole library"),
+        // Names are not shown for All.
+        (picked(Scope::All, &["A"]), "syncs the whole library"),
+    ];
+    for (s, want) in cases {
+        assert_eq!(selection_summary(&s), want, "{s:?}");
+    }
+}
+
+/// Two playlists: "has" holds track 0, "empty" holds nothing.
+fn with_playlists() -> Sandbox {
+    let sb = sandbox(2);
+    sb.data.create("has").unwrap();
+    sb.data.add("has", &sb.pick(&[0]), None).unwrap();
+    sb.data.create("empty").unwrap();
+    sb
+}
+
+fn one_device(sb: &Sandbox) -> i64 {
+    devices::upsert_device(sb.data.store.conn(), GUID, Some("Mine"), None).unwrap()
+}
+
+#[test]
+fn set_selection_stores_a_good_selection_and_selection_reads_it_back() {
+    let sb = with_playlists();
+    let id = one_device(&sb);
+    let (s, own) = sb.data.selection(id).unwrap();
+    assert!(!own, "follows the config until one is set");
+    assert_eq!(s.kind, Scope::All);
+
+    sb.data
+        .set_selection(id, &picked(Scope::Except, &["has"]))
+        .unwrap();
+    let (s, own) = sb.data.selection(id).unwrap();
+    assert!(own);
+    assert_eq!(s, picked(Scope::Except, &["has"]));
+    assert_eq!(devices::scope(sb.data.store.conn(), id).unwrap(), Some(s));
+
+    // Excluding everything is allowed, and so is keeping one playlist.
+    sb.data
+        .set_selection(id, &picked(Scope::Playlists, &["has", "empty"]))
+        .unwrap();
+    assert_eq!(
+        sb.data.selection(id).unwrap().0,
+        picked(Scope::Playlists, &["empty", "has"])
+    );
+}
+
+#[test]
+fn set_selection_refuses_a_bad_one_and_keeps_the_old() {
+    let sb = with_playlists();
+    let id = one_device(&sb);
+    let good = picked(Scope::Playlists, &["has"]);
+    sb.data.set_selection(id, &good).unwrap();
+    let bad = [
+        ("gone", picked(Scope::Playlists, &["has", "gone"]), "gone"),
+        ("gone, except", picked(Scope::Except, &["gone"]), "gone"),
+        ("no names", picked(Scope::Playlists, &[]), "names none"),
+        (
+            "no track",
+            picked(Scope::Playlists, &["empty"]),
+            "no library track",
+        ),
+    ];
+    for (what, s, why) in bad {
+        let e = sb.data.set_selection(id, &s).unwrap_err().to_string();
+        assert!(e.contains(why), "{what}: {e}");
+        assert_eq!(
+            sb.data.selection(id).unwrap(),
+            (good.clone(), true),
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn a_device_row_carries_its_id_and_a_summary_of_what_it_syncs() {
+    let sb = with_playlists();
+    let id = one_device(&sb);
+    let info = sb.data.device().unwrap().unwrap();
+    assert_eq!(info.id, Some(id));
+    assert_eq!(info.selection.as_deref(), Some("syncs the whole library"));
+
+    sb.data
+        .set_selection(id, &picked(Scope::Except, &["empty", "has"]))
+        .unwrap();
+    let info = sb.data.device().unwrap().unwrap();
+    assert_eq!(info.selection.as_deref(), Some("syncs all but 2 playlists"));
+}
+
+#[test]
+fn a_summary_follows_the_config_for_an_ipod_without_a_selection_of_its_own() {
+    let mut sb = with_playlists();
+    one_device(&sb);
+    sb.data.config.sync.scope = Scope::Playlists;
+    sb.data.config.sync.playlists = vec!["has".into()];
+    let info = sb.data.device().unwrap().unwrap();
+    assert_eq!(info.selection.as_deref(), Some("syncs 1 playlist"));
+}
+
+#[test]
+fn a_mounted_ipod_that_was_never_adopted_has_no_id_and_no_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mp = fake_ipod(tmp.path(), &sysinfo(GUID));
+    let d = data_with_mount(&mp);
+    let info = d.device().unwrap().unwrap();
+    assert!(!info.adopted);
+    assert_eq!((info.id, info.selection), (None, None));
+}
+
+#[test]
+fn selection_inputs_hold_the_library_and_the_playlists_as_indexed() {
+    let sb = with_playlists();
+    let (tracks, lists) = sb.data.selection_inputs().unwrap();
+    assert_eq!(tracks.len(), 2);
+    let mut names: Vec<(&str, usize)> = lists
+        .iter()
+        .map(|p| (p.name.as_str(), p.members.len()))
+        .collect();
+    names.sort();
+    assert_eq!(names, [("empty", 0), ("has", 1)]);
+}
+
+#[test]
+fn a_mounted_adopted_ipod_carries_its_own_id_and_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mp = fake_ipod(tmp.path(), &sysinfo(GUID));
+    let d = data_with_mount(&mp);
+    // Another iPod first, so the id is not just the first row.
+    devices::upsert_device(d.store.conn(), "FFFF0000FFFF0000", Some("Other"), None).unwrap();
+    let id = devices::upsert_device(d.store.conn(), GUID, Some("Mine"), None).unwrap();
+    devices::set_scope(
+        d.store.conn(),
+        id,
+        Some(&picked(Scope::Playlists, &["a", "b"])),
+    )
+    .unwrap();
+    let info = d.device().unwrap().unwrap();
+    assert!(info.connected && info.adopted);
+    assert_eq!(info.id, Some(id));
+    assert_eq!(info.selection.as_deref(), Some("syncs 2 playlists"));
+}

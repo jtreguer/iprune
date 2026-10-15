@@ -15,6 +15,7 @@ use iprune_core::plan::{
     Member, Plan, PlaylistDeleteReason, PlaylistOp, PlaylistSkipReason, RemoveReason, Space,
     SpaceCheck,
 };
+use iprune_core::store::devices::{self, DeviceScope};
 use iprune_core::sync::{self, Prepared};
 use iprune_core::{Error, adoption, ipod, playlists};
 
@@ -666,6 +667,294 @@ fn a_valid_playlists_scope_plans_only_those_playlists() {
         o,
         PlaylistOp::Delete { name, reason: PlaylistDeleteReason::OutOfScope, .. } if name == "Mix"
     )));
+}
+
+// ---- a scope of the iPod's own
+
+fn device_id(w: &World) -> i64 {
+    let guid = ipod::read(&w.open()).firewire_guid.unwrap();
+    devices::device_id(w.env.store.conn(), &guid)
+        .unwrap()
+        .expect("the iPod is known")
+}
+
+fn set_own(w: &World, kind: ConfigScope, names: &[&str]) {
+    let s = DeviceScope {
+        kind,
+        playlists: names.iter().map(|n| (*n).to_owned()).collect(),
+    };
+    devices::set_scope(w.env.store.conn(), device_id(w), Some(&s)).unwrap();
+}
+
+fn bad_scope(w: &World) -> String {
+    match w.prepare().err().expect("must be refused") {
+        Error::BadScope(m) => m,
+        e => panic!("{e:?}"),
+    }
+}
+
+const HINT: &str = "; change it in the window or with `iprune scope`";
+
+#[test]
+fn an_ipods_own_scope_wins_over_sync_in_the_config() {
+    let mut w = adopted();
+    // The config keeps only Road: it would remove Mix's track.
+    w.env.cfg.sync.scope = ConfigScope::Playlists;
+    w.env.cfg.sync.playlists = vec!["Road".into()];
+    assert_eq!(w.plan().remove.len(), 1, "set up: the config removes one");
+    // This iPod keeps everything.
+    set_own(&w, ConfigScope::All, &[]);
+    assert!(w.plan().is_empty(), "{:?}", w.plan());
+
+    // And the other way round: the config keeps all, the iPod only Mix.
+    w.env.cfg.sync.scope = ConfigScope::All;
+    w.env.cfg.sync.playlists = vec![];
+    set_own(&w, ConfigScope::Playlists, &["Mix"]);
+    let p = w.plan();
+    let mut removed: Vec<(u64, RemoveReason)> =
+        p.remove.iter().map(|r| (r.dbid, r.reason)).collect();
+    removed.sort_by_key(|r| r.0);
+    assert_eq!(
+        removed,
+        vec![
+            (D2, RemoveReason::OutOfScope),
+            (D1, RemoveReason::OutOfScope)
+        ]
+    );
+
+    // Clearing it hands the iPod back to the config.
+    devices::set_scope(w.env.store.conn(), device_id(&w), None).unwrap();
+    assert!(w.plan().is_empty());
+}
+
+#[test]
+fn an_own_except_scope_copies_only_tracks_outside_the_excluded_playlists() {
+    let w = empty_world();
+    known_device(&w);
+    set_own(&w, ConfigScope::Except, &["Mix"]);
+    let p = w.prepare().expect("accepted").plan;
+    let mut copied: Vec<i64> = p.copy.iter().map(|c| c.track_id).collect();
+    copied.sort();
+    let mut want = vec![w.id("one"), w.id("two")];
+    want.sort();
+    assert_eq!(copied, want);
+    assert!(
+        p.playlists
+            .iter()
+            .all(|o| !matches!(o, PlaylistOp::Create { name, .. } if name == "Mix")),
+        "{:?}",
+        p.playlists
+    );
+    assert!(
+        p.playlists
+            .iter()
+            .any(|o| matches!(o, PlaylistOp::Create { name, .. } if name == "Road")),
+        "{:?}",
+        p.playlists
+    );
+}
+
+#[test]
+fn an_own_except_scope_removes_the_excluded_playlist_and_its_tracks_from_an_adopted_ipod() {
+    let w = adopted();
+    set_own(&w, ConfigScope::Except, &["Mix"]);
+    let p = w.plan();
+    assert_eq!(
+        p.remove
+            .iter()
+            .map(|r| (r.dbid, r.reason))
+            .collect::<Vec<_>>(),
+        vec![(D3, RemoveReason::OutOfScope)]
+    );
+    assert!(p.copy.is_empty());
+    assert!(p.playlists.iter().any(|o| matches!(
+        o,
+        PlaylistOp::Delete { name, reason: PlaylistDeleteReason::OutOfScope, .. } if name == "Mix"
+    )));
+}
+
+#[test]
+fn an_own_scope_naming_a_gone_playlist_is_refused_with_a_hint() {
+    let w = adopted();
+    for kind in [ConfigScope::Playlists, ConfigScope::Except] {
+        set_own(&w, kind, &["Road", "Typo"]);
+        let m = bad_scope(&w);
+        assert!(m.contains("Typo") && !m.contains("Road,"), "{kind:?}: {m}");
+        assert!(m.ends_with(HINT), "{kind:?}: {m}");
+    }
+    // Nothing planned means nothing was changed in the index either.
+    assert_eq!(
+        devices::scope(w.env.store.conn(), device_id(&w))
+            .unwrap()
+            .unwrap()
+            .playlists,
+        vec!["Road", "Typo"]
+    );
+}
+
+#[test]
+fn a_config_scope_problem_keeps_its_wording_and_has_no_hint() {
+    let mut w = adopted();
+    w.env.cfg.sync.scope = ConfigScope::Playlists;
+    w.env.cfg.sync.playlists = vec![];
+    assert_eq!(
+        bad_scope(&w),
+        "sync.scope is \"playlists\" but sync.playlists is empty"
+    );
+    w.env.cfg.sync.playlists = vec!["Typo".into()];
+    assert_eq!(
+        bad_scope(&w),
+        "sync.playlists names playlists that do not exist: Typo"
+    );
+    w.env.write_playlist("Empty", "");
+    w.reload_playlists();
+    w.env.cfg.sync.playlists = vec!["Empty".into()];
+    assert_eq!(
+        bad_scope(&w),
+        "the playlists in sync.playlists hold no library track"
+    );
+}
+
+#[test]
+fn an_own_scope_that_keeps_nothing_is_refused_with_a_hint() {
+    let w = adopted();
+    set_own(&w, ConfigScope::Playlists, &[]);
+    let m = bad_scope(&w);
+    assert!(m.ends_with(HINT), "{m}");
+    assert!(m.contains("names none"), "{m}");
+}
+
+#[test]
+fn device_scope_says_whether_it_was_set_for_the_ipod() {
+    let mut w = adopted();
+    w.env.cfg.sync.scope = ConfigScope::Except;
+    w.env.cfg.sync.playlists = vec!["Mix".into()];
+    let conn = w.env.store.conn();
+    let id = device_id(&w);
+    let (s, own) = sync::device_scope(conn, &w.env.cfg, id).unwrap();
+    assert!(!own);
+    assert_eq!(
+        s,
+        DeviceScope {
+            kind: ConfigScope::Except,
+            playlists: vec!["Mix".into()]
+        }
+    );
+    set_own(&w, ConfigScope::Playlists, &["Road"]);
+    let (s, own) = sync::device_scope(w.env.store.conn(), &w.env.cfg, id).unwrap();
+    assert!(own);
+    assert_eq!(s.kind, ConfigScope::Playlists);
+    assert_eq!(s.playlists, vec!["Road"]);
+}
+
+#[test]
+fn scope_problem_cases_in_both_wordings() {
+    let w = adopted();
+    w.env.write_playlist("Empty", "");
+    w.reload_playlists();
+    let conn = w.env.store.conn();
+    let library = iprune_core::store::all_tracks(conn).unwrap();
+    let lists = devices::library_playlists(conn).unwrap();
+    let s = |kind, names: &[&str]| DeviceScope {
+        kind,
+        playlists: names.iter().map(|n| (*n).to_owned()).collect(),
+    };
+    use ConfigScope::{All, Except, Playlists};
+    // (selection, problem for the config's, problem for the iPod's)
+    let cases: Vec<(DeviceScope, Option<&str>, Option<&str>)> = vec![
+        (s(All, &[]), None, None),
+        (s(All, &["Typo"]), None, None),
+        (s(Except, &[]), None, None),
+        (s(Except, &["Mix"]), None, None),
+        (s(Playlists, &["Road", "Mix"]), None, None),
+        (
+            s(Playlists, &[]),
+            Some("sync.scope is \"playlists\" but sync.playlists is empty"),
+            Some("this iPod's selection keeps only some playlists but names none"),
+        ),
+        (
+            s(Playlists, &["Typo", "Nope"]),
+            Some("sync.playlists names playlists that do not exist: Typo, Nope"),
+            Some("this iPod's selection names playlists that do not exist: Typo, Nope"),
+        ),
+        (
+            s(Except, &["Road", "Nope"]),
+            Some("sync.playlists names playlists that do not exist: Nope"),
+            Some("this iPod's selection names playlists that do not exist: Nope"),
+        ),
+        (
+            s(Playlists, &["Empty"]),
+            Some("the playlists in sync.playlists hold no library track"),
+            Some("the playlists this iPod keeps hold no library track"),
+        ),
+        // Excluding every track would plan the removal of every managed one.
+        (
+            s(Except, &["Road", "Mix", "Empty"]),
+            Some(
+                "the playlists in sync.playlists hold every library track, which \"except\" leaves out",
+            ),
+            Some("this iPod's selection leaves out every library track"),
+        ),
+    ];
+    for (sel, config, own) in cases {
+        assert_eq!(
+            sync::scope_problem(&sel, false, &library, &lists).as_deref(),
+            config,
+            "config: {sel:?}"
+        );
+        assert_eq!(
+            sync::scope_problem(&sel, true, &library, &lists).as_deref(),
+            own,
+            "own: {sel:?}"
+        );
+    }
+}
+
+#[test]
+fn describe_and_size_of_a_selection() {
+    let w = adopted();
+    let conn = w.env.store.conn();
+    let library = iprune_core::store::all_tracks(conn).unwrap();
+    let lists = devices::library_playlists(conn).unwrap();
+    let size_of = |name: &str| fs::metadata(&w.files[name]).unwrap().len();
+    let s = |kind, names: &[&str]| DeviceScope {
+        kind,
+        playlists: names.iter().map(|n| (*n).to_owned()).collect(),
+    };
+    use ConfigScope::{All, Except, Playlists};
+    let all = size_of("one") + size_of("two") + size_of("three");
+    let cases = [
+        (s(All, &[]), "the whole library", 3, all),
+        (s(Except, &[]), "the whole library", 3, all),
+        (
+            s(Playlists, &["Mix"]),
+            "only 1 playlist: Mix",
+            1,
+            size_of("three"),
+        ),
+        (
+            s(Playlists, &["Road", "Mix"]),
+            "only 2 playlists: Road, Mix",
+            3,
+            all,
+        ),
+        (
+            s(Except, &["Mix"]),
+            "the whole library except 1 playlist: Mix",
+            2,
+            size_of("one") + size_of("two"),
+        ),
+        (
+            s(Except, &["Road", "Mix"]),
+            "the whole library except 2 playlists: Road, Mix",
+            0,
+            0,
+        ),
+    ];
+    for (sel, text, tracks, bytes) in cases {
+        assert_eq!(sel.describe(), text, "{sel:?}");
+        assert_eq!(sel.size(&library, &lists), (tracks, bytes), "{sel:?}");
+    }
 }
 
 // ---- describe, space, bytes

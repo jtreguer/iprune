@@ -27,6 +27,46 @@ pub enum Scope<'a> {
     All,
     /// These playlists and the tracks in them.
     Playlists(&'a [String]),
+    /// Every playlist but these, and every track but those in them, even
+    /// when another playlist holds it.
+    Except(&'a [String]),
+}
+
+impl Scope<'_> {
+    /// Whether the playlist `name` goes to the iPod.
+    pub fn takes_playlist(&self, name: &str) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Playlists(names) => names.iter().any(|n| n == name),
+            Scope::Except(names) => !names.iter().any(|n| n == name),
+        }
+    }
+}
+
+/// The present library tracks that `scope` sends to the iPod.
+pub fn in_scope(library: &[TrackRow], playlists: &[LibPlaylist], scope: Scope) -> BTreeSet<i64> {
+    let present = library
+        .iter()
+        .filter(|t| t.missing_since.is_none())
+        .map(|t| t.id);
+    let members = |names: &[String]| -> HashSet<i64> {
+        playlists
+            .iter()
+            .filter(|p| names.contains(&p.name))
+            .flat_map(|p| p.members.iter().flatten().copied())
+            .collect()
+    };
+    match scope {
+        Scope::All => present.collect(),
+        Scope::Playlists(names) => {
+            let members = members(names);
+            present.filter(|id| members.contains(id)).collect()
+        }
+        Scope::Except(names) => {
+            let members = members(names);
+            present.filter(|id| !members.contains(id)).collect()
+        }
+    }
 }
 
 /// The iPod filesystem's size and free space, in bytes.
@@ -470,21 +510,8 @@ pub fn plan(input: &PlanInput) -> Plan {
         .filter(|t| t.missing_since.is_none())
         .map(|t| (t.id, t))
         .collect();
-    let synced = |p: &LibPlaylist| match input.scope {
-        Scope::All => true,
-        Scope::Playlists(names) => names.contains(&p.name),
-    };
-    let in_scope: BTreeSet<i64> = match input.scope {
-        Scope::All => present.keys().copied().collect(),
-        Scope::Playlists(_) => input
-            .playlists
-            .iter()
-            .filter(|p| synced(p))
-            .flat_map(|p| p.members.iter().flatten())
-            .filter(|id| present.contains_key(id))
-            .copied()
-            .collect(),
-    };
+    let synced = |p: &LibPlaylist| input.scope.takes_playlist(&p.name);
+    let in_scope = in_scope(input.library, input.playlists, input.scope);
     let on_ipod: HashMap<u64, &ipod::Track> = input
         .device
         .tracks

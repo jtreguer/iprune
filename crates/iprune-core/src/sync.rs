@@ -125,47 +125,15 @@ pub fn prepare(conn: &Connection, cfg: &Config, db: &gpod::Database) -> Result<P
             .collect(),
         None => Default::default(),
     };
-    let scope = match cfg.sync.scope {
-        config::Scope::All => Scope::All,
-        config::Scope::Playlists => {
-            // A scope naming nothing that exists would plan the removal of
-            // every managed track.
-            if cfg.sync.playlists.is_empty() {
-                return Err(Error::BadScope(
-                    "sync.scope is \"playlists\" but sync.playlists is empty".into(),
-                ));
-            }
-            let unknown: Vec<&str> = cfg
-                .sync
-                .playlists
-                .iter()
-                .filter(|n| !playlists.iter().any(|p| &p.name == *n))
-                .map(String::as_str)
-                .collect();
-            if !unknown.is_empty() {
-                return Err(Error::BadScope(format!(
-                    "sync.playlists names playlists that do not exist: {}",
-                    unknown.join(", ")
-                )));
-            }
-            let present: std::collections::HashSet<i64> = library
-                .iter()
-                .filter(|t| t.missing_since.is_none())
-                .map(|t| t.id)
-                .collect();
-            let any_track = playlists
-                .iter()
-                .filter(|p| cfg.sync.playlists.contains(&p.name))
-                .flat_map(|p| p.members.iter().flatten())
-                .any(|id| present.contains(id));
-            if !any_track {
-                return Err(Error::BadScope(
-                    "the playlists in sync.playlists hold no library track".into(),
-                ));
-            }
-            Scope::Playlists(&cfg.sync.playlists)
-        }
-    };
+    let (selection, own) = device_scope(conn, cfg, device)?;
+    if let Some(why) = scope_problem(&selection, own, &library, &playlists) {
+        return Err(Error::BadScope(if own {
+            format!("{why}; change it in the window or with `iprune scope`")
+        } else {
+            why
+        }));
+    }
+    let scope = selection.as_plan();
     let plan = plan::plan(&PlanInput {
         library: &library,
         playlists: &playlists,
@@ -187,6 +155,120 @@ pub fn prepare(conn: &Connection, cfg: &Config, db: &gpod::Database) -> Result<P
         recovered,
         library: library.into_iter().map(|t| (t.id, t)).collect(),
         identity,
+    })
+}
+
+/// What the iPod `device` syncs: the selection set for it, else `[sync]`
+/// in the config. The flag is true for one set for the iPod.
+pub fn device_scope(
+    conn: &Connection,
+    cfg: &Config,
+    device: i64,
+) -> Result<(devices::DeviceScope, bool)> {
+    Ok(match devices::scope(conn, device)? {
+        Some(s) => (s, true),
+        None => (
+            devices::DeviceScope {
+                kind: cfg.sync.scope,
+                playlists: cfg.sync.playlists.clone(),
+            },
+            false,
+        ),
+    })
+}
+
+impl devices::DeviceScope {
+    /// The planner's form of this selection.
+    pub fn as_plan(&self) -> Scope<'_> {
+        match self.kind {
+            config::Scope::All => Scope::All,
+            config::Scope::Playlists => Scope::Playlists(&self.playlists),
+            config::Scope::Except => Scope::Except(&self.playlists),
+        }
+    }
+
+    /// The selection in words: "the whole library", "only 2 playlists: A,
+    /// B", "the whole library except 1 playlist: C".
+    pub fn describe(&self) -> String {
+        let list = |n: &[String]| {
+            let noun = if n.len() == 1 {
+                "playlist"
+            } else {
+                "playlists"
+            };
+            format!("{} {noun}: {}", n.len(), n.join(", "))
+        };
+        match self.kind {
+            config::Scope::All => "the whole library".into(),
+            config::Scope::Playlists => format!("only {}", list(&self.playlists)),
+            config::Scope::Except if self.playlists.is_empty() => "the whole library".into(),
+            config::Scope::Except => format!("the whole library except {}", list(&self.playlists)),
+        }
+    }
+
+    /// How many present tracks this selection sends, and their size.
+    pub fn size(
+        &self,
+        library: &[TrackRow],
+        playlists: &[crate::adopt::LibPlaylist],
+    ) -> (usize, u64) {
+        let ids = plan::in_scope(library, playlists, self.as_plan());
+        let bytes = library
+            .iter()
+            .filter(|t| ids.contains(&t.id))
+            .map(|t| t.size)
+            .sum();
+        (ids.len(), bytes)
+    }
+}
+
+/// Why a selection cannot be synced, if it cannot: it names a playlist
+/// that does not exist, or selects no present track, which would plan the
+/// removal of every managed track. `own` is true for
+/// a selection set for the iPod, false for the config's.
+pub fn scope_problem(
+    s: &devices::DeviceScope,
+    own: bool,
+    library: &[TrackRow],
+    playlists: &[crate::adopt::LibPlaylist],
+) -> Option<String> {
+    if s.kind == config::Scope::All {
+        return None;
+    }
+    if s.kind == config::Scope::Playlists && s.playlists.is_empty() {
+        return Some(if own {
+            "this iPod's selection keeps only some playlists but names none".into()
+        } else {
+            "sync.scope is \"playlists\" but sync.playlists is empty".into()
+        });
+    }
+    let unknown: Vec<&str> = s
+        .playlists
+        .iter()
+        .filter(|n| !playlists.iter().any(|p| &p.name == *n))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        let unknown = unknown.join(", ");
+        return Some(if own {
+            format!("this iPod's selection names playlists that do not exist: {unknown}")
+        } else {
+            format!("sync.playlists names playlists that do not exist: {unknown}")
+        });
+    }
+    if !plan::in_scope(library, playlists, s.as_plan()).is_empty() {
+        return None;
+    }
+    Some(match (s.kind, own) {
+        (config::Scope::Except, true) => {
+            "this iPod's selection leaves out every library track".into()
+        }
+        (config::Scope::Except, false) => {
+            "the playlists in sync.playlists hold every library track, which \"except\" leaves out"
+                .into()
+        }
+        (_, true) => "the playlists this iPod keeps hold no library track".into(),
+        (_, false) => "the playlists in sync.playlists hold no library track".into(),
     })
 }
 

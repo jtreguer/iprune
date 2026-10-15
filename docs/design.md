@@ -95,11 +95,14 @@ moves as long as the file content does not change at the same time.
 playlists folder. The file name, minus extension, is the playlist name. A track
 may appear twice in a playlist only if the file says so.
 
-**Device.** One iPod, identified by its FireWire GUID. iprune keeps a mapping
-between library tracks and the iPod's own track ids (`dbid`) for each device.
+**Device.** An iPod, identified by its FireWire GUID. iprune keeps a mapping
+between library tracks and the iPod's own track ids (`dbid`), and a sync
+scope, for each device.
 
-**Sync scope.** What goes on the device. Either the whole library (today's
-situation, and the default), or only the tracks in a chosen set of playlists.
+**Sync scope.** What goes on the device: the whole library (the default),
+only the tracks in a chosen set of playlists, or the whole library except
+the tracks in a chosen set. Each iPod has its own, set in the window or
+with `iprune scope`; one never set follows `[sync]` in the config.
 
 **Adoption.** The one-time step that matches the tracks already on an iPod to
 library files, so the first sync updates the device instead of refilling it.

@@ -128,6 +128,8 @@ fn a_version_4_index_keeps_every_row_and_id_and_gets_an_id_that_is_never_reused(
     let mut after = dump_all(conn);
     for row in after.get_mut("devices").unwrap() {
         assert_eq!(row.remove("restoring").as_deref(), Some("Null"));
+        // No selection of its own: it follows [sync] in the config.
+        assert_eq!(row.remove("scope").as_deref(), Some("Null"));
     }
     let mapped = after.get_mut("device_tracks").unwrap();
     assert_eq!(mapped.len(), 2, "set up");
@@ -142,7 +144,7 @@ fn a_version_4_index_keeps_every_row_and_id_and_gets_an_id_that_is_never_reused(
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 
     // The next id starts above the highest one used, also after that
     // highest row is deleted.
@@ -287,4 +289,76 @@ fn a_new_index_is_created_at_the_current_version_with_stable_ids_and_foreign_key
         .query_row("SELECT id FROM tracks", [], |r| r.get(0))
         .unwrap();
     assert_eq!(id, 2, "an id freed is not given again");
+}
+
+/// A version 7 index with two iPods, built from the real migrations.
+fn version_7(path: &Path) {
+    let conn = Connection::open(path).unwrap();
+    for sql in [
+        include_str!("../src/store/migrations/0001_init.sql"),
+        include_str!("../src/store/migrations/0002_tag_state.sql"),
+        include_str!("../src/store/migrations/0003_playlist_tombstones.sql"),
+        include_str!("../src/store/migrations/0004_pending_pulls.sql"),
+        include_str!("../src/store/migrations/0005_stable_ids.sql"),
+        include_str!("../src/store/migrations/0006_synced_rating.sql"),
+        include_str!("../src/store/migrations/0007_tags_version.sql"),
+    ] {
+        conn.execute_batch(sql).unwrap();
+    }
+    conn.execute_batch(
+        "INSERT INTO devices (id, firewire_guid, name, model, last_sync_at) VALUES \
+           (1, '0x000A27001234ABCD', 'First', 'MC297', 1700000000), \
+           (2, '0x000A27001234FFFF', 'Second', NULL, NULL);",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 7).unwrap();
+}
+
+#[test]
+fn a_version_7_index_gains_device_scopes_and_its_ipods_follow_the_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("iprune.sqlite");
+    version_7(&path);
+
+    let store = Store::open(&path).unwrap();
+    let conn = store.conn();
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 8);
+
+    // Both iPods are still there, with no selection of their own.
+    let devices = dump(conn, "devices");
+    assert_eq!(devices.len(), 2);
+    for row in &devices {
+        assert_eq!(row["scope"], "Null", "{row:?}");
+    }
+    assert_eq!(devices[0]["name"], "Text(\"First\")");
+    assert_eq!(devices[0]["last_sync_at"], "Integer(1700000000)");
+    for id in [1, 2] {
+        assert_eq!(iprune_core::store::devices::scope(conn, id).unwrap(), None);
+    }
+
+    // The new table works and is tied to a device.
+    conn.execute(
+        "INSERT INTO device_scope_playlists (device_id, name) VALUES (1, 'Road')",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO device_scope_playlists (device_id, name) VALUES (1, 'Road')",
+            [],
+        )
+        .is_err(),
+        "a name is listed once per iPod"
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO device_scope_playlists (device_id, name) VALUES (99, 'Road')",
+            [],
+        )
+        .is_err(),
+        "an unknown iPod"
+    );
 }

@@ -65,7 +65,10 @@ pub enum PathStyle {
 pub enum Scope {
     #[default]
     All,
+    /// Only the playlists named, and their tracks.
     Playlists,
+    /// Everything but the playlists named and their tracks.
+    Except,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
