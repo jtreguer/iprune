@@ -9,7 +9,7 @@
      T <dbid hex> <size> <tracklen ms> <title> <artist> <album> <playcount>
      P <name> <dbid hex>,<dbid hex>,...        regular playlist, members in order
      S <name> <dbid hex>,...                   smart playlist
-     C <name>                                  the Podcasts playlist (not a regular one)
+     C <name> <dbid hex>,...                   the Podcasts playlist (not a regular one)
      R <smart name> <artist text>              adds the rule "artist contains <text>" to a
                                                smart playlist already declared with S
 */
@@ -105,6 +105,7 @@ int main(int argc, char **argv) {
             Itdb_Playlist *pl = itdb_playlist_new(f[1], FALSE);
             itdb_playlist_set_podcasts(pl);
             itdb_playlist_add(db, pl, -1);
+            if (n >= 3 && f[2][0]) members(db, pl, f[2]);
         } else {
             fprintf(stderr, "bad manifest line: %s\n", f[0]);
             return 2;

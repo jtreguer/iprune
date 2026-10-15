@@ -717,7 +717,11 @@ After `itdb_write`, close the database, parse it again from the iPod,
 produce a snapshot in the same text format as the C `snapshot` tool, and
 compare it with the snapshot of the in-memory database taken just before
 the write. A database that cannot be read back counts as a difference. The artwork link (`mhii`) is excluded, since libgpod renumbers it
-on every artwork write. The header's signature is checked as in section 9.
+on every artwork write; it is found from the end of a track line, since a
+tag may contain the same text. The members of the playlists libgpod flags
+as Podcasts, taken by position so a regular playlist of the same name keeps
+its order checked, are compared as a multiset: libgpod writes it grouped by show through a hash
+table, so its order read back is not the order in memory. The header's signature is checked as in section 9.
 Any difference is printed (up to 20 lines) and the
 command exits with code 3; the backup stays in place for `iprune restore`
 and the mappings are not updated.

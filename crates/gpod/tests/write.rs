@@ -359,7 +359,8 @@ fn write_persists_changes_to_the_ipod_database_in_the_mountpoint() {
     // libgpod renumbers the artwork link on write, nothing else may differ.
     let strip = |s: &str| -> String {
         s.lines()
-            .map(|l| l.split(" mhii ").next().unwrap().to_owned())
+            // From the end: a tag may contain " mhii ".
+            .map(|l| l.rsplit_once(" mhii ").map_or(l, |(a, _)| a).to_owned())
             .collect::<Vec<_>>()
             .join("\n")
     };

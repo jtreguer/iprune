@@ -309,8 +309,11 @@ fn normalize_drops_only_the_artwork_link_value() {
         verify::normalize(&text),
         format!("tracks 1 playlists 1\n{LINE_NO_MHII}\nP Road 0\n  0000000000000001")
     );
-    // A link at the end of the line, with nothing after it.
-    assert_eq!(verify::normalize("T x | art 1 mhii 9"), "T x | art 1");
+    // A link right before the rating, as the snapshot always prints it.
+    assert_eq!(
+        verify::normalize("T x | art 1 mhii 9 | rating 0 plays 0"),
+        "T x | art 1 | rating 0 plays 0"
+    );
     // Nothing to drop.
     assert_eq!(verify::normalize("P a 0\n  1"), "P a 0\n  1");
 }
@@ -679,4 +682,224 @@ fn playlists_created_deleted_and_track_changes_are_checked_together() {
     let p = run(&bad, &e);
     has(p.clone(), "playlist 00000000000000c8 was not deleted");
     has(p, "regular playlists, expected 3");
+}
+
+// ---- normalize with " mhii " in a tag (audit L50)
+
+#[test]
+fn normalize_cuts_the_artwork_link_from_the_end_of_a_track_line() {
+    let line = |title: &str, mhii: u32| {
+        format!(
+            "T 0000000000000001 :iPod_Control:Music:F00:A.mp3 | A | B | {title} | 10 | art 1 mhii {mhii} | rating 0 plays 0"
+        )
+    };
+    let (a, b) = (line("Song mhii 77 x", 100), line("Song mhii 77 x", 101));
+    assert_eq!(verify::normalize(&a), verify::normalize(&b));
+    assert_eq!(
+        verify::normalize(&a),
+        "T 0000000000000001 :iPod_Control:Music:F00:A.mp3 | A | B | Song mhii 77 x | 10 | art 1 | rating 0 plays 0"
+    );
+    // The tag stays in the comparison: a different title is a difference.
+    assert!(verify::differences(&a, &line("Song mhii 88 x", 100), 20).len() == 1);
+    // A title that ends with the link text, and one that is only that text.
+    let (c, d) = (line("a mhii 5", 1), line("a mhii 5", 2));
+    assert_eq!(verify::normalize(&c), verify::normalize(&d));
+    assert!(verify::differences(&line(" mhii 5", 1), &line(" mhii 5", 2), 20).is_empty());
+    assert!(verify::differences(&c, &line("a mhii 6", 1), 20).len() == 1);
+}
+
+// After `without_artwork` a track line has no link field, and a title may
+// hold " mhii 5 b": that text must stay in the comparison.
+#[test]
+fn normalize_does_not_eat_title_words_after_mhii_when_the_link_is_gone() {
+    let line = |title: &str| {
+        format!(
+            "T 0000000000000001 :iPod_Control:Music:F00:A.mp3 | A | B | {title} | 10 | rating 0 plays 0"
+        )
+    };
+    assert_ne!(
+        verify::normalize(&line("x mhii 5 b")),
+        verify::normalize(&line("x mhii 6 b"))
+    );
+    assert_eq!(
+        verify::differences(&line("x mhii 5 b"), &line("x mhii 6 b"), 20).len(),
+        1
+    );
+    assert_eq!(verify::normalize(&line("x mhii 5 b")), line("x mhii 5 b"));
+    // Through without_artwork, from a line that has the real field too.
+    let full = |title: &str, mhii: u32| {
+        format!(
+            "T 0000000000000001 :iPod_Control:Music:F00:A.mp3 | A | B | {title} | 10 | art 1 mhii {mhii} | rating 0 plays 0"
+        )
+    };
+    let stripped = |t: &str| verify::without_artwork(&full(t, 7));
+    assert_eq!(
+        verify::differences(&stripped("x mhii 5 b"), &stripped("x mhii 6 b"), 20).len(),
+        1
+    );
+    // A non-numeric word after " mhii " in the title is kept too.
+    assert_eq!(
+        verify::normalize(&full("x mhii abc", 7)),
+        full("x mhii abc", 7).replace(" mhii 7", "")
+    );
+}
+
+#[test]
+fn normalize_leaves_playlist_lines_alone_even_with_mhii_in_the_name() {
+    let text = "P Mix mhii 4 x 2\n  0000000000000001\nP a mhii 9 1";
+    assert_eq!(verify::normalize(text), text);
+}
+
+// ---- sort_members (audit H8)
+
+#[test]
+fn sort_members_sorts_only_the_listed_positions() {
+    let text = "tracks 3 playlists 3\nT x | 1\nP Podcasts 3\n  c\n  a\n  b\nP Road 3\n  z\n  y\n  x\nP Other 2\n  q\n  p";
+    let sorted_first = "tracks 3 playlists 3\nT x | 1\nP Podcasts 3\n  a\n  b\n  c\nP Road 3\n  z\n  y\n  x\nP Other 2\n  q\n  p";
+    assert_eq!(verify::sort_members(text, &[0]), sorted_first);
+    // Nothing listed, or a position past the end: unchanged.
+    assert_eq!(verify::sort_members(text, &[]), text);
+    assert_eq!(verify::sort_members(text, &[3, 9]), text);
+    // Two listed, the middle one keeps its order.
+    assert_eq!(
+        verify::sort_members(text, &[0, 2]),
+        sorted_first.replace("  q\n  p", "  p\n  q")
+    );
+    // The last one alone.
+    assert_eq!(
+        verify::sort_members(text, &[2]),
+        text.replace("  q\n  p", "  p\n  q")
+    );
+}
+
+#[test]
+fn sort_members_keeps_duplicates_and_the_count_line() {
+    let text = "P Podcasts 4\n  b\n  a\n  b\n  a";
+    assert_eq!(
+        verify::sort_members(text, &[0]),
+        "P Podcasts 4\n  a\n  a\n  b\n  b"
+    );
+}
+
+#[test]
+fn sort_members_counts_every_p_line_whatever_the_name_or_flags() {
+    // Names that look like other lines of the format, a master and a smart
+    // playlist (no members), all count as one position each.
+    let text = "P   0000000000000009 2\n  b\n  a\nP T x | y 2\n  d\n  c\nP Master [master] 3\nP Smart [smart] 1\nP P 7 2\n  f\n  e\nP 0000000000000002 2\n  h\n  g";
+    let at = |k: usize| verify::sort_members(text, &[k]);
+    let mut want0 = text.to_owned();
+    want0 = want0.replacen("  b\n  a", "  a\n  b", 1);
+    assert_eq!(at(0), want0);
+    assert_eq!(at(1), text.replace("  d\n  c", "  c\n  d"));
+    assert_eq!(at(2), text, "master");
+    assert_eq!(at(3), text, "smart");
+    assert_eq!(at(4), text.replace("  f\n  e", "  e\n  f"));
+    assert_eq!(at(5), text.replace("  h\n  g", "  g\n  h"));
+}
+
+#[test]
+fn sort_members_with_an_empty_playlist_does_not_touch_the_next_one() {
+    let text = "P Podcasts 0\nP Road 2\n  b\n  a";
+    assert_eq!(verify::sort_members(text, &[0]), text);
+    let last = "P Road 2\n  b\n  a\nP Podcasts 0";
+    assert_eq!(verify::sort_members(last, &[1]), last);
+    assert_eq!(
+        verify::sort_members("P Podcasts 0\nP Shows 2\n  b\n  a", &[0, 1]),
+        "P Podcasts 0\nP Shows 2\n  a\n  b"
+    );
+}
+
+// A regular playlist named like the Podcasts one: only the Podcasts one (by
+// position) is compared as a multiset; a reorder of the other is a difference.
+#[test]
+fn a_regular_playlist_named_like_the_podcasts_one_keeps_its_order_checked() {
+    let text = |regular: &[&str]| {
+        let body: String = regular.iter().map(|m| format!("\n  {m}")).collect();
+        format!(
+            "P Podcasts 3\n  c\n  a\n  b\nP Podcasts {}{body}",
+            regular.len()
+        )
+    };
+    let cmp = |a: &str, b: &str| {
+        verify::differences(
+            &verify::sort_members(a, &[0]),
+            &verify::sort_members(b, &[0]),
+            20,
+        )
+    };
+    let (ab, ba) = (text(&["x", "y"]), text(&["y", "x"]));
+    let d = cmp(&ab, &ba);
+    assert_eq!(d.len(), 2, "{d:?}");
+    // The special one reordered alone is still fine.
+    let other_order = ab.replace("  c\n  a\n  b", "  b\n  c\n  a");
+    assert!(cmp(&ab, &other_order).is_empty());
+    // And the position of the regular one is what is checked.
+    assert!(
+        verify::differences(
+            &verify::sort_members(&ab, &[1]),
+            &verify::sort_members(&ba, &[1]),
+            20
+        )
+        .is_empty()
+    );
+}
+
+// A Podcasts playlist whose name is NULL prints as "(null)".
+#[test]
+fn a_podcasts_playlist_without_a_name_is_still_sorted() {
+    let text = "P Road 1\n  r\nP (null) 3\n  c\n  a\n  b";
+    assert_eq!(
+        verify::sort_members(text, &[1]),
+        "P Road 1\n  r\nP (null) 3\n  a\n  b\n  c"
+    );
+    let other = "P Road 1\n  r\nP (null) 3\n  b\n  c\n  a";
+    assert!(
+        verify::differences(
+            &verify::sort_members(text, &[1]),
+            &verify::sort_members(other, &[1]),
+            20
+        )
+        .is_empty()
+    );
+    // Dropping a member is still seen.
+    let dropped = "P Road 1\n  r\nP (null) 2\n  b\n  c";
+    assert!(
+        !verify::differences(
+            &verify::sort_members(text, &[1]),
+            &verify::sort_members(dropped, &[1]),
+            20
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn podcast_members_are_compared_as_a_multiset() {
+    let with = |members: &[&str]| {
+        let body: String = members.iter().map(|m| format!("\n  {m}")).collect();
+        format!("P Podcasts {}{body}\nP Road 1\n  r", members.len())
+    };
+    let cmp = |a: &[&str], b: &[&str]| {
+        verify::differences(
+            &verify::sort_members(&with(a), &[0]),
+            &verify::sort_members(&with(b), &[0]),
+            20,
+        )
+    };
+    assert!(cmp(&["a", "b", "c"], &["c", "a", "b"]).is_empty());
+    assert!(!cmp(&["a", "b", "c"], &["a", "b"]).is_empty());
+    assert!(!cmp(&["a", "b"], &["a", "b", "c"]).is_empty());
+    assert!(!cmp(&["a", "b", "c"], &["a", "b", "d"]).is_empty());
+    assert!(!cmp(&["a", "a", "b"], &["a", "b", "b"]).is_empty());
+    // The order of the other playlists still matters.
+    let swapped = with(&["a"]).replace("P Road 1\n  r", "P Road 2\n  s\n  r");
+    let plain = with(&["a"]).replace("P Road 1\n  r", "P Road 2\n  r\n  s");
+    assert!(
+        !verify::differences(
+            &verify::sort_members(&swapped, &[0]),
+            &verify::sort_members(&plain, &[0]),
+            20
+        )
+        .is_empty()
+    );
 }

@@ -437,6 +437,13 @@ impl Writer<'_> {
             });
         }
         let expected = snapshot(db).map_err(|e| self.undo(e))?;
+        // Compared without their order, see `verify::sort_members`.
+        let podcasts: Vec<usize> = db
+            .playlists()
+            .enumerate()
+            .filter(|(_, p)| p.is_podcasts())
+            .map(|(i, _)| i)
+            .collect();
         progress(Progress::Writing);
         if let Err(e) = db.write() {
             // libgpod writes several files; a failure part way leaves some
@@ -471,7 +478,11 @@ impl Writer<'_> {
         };
         let reread = gpod::Database::open(self.mountpoint)
             .map_err(|e| failed(vec![format!("the written database cannot be read: {e}")]))?;
-        let mut diffs = verify::differences(&expected, &snapshot(&reread)?, 20);
+        let mut diffs = verify::differences(
+            &verify::sort_members(&expected, &podcasts),
+            &verify::sort_members(&snapshot(&reread)?, &podcasts),
+            20,
+        );
         // The files the written database still uses, which no deletion
         // may touch: `f01/abcd.mp3` under `iPod_Control/Music`, lower-cased.
         let used: HashSet<String> = reread

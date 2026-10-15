@@ -213,16 +213,54 @@ pub fn pre_write(
 pub fn normalize(snapshot: &str) -> String {
     snapshot
         .lines()
-        .map(|l| match l.find(" mhii ") {
-            Some(i) => {
-                let rest = &l[i + 6..];
-                let end = rest.find(' ').unwrap_or(rest.len());
-                format!("{}{}", &l[..i], &rest[end..])
-            }
-            None => l.to_owned(),
-        })
+        // From the end of a track line: a tag may contain " mhii ".
+        .map(
+            |l| match l.starts_with("T ").then(|| l.rfind(" mhii ")).flatten() {
+                // Only the real field: a number, then the rating.
+                Some(i) => {
+                    let rest = &l[i + 6..];
+                    let end = rest.find(' ').unwrap_or(rest.len());
+                    let number =
+                        !rest[..end].is_empty() && rest[..end].bytes().all(|b| b.is_ascii_digit());
+                    if number && rest[end..].starts_with(" | rating ") {
+                        format!("{}{}", &l[..i], &rest[end..])
+                    } else {
+                        l.to_owned()
+                    }
+                }
+                None => l.to_owned(),
+            },
+        )
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// `snapshot` with the members of the playlists at the positions in
+/// `unordered` sorted, counting its `P` lines from 0 (the database's
+/// playlist order). libgpod writes the Podcasts playlist grouped by show
+/// through a hash table, so its order read back after a write is not the
+/// order in memory; its members, as a multiset, must still match. Taken by
+/// position, a regular playlist of the same name keeps its order checked.
+pub fn sort_members(snapshot: &str, unordered: &[usize]) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut lines = snapshot.lines().peekable();
+    let mut playlist = 0usize;
+    while let Some(l) = lines.next() {
+        out.push(l);
+        if l.starts_with("P ") {
+            let sorted = unordered.contains(&playlist);
+            playlist += 1;
+            if sorted {
+                let mut members = Vec::new();
+                while let Some(m) = lines.next_if(|m| m.starts_with("  ")) {
+                    members.push(m);
+                }
+                members.sort_unstable();
+                out.extend(members);
+            }
+        }
+    }
+    out.join("\n")
 }
 
 /// `snapshot` without each track's artwork fields (`art N mhii M`). A
