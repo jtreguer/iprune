@@ -159,7 +159,7 @@ layouts, string handling and list walking before anything is written.
 
 ```toml
 [library]
-roots = ["/mnt/seagate-1tb/Music"]
+roots = ["/mnt/seagate-1tb/Music"]  # absolute, never /
 exclude_extensions = ["m4v", "mp4", "mov"]
 
 [playlists]
@@ -173,7 +173,8 @@ remove_unmanaged = false
 keep_backups = 20
 
 [device]
-mountpoint = ""                  # empty means detect; absolute otherwise
+mountpoint = ""                  # empty means detect; absolute otherwise,
+                                 # and neither inside a root nor holding one
 # allow_folder = true            # tests only: write to a plain folder
 ```
 
@@ -300,7 +301,15 @@ existing mappings.
    that is not a readable folder stops the scan, and so does a walk that finds
    no audio at all while the index has tracks: an unmounted disk must never
    look like an empty library. Nothing under a folder that failed to read is
-   marked missing.
+   marked missing. Symbolic links are not followed: each is reported, and
+   nothing under it is marked missing. A folder holding an iPod
+   (`iPod_Control/iTunes/iTunesDB`) is skipped and reported, so the iPod's
+   own files never become library tracks. A folder below a root that is
+   now empty, and is a mount target in `/etc/fstab` or held more than 50
+   indexed tracks, counts as unreadable: a disk or share not mounted there
+   must not look like deleted music. When the music was deleted on purpose,
+   removing the empty folder lets the next scan mark it missing. Rows an
+   older scan indexed from an iPod folder are left as they were.
 2. For each file compare `(size, mtime_ns)` with the stored row. Unchanged
    files are skipped, so a rescan of 9,675 files takes about a second.
 3. New or changed files are read in parallel with `lofty` (tags, duration,
@@ -312,6 +321,15 @@ existing mappings.
    and exactly one new file share the hash. Anything ambiguous is an
    addition plus a missing track. The row keeps its id, its path is
    updated, and every `.m3u8` that referenced the old path is rewritten.
+   A file moved and retagged in one go (Picard, beets) has another hash, so
+   a second pass pairs the rest by audio: the same kind, sample rate,
+   bitrate and duration to the millisecond, which tags do not change, plus
+   the same title or the same artist and album, again only one-to-one. Its
+   audio is not proven the same, so its mappings are marked
+   (`synced_size` and `synced_duration_ms` 0) and the next sync copies it
+   again onto the same iPod entry, which keeps its play count and rating.
+   A restore before that sync puts back the backup's mappings, and the
+   mark with them is gone.
 5. Paths that disappeared without a match get `missing_since` set. Their rows
    are kept, with their statistics and playlist links, so a file that comes
    back or turns out to have moved keeps its history. `doctor --fix` drops a
@@ -341,6 +359,9 @@ existing mappings.
   hard link then unlink).
 - Unresolved entries are kept verbatim in the file so iprune never deletes a
   line it does not understand.
+- A reload whose folder listing had errors (an entry or a file's metadata
+  that could not be read, a `.m3u8` name that is not UTF-8) reports them and
+  takes no playlist as deleted in that pass.
 
 ## 9. Device detection and identity
 

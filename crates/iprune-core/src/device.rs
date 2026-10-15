@@ -16,6 +16,12 @@ pub struct Mount {
     pub root: PathBuf,
 }
 
+/// A mountinfo or fstab path with the kernel's octal escapes (`\040` for a
+/// space) decoded.
+pub fn unescape_mount(s: &str) -> String {
+    unescape(s)
+}
+
 /// Undoes the octal escapes the kernel uses in mountinfo (`\040` for space).
 fn unescape(s: &str) -> String {
     let b = s.as_bytes();

@@ -405,7 +405,14 @@ pub fn tag_changes(lib: &Tags, ipod: &Tags) -> Vec<TagChange> {
     out
 }
 
+/// Whether the file's audio is not what was copied to the iPod.
 fn audio_changed(t: &TrackRow, m: &TrackMapping) -> bool {
+    // Marked by the scan when the file was paired with this track by its
+    // audio properties, not its content (`forget_synced_audio`): copied
+    // again whatever its length, a track under a second included.
+    if m.synced_size == 0 && m.synced_duration_ms == Some(0) {
+        return true;
+    }
     match (t.info.duration_ms, m.synced_duration_ms) {
         (Some(now), Some(then)) => {
             t.size != m.synced_size && now.abs_diff(then) > AUDIO_DURATION_MS

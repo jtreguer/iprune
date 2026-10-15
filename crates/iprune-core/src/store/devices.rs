@@ -121,6 +121,17 @@ pub fn set_restoring(conn: &Connection, device_id: i64, stamp: Option<&str>) -> 
     Ok(())
 }
 
+/// Marks every iPod copy of library track `track_id` as holding audio no
+/// longer known to be the file's, so the next sync copies it again onto the
+/// same iPod entry (see `plan::audio_changed`).
+pub fn forget_synced_audio(conn: &Connection, track_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE device_tracks SET synced_size = 0, synced_duration_ms = 0 WHERE track_id = ?1",
+        [track_id],
+    )?;
+    Ok(())
+}
+
 /// The rating each mapped iPod track held at the last statistics pull, by
 /// dbid; tracks not known yet are left out.
 pub fn synced_ratings(

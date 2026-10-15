@@ -61,23 +61,50 @@ fn existing_file(cfg: &Config, name: &str) -> Result<PathBuf> {
     Ok(file)
 }
 
-/// `(name, path)` of every playlist file in `dir`, sorted by name. Hidden files
-/// (including iprune's own temporary files) and non-UTF-8 names are ignored.
-fn playlist_files(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
-    let mut out: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
-        .at(dir)?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            let stem = name
-                .strip_suffix(EXT)
-                .filter(|s| !s.starts_with('.') && !s.is_empty())?;
-            Some((stem.to_owned(), e.path()))
-        })
-        .filter(|(_, p)| p.is_file())
-        .collect();
-    out.sort();
-    Ok(out)
+/// The playlist files of a folder, and what could not be read in it.
+struct Listing {
+    /// `(name, path)` of every playlist file, sorted by name.
+    files: Vec<(String, PathBuf)>,
+    /// Entries that could not be read or named: a playlist may be among
+    /// them, so none is taken as deleted while there are any.
+    problems: Vec<(PathBuf, String)>,
+}
+
+/// The playlist files in `dir`. Hidden files (including iprune's own
+/// temporary files) are ignored, as is a link to nothing.
+fn playlist_files(dir: &Path) -> Result<Listing> {
+    let mut files = Vec::new();
+    let mut problems = Vec::new();
+    for e in std::fs::read_dir(dir).at(dir)? {
+        let e = match e {
+            Ok(e) => e,
+            Err(err) => {
+                problems.push((dir.to_owned(), err.to_string()));
+                continue;
+            }
+        };
+        let raw = e.file_name();
+        let Some(name) = raw.to_str() else {
+            if raw.as_encoded_bytes().ends_with(EXT.as_bytes()) {
+                problems.push((e.path(), "name is not valid UTF-8".into()));
+            }
+            continue;
+        };
+        let Some(stem) = name
+            .strip_suffix(EXT)
+            .filter(|s| !s.starts_with('.') && !s.is_empty())
+        else {
+            continue;
+        };
+        match std::fs::metadata(e.path()) {
+            Ok(m) if m.is_file() => files.push((stem.to_owned(), e.path())),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => problems.push((e.path(), err.to_string())),
+        }
+    }
+    files.sort();
+    Ok(Listing { files, problems })
 }
 
 fn resolve(conn: &Connection, cfg: &Config, entries: Vec<Entry>) -> Result<Vec<Item>> {
@@ -178,7 +205,10 @@ fn load_from_disk(conn: &Connection, cfg: &Config, force: bool) -> Result<LoadRe
         .collect();
     let mut report = LoadReport::default();
     let mut seen = HashSet::new();
-    for (name, file) in playlist_files(dir)? {
+    let listing = playlist_files(dir)?;
+    let complete = listing.problems.is_empty();
+    report.skipped.extend(listing.problems);
+    for (name, file) in listing.files {
         let mtime = mtime_ns(&file)?;
         seen.insert(name.clone());
         if !force && known.get(&name) == Some(&mtime) {
@@ -200,7 +230,8 @@ fn load_from_disk(conn: &Connection, cfg: &Config, force: bool) -> Result<LoadRe
         store_items(conn, &name, &file, &items)?;
         report.loaded += 1;
     }
-    for name in known.keys().filter(|n| !seen.contains(*n)) {
+    // A folder not fully read may still hold the playlists not seen.
+    for name in known.keys().filter(|n| complete && !seen.contains(*n)) {
         store::delete_playlist(conn, name)?;
         report.removed.push(name.clone());
     }
@@ -221,7 +252,7 @@ pub fn rewrite_moved(
     }
     let mut rewritten = Vec::new();
     let dir = &cfg.playlists.dir;
-    for (name, file) in playlist_files(dir)? {
+    for (name, file) in playlist_files(dir)?.files {
         let mtime = mtime_ns(&file)?;
         // An unreadable playlist is reported by the reload that follows.
         let Ok(entries) = playlist::read(&file) else {

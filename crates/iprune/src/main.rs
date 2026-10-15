@@ -271,6 +271,12 @@ fn run_scan() -> Result<()> {
     print_list(&mut out, "unreadable", &r.unreadable, |(p, why)| {
         format!("{}: {why}", p.display())
     })?;
+    print_list(
+        &mut out,
+        "iPods inside the library folders, not indexed",
+        &r.ipods,
+        |p| p.display().to_string(),
+    )?;
     print_list(&mut out, "unsupported", &r.unsupported, |(p, why)| {
         format!("{}: {why}", p.display())
     })?;

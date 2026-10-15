@@ -11,7 +11,7 @@ use lofty::probe::Probe;
 use lofty::tag::Tag;
 
 /// Audio formats the iPod Classic plays.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileKind {
     Mp3,
     Aac,

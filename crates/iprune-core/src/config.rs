@@ -153,9 +153,27 @@ impl Config {
         if !self.playlists.dir.is_absolute() {
             return fail("playlists.dir must be an absolute path");
         }
+        if self.library.roots.iter().any(|r| r.parent().is_none()) {
+            return fail("library.roots must not be / (it holds the iPod and everything else)");
+        }
         let mp = &self.device.mountpoint;
         if !mp.as_os_str().is_empty() && !mp.is_absolute() {
             return fail("device.mountpoint must be an absolute path");
+        }
+        // The iPod's own files must never be library tracks. An iPod found
+        // at run time inside a root is skipped by the scan.
+        if !mp.as_os_str().is_empty() {
+            let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+            let mp = real(mp);
+            if self
+                .library
+                .roots
+                .iter()
+                .map(|r| real(r))
+                .any(|r| r.starts_with(&mp) || mp.starts_with(&r))
+            {
+                return fail("device.mountpoint must not be inside a library root, nor hold one");
+            }
         }
         Ok(())
     }

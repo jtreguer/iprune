@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use crate::config::Config;
 use crate::playlists::{self, LoadReport};
 use crate::store::{self, FileRecord, Store, TrackRow};
-use crate::tags::{self, ReadError};
+use crate::tags::{self, AudioInfo, FileKind, ReadError};
 use crate::{Error, Result, now_unix, paths};
 
 /// Threads used to read and hash files. The library is on a USB hard disk,
@@ -45,6 +45,10 @@ pub struct ScanReport {
     /// AAC. Taken from the index.
     pub drm: Vec<PathBuf>,
     pub non_utf8: Vec<PathBuf>,
+    /// Folders under a root that hold an iPod (`iPod_Control/iTunes/
+    /// iTunesDB`): never indexed, or the iPod's own files would become
+    /// library tracks.
+    pub ipods: Vec<PathBuf>,
     /// Playlists rewritten to follow moved files.
     pub rewritten_playlists: Vec<String>,
     pub playlists: LoadReport,
@@ -61,8 +65,17 @@ fn walk(cfg: &Config, report: &mut ScanReport, progress: &(dyn Fn(Progress) + Sy
     let mut seen = Vec::new();
     let mut keys = HashSet::new();
     for root in &cfg.library.roots {
+        let ipods = std::cell::RefCell::new(Vec::new());
         let walker = walkdir::WalkDir::new(root).into_iter().filter_entry(|e| {
-            e.depth() == 0 || !e.file_name().as_encoded_bytes().starts_with(b".")
+            if e.depth() > 0 && e.file_name().as_encoded_bytes().starts_with(b".") {
+                return false;
+            }
+            let ipod =
+                e.file_type().is_dir() && e.path().join("iPod_Control/iTunes/iTunesDB").is_file();
+            if ipod {
+                ipods.borrow_mut().push(e.path().to_owned());
+            }
+            !ipod
         });
         for entry in walker {
             let entry = match entry {
@@ -73,6 +86,14 @@ fn walk(cfg: &Config, report: &mut ScanReport, progress: &(dyn Fn(Progress) + Sy
                     continue;
                 }
             };
+            // Links are not followed: what is under one is kept as it was,
+            // never declared missing, and the link is reported.
+            if entry.depth() > 0 && entry.path_is_symlink() {
+                report
+                    .unreadable
+                    .push((entry.into_path(), "symbolic link, not followed".into()));
+                continue;
+            }
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -116,8 +137,43 @@ fn walk(cfg: &Config, report: &mut ScanReport, progress: &(dyn Fn(Progress) + Sy
                 progress(Progress::Walking { files: seen.len() });
             }
         }
+        report.ipods.extend(ipods.into_inner());
     }
     seen
+}
+
+/// More indexed tracks than this under a folder now empty means a disk or
+/// share not mounted there, not an album deleted file by file.
+const EMPTY_FOLDER_TRACKS: usize = 50;
+
+/// Whether `dir` is a mount target in `/etc/fstab` text.
+fn mounted_by_fstab(fstab: &str, dir: &Path) -> bool {
+    fstab
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .any(|target| Path::new(&crate::device::unescape_mount(target)) == dir)
+}
+
+/// What a retag leaves unchanged in a file: its kind, sample rate, bitrate
+/// and exact duration. `None` without a duration.
+type AudioKey = (FileKind, Option<u32>, Option<u32>, u32);
+
+/// Whether two tag sets name the same song well enough to pair files by
+/// their audio properties: the same title, or the same artist and album,
+/// ignoring case and surrounding spaces.
+fn same_song(a: &tags::Tags, b: &tags::Tags) -> bool {
+    let eq = |x: &Option<String>, y: &Option<String>| match (x, y) {
+        (Some(x), Some(y)) => x.trim().to_lowercase() == y.trim().to_lowercase(),
+        _ => false,
+    };
+    eq(&a.title, &b.title) || (eq(&a.artist, &b.artist) && eq(&a.album, &b.album))
+}
+
+fn audio_key(info: &AudioInfo) -> Option<AudioKey> {
+    let ms = info.duration_ms.filter(|&ms| ms > 0)?;
+    Some((info.kind, info.samplerate, info.bitrate, ms))
 }
 
 fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
@@ -190,8 +246,46 @@ pub fn scan(
         }
     }
     let seen_keys: HashSet<&str> = seen.iter().map(|s| s.key.as_str()).collect();
+    // Same for a folder below a root that is now empty and is where a disk
+    // or share is mounted (in /etc/fstab), or held more tracks than an
+    // album: most likely what is mounted there is not.
+    let fstab = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
+    let mut empty: HashMap<PathBuf, usize> = HashMap::new();
+    for t in &existing {
+        if t.missing_since.is_some() || seen_keys.contains(t.path_key.as_str()) {
+            continue;
+        }
+        let Some(root) = cfg.library.roots.iter().find(|r| t.path.starts_with(r)) else {
+            continue;
+        };
+        let Some(dir) = t.path.ancestors().skip(1).find(|d| d.is_dir()) else {
+            continue;
+        };
+        if dir != root.as_path() && dir.starts_with(root) {
+            *empty.entry(dir.to_owned()).or_default() += 1;
+        }
+    }
+    for (dir, held) in empty {
+        if (held > EMPTY_FOLDER_TRACKS || mounted_by_fstab(&fstab, &dir))
+            && std::fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_none())
+        {
+            report.unreadable.push((
+                dir,
+                "empty folder that held indexed tracks: is a disk mounted there? \
+             If the music was deleted on purpose, remove the folder"
+                    .into(),
+            ));
+        }
+    }
     // Nothing under a path that could not be read is declared missing.
-    let walk_errors: Vec<PathBuf> = report.unreadable.iter().map(|(p, _)| p.clone()).collect();
+    // An iPod inside a root is skipped, and rows an older scan indexed from
+    // it are left as they were.
+    let walk_errors: Vec<PathBuf> = report
+        .unreadable
+        .iter()
+        .map(|(p, _)| p.clone())
+        .chain(report.ipods.iter().cloned())
+        .collect();
     let vanished = |t: &TrackRow| {
         t.missing_since.is_none()
             && !seen_keys.contains(t.path_key.as_str())
@@ -256,6 +350,8 @@ pub fn scan(
     let now = now_unix();
     let tx = store.transaction()?;
     let mut moves: HashMap<String, i64> = HashMap::new();
+    // New files the content hash did not pair with a vanished track.
+    let mut unpaired: Vec<FileRecord> = Vec::new();
     for (s, t, r) in results {
         let rec = match r {
             Ok(rec) => rec,
@@ -288,15 +384,57 @@ pub fn scan(
                         moves.insert(old.path_key.clone(), old.id);
                         report.moved.push((old.path.clone(), rec.path.clone()));
                     }
-                    _ => {
-                        store::insert_track(&tx, &rec, now)?;
-                        report.added += 1;
-                    }
+                    _ => unpaired.push(rec),
                 }
             }
         }
     }
+    // A file moved and retagged in one go (Picard, beets) has another hash,
+    // but the same audio: the same kind, sample rate, bitrate and duration
+    // to the millisecond, which tags do not change. Paired only when exactly
+    // one vanished or missing track and exactly one new file share them.
+    let left: Vec<(&TrackRow, bool)> = gone.values().flatten().copied().collect();
+    let mut by_audio: HashMap<AudioKey, Vec<usize>> = HashMap::new();
+    for (i, (t, _)) in left.iter().enumerate() {
+        if let Some(k) = audio_key(&t.info) {
+            by_audio.entry(k).or_default().push(i);
+        }
+    }
+    let mut new_by_audio: HashMap<AudioKey, usize> = HashMap::new();
+    for rec in &unpaired {
+        if let Some(k) = audio_key(&rec.info) {
+            *new_by_audio.entry(k).or_default() += 1;
+        }
+    }
+    let mut taken: HashSet<i64> = HashSet::new();
+    for rec in unpaired {
+        let pair = audio_key(&rec.info)
+            .filter(|k| new_by_audio[k] == 1)
+            .and_then(|k| match by_audio.get(&k).map(Vec::as_slice) {
+                Some(&[i]) => Some(left[i].0),
+                _ => None,
+            })
+            .filter(|old| same_song(&old.tags, &rec.tags));
+        match pair {
+            Some(old) => {
+                store::update_track(&tx, old.id, &rec)?;
+                // Its audio is not proven the same: every iPod copy of it is
+                // copied again, keeping the iPod entry and its history.
+                store::devices::forget_synced_audio(&tx, old.id)?;
+                taken.insert(old.id);
+                moves.insert(old.path_key.clone(), old.id);
+                report.moved.push((old.path.clone(), rec.path.clone()));
+            }
+            None => {
+                store::insert_track(&tx, &rec, now)?;
+                report.added += 1;
+            }
+        }
+    }
     for (t, newly) in gone.into_values().flatten() {
+        if taken.contains(&t.id) {
+            continue;
+        }
         if newly {
             store::set_missing(&tx, t.id, Some(now))?;
             report.missing.push(t.path.clone());
@@ -340,5 +478,55 @@ mod tests {
             without_panics(unreadable),
             Err(ReadError::Unreadable("bad".into()))
         );
+    }
+
+    const FSTAB: &str = "\
+# <file system> <mount point> <type> <options> <dump> <pass>
+UUID=1111 / ext4 rw 0 1
+   # /mnt/commented ext4 defaults 0 0
+//nas/share\t/mnt/nas\tcifs\tuser=x 0 0
+/dev/sdb1   /mnt/My\\040Disk   ext4   defaults  0 2
+
+/dev/sdc1 /mnt/seagate ext4 defaults 0 2 # /mnt/after-comment
+/mnt/device-field /mnt/other ext4 defaults 0 0
+";
+
+    #[test]
+    fn a_mount_target_in_fstab_is_found_whatever_the_spacing_and_escapes() {
+        for dir in [
+            "/",
+            "/mnt/nas",
+            "/mnt/My Disk",
+            "/mnt/seagate",
+            "/mnt/other",
+        ] {
+            assert!(mounted_by_fstab(FSTAB, Path::new(dir)), "{dir}");
+        }
+    }
+
+    #[test]
+    fn comments_other_fields_and_near_misses_are_not_mount_targets() {
+        for dir in [
+            "/mnt/commented",
+            "/mnt/after-comment",
+            // the device field, not the mount point
+            "/mnt/device-field",
+            "//nas/share",
+            "/dev/sdb1",
+            // prefixes, parents and the unescaped text
+            "/mnt",
+            "/mnt/na",
+            "/mnt/nas/sub",
+            "/mnt/seagate2",
+            "/mnt/My\\040Disk",
+            "/mnt/My",
+        ] {
+            assert!(!mounted_by_fstab(FSTAB, Path::new(dir)), "{dir}");
+        }
+        assert!(!mounted_by_fstab("", Path::new("/mnt/nas")));
+        assert!(!mounted_by_fstab(
+            "# only a comment\n\n",
+            Path::new("/mnt/nas")
+        ));
     }
 }

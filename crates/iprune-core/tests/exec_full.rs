@@ -4608,3 +4608,209 @@ fn a_kill_after_play_counts_was_moved_aside_counts_every_play_once_on_the_next_s
     );
     assert_eq!(w.pending_pulls(), 0);
 }
+
+// ---- audit step 6: library identity
+
+mod library_identity {
+    use super::*;
+
+    /// Track `variant`'s audio with its title replaced; the artist stays and
+    /// the album is always "Album A".
+    fn album_mp3(variant: u32, title: &str) -> Vec<u8> {
+        retagged_mp3(
+            variant,
+            title,
+            &format!("Artist{variant}"),
+            Some("Album A"),
+            None,
+        )
+    }
+
+    // Prevents (audit H6) a file moved and retagged in one go (Picard, beets)
+    // becoming a new track: its iPod entry removed, its stats and playlist
+    // places lost.
+    #[test]
+    fn a_file_moved_and_retagged_together_keeps_its_track_playlists_stats_and_ipod_entry() {
+        let mut w = World::new(3);
+        w.write_play_counts(&[
+            (4, 1_700_000_000, 80, 2),
+            (0, 0, 0, 0),
+            (0, 0, 0, 0),
+            (0, 0, 0, 0),
+        ]);
+        // Track 1 gets an album in the library; one sync settles that and
+        // pulls the plays into SQLite.
+        let src = w.files[0].clone();
+        fs::write(&src, album_mp3(1, "Title1")).unwrap();
+        w.rescan();
+        w.sync().unwrap();
+        let id = w.id_of(&src);
+        assert_eq!(stats_of(&w, &src), Some((4, Some(80))));
+        let before = w.track(dbid(1)).unwrap();
+        assert_eq!((before.adopt.playcount, before.rating), (4, 80));
+        assert_eq!(before.tags.album.as_deref(), Some("Album A"));
+        let road_before = w.playlist("Road").unwrap();
+        assert!(w.prepare().plan.is_empty());
+
+        // Same audio, new title and path in one operation.
+        fs::remove_file(&src).unwrap();
+        let new_path = w
+            .env
+            .add_bytes("Artist1/Album A/01 Renamed.mp3", &album_mp3(1, "Renamed"));
+        let scan = w.env.scan();
+        w.reload();
+        assert_eq!(scan.moved, vec![(src.clone(), new_path.clone())]);
+        assert_eq!((scan.added, scan.missing.len()), (0, 0), "{scan:?}");
+        assert_eq!(w.id_of(&new_path), id, "the track keeps its id");
+        // The .m3u8 follows the file and every entry still resolves.
+        let road = w.env.locations("Road");
+        assert_eq!(road.first().map(String::as_str), new_path.to_str());
+        assert!(!road.iter().any(|l| Path::new(l) == src), "{road:?}");
+        let items = w.env.indexed_items("Road");
+        assert_eq!(items.len(), 3);
+        assert!(items.iter().all(|i| i.1.is_some()), "{items:?}");
+        assert_eq!(items[0].1, Some(id));
+        assert_eq!(stats_of(&w, &new_path), Some((4, Some(80))));
+
+        // The plan replaces the audio on the same iPod entry.
+        let p = w.prepare();
+        assert_eq!(p.plan.replace.len(), 1, "{:?}", p.plan);
+        assert_eq!(
+            (p.plan.replace[0].track_id, p.plan.replace[0].old_dbid),
+            (id, dbid(1))
+        );
+        assert!(
+            p.plan.copy.is_empty() && p.plan.remove.is_empty(),
+            "{:?}",
+            p.plan
+        );
+
+        let count_before = w.contents().tracks.len();
+        let out = w.sync().unwrap();
+        assert_eq!((out.copied, out.recopied, out.removed), (0, 1, 0));
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+
+        assert_eq!(w.mapping()[&id], dbid(1), "same iPod entry");
+        assert_eq!(w.contents().tracks.len(), count_before);
+        assert_eq!(w.playlist("Road").unwrap(), road_before);
+        let after = w.track(dbid(1)).unwrap();
+        assert_eq!(after.tags.title.as_deref(), Some("Renamed"));
+        assert_eq!((after.adopt.playcount, after.rating), (4, 80));
+        assert_eq!(
+            fs::read(w.file_of(dbid(1))).unwrap(),
+            fs::read(&new_path).unwrap(),
+            "the iPod holds the library file's bytes"
+        );
+        assert_eq!(stats_of(&w, &new_path), Some((4, Some(80))));
+        // The mapping records the real audio now: settled.
+        assert!(exec::full_work(&w.prepare()).is_empty());
+    }
+
+    // A wrong pair must never leave old audio under new tags: a different
+    // recording of the same length and bitrate that is paired by mistake
+    // (same artist and album) gets its audio replaced, not just retagged.
+    #[test]
+    fn a_wrong_pair_by_audio_properties_gets_its_audio_replaced_not_just_retagged() {
+        let mut w = World::new(3);
+        let src = w.files[1].clone();
+        fs::write(&src, album_mp3(2, "Title2")).unwrap();
+        w.rescan();
+        w.sync().unwrap();
+        // Another recording of the same length, same artist and album, new
+        // title and path (the tags say it is the same song, the bytes of the
+        // audio are different).
+        let old_audio = fs::read(w.file_of(dbid(2))).unwrap();
+        fs::remove_file(&src).unwrap();
+        let new_bytes = retagged_mp3(7, "Take Two", "Artist2", Some("Album A"), None);
+        let new_path = w.env.add_bytes("Take Two.mp3", &new_bytes);
+        let scan = w.env.scan();
+        w.reload();
+        assert_eq!(scan.moved.len(), 1, "{scan:?}");
+        let p = w.prepare();
+        assert_eq!(p.plan.replace.len(), 1, "{:?}", p.plan);
+        w.sync().unwrap();
+        let now = fs::read(w.file_of(dbid(2))).unwrap();
+        assert_ne!(now, old_audio);
+        assert_eq!(now, fs::read(&new_path).unwrap());
+        assert_eq!(w.mapping()[&w.id_of(&new_path)], dbid(2));
+    }
+
+    /// A 600 ms Mp3 with these tags, and the same audio under other tags.
+    fn short_mp3_pair(dir: &Path) -> (Vec<u8>, Vec<u8>) {
+        let run = |args: &[&str]| {
+            let o = std::process::Command::new("ffmpeg")
+                .args(["-loglevel", "error", "-y"])
+                .args(args)
+                .output()
+                .expect("ffmpeg must be installed");
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        };
+        let a = dir.join("a.mp3");
+        let b = dir.join("b.mp3");
+        let a_s = a.to_str().unwrap();
+        run(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=0.6",
+            "-c:a",
+            "libmp3lame",
+            "-id3v2_version",
+            "3",
+            "-metadata",
+            "title=Short",
+            "-metadata",
+            "artist=Artist1",
+            "-metadata",
+            "album=Album A",
+            a_s,
+        ]);
+        run(&[
+            "-i",
+            a_s,
+            "-c",
+            "copy",
+            "-id3v2_version",
+            "3",
+            "-metadata",
+            "title=Short Renamed",
+            b.to_str().unwrap(),
+        ]);
+        (fs::read(a).unwrap(), fs::read(b).unwrap())
+    }
+
+    // A paired track of a second or less: the duration rule cannot fire (the
+    // difference to the reset mark is under the tolerance), so only the mark
+    // makes the plan replace the audio.
+    #[test]
+    fn a_wrong_pair_of_a_track_under_a_second_is_planned_as_a_replace() {
+        let mut w = World::new(3);
+        let tmp = tempfile::tempdir().unwrap();
+        let (old_bytes, new_bytes) = short_mp3_pair(tmp.path());
+        let src = w.files[0].clone();
+        fs::write(&src, &old_bytes).unwrap();
+        w.rescan();
+        assert!(w.env.track(&src).info.duration_ms.unwrap() < 1000);
+        w.sync().unwrap();
+        assert!(w.prepare().plan.is_empty(), "settled before the move");
+        let id = w.id_of(&src);
+
+        fs::remove_file(&src).unwrap();
+        let new_path = w.env.add_bytes("Short Renamed.mp3", &new_bytes);
+        let scan = w.env.scan();
+        w.reload();
+        assert_eq!(scan.moved.len(), 1, "{scan:?}");
+        assert_eq!(w.id_of(&new_path), id);
+
+        let p = w.prepare();
+        assert_eq!(p.plan.replace.len(), 1, "{:?}", p.plan);
+        assert_eq!(p.plan.replace[0].track_id, id);
+        assert_eq!(p.plan.replace[0].old_dbid, dbid(1));
+        w.sync().unwrap();
+        assert_eq!(
+            fs::read(w.file_of(dbid(1))).unwrap(),
+            fs::read(&new_path).unwrap()
+        );
+        assert!(w.prepare().plan.is_empty());
+    }
+}
