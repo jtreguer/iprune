@@ -805,6 +805,44 @@ fn restore_onto_an_ipod_without_a_readable_guid_needs_the_folder_named() {
     assert_ne!(sb.tree(&sb.ipod), ipod_before);
 }
 
+// Prevents (audit L17) the one iPod a restore is for, one whose database is
+// gone, being unfindable: restore needs a mounted iPod with an iTunesDB.
+#[test]
+fn restore_mountpoint_puts_the_backup_on_an_ipod_whose_database_was_deleted() {
+    let sb = adopted();
+    let stamp = sb.synced();
+    let backed_up = fs::read(
+        sb.backups_dir()
+            .join(GUID_DIR)
+            .join(&stamp)
+            .join("iTunesDB"),
+    )
+    .unwrap();
+    assert_ne!(sb.itunesdb(), backed_up, "set up: the sync changed it");
+    // No mountpoint in the config, and the database gone.
+    sb.edit_config(&format!("mountpoint = {:?}", sb.ipod), "mountpoint = \"\"");
+    let db = sb.ipod.join("iPod_Control/iTunes/iTunesDB");
+    fs::remove_file(&db).unwrap();
+    let ipod_before = sb.tree(&sb.ipod);
+
+    // Without the option nothing is found (detection is off here), and
+    // nothing changes.
+    let o = sb.run(&["restore", &stamp, "--yes"]);
+    assert_code(&o, 1);
+    assert_eq!(sb.tree(&sb.ipod), ipod_before);
+
+    let o = sb.ok(&[
+        "restore",
+        &stamp,
+        "--yes",
+        "--mountpoint",
+        sb.ipod.to_str().unwrap(),
+    ]);
+    assert!(out(&o).contains("restored iTunesDB"), "{}", out(&o));
+    assert_eq!(fs::read(&db).unwrap(), backed_up);
+    assert_eq!(sb.ipod_playlist("Road"), Some(vec![u64::MAX - 1, 2]));
+}
+
 #[test]
 fn restore_says_where_it_saved_what_it_replaced() {
     let sb = adopted();
@@ -1104,6 +1142,118 @@ fn doctor_fix_deletes_orphans_after_its_own_sync_and_leaves_the_lock_free() {
     assert!(out(&o).contains("moved 2 orphan files"), "{}", out(&o));
     sb.assert_quarantined(&orphans);
     drop(sb.hold_ipod_lock());
+}
+
+// ---- doctor --fix and the long-missing tracks (audit L38)
+
+impl Sandbox {
+    fn index(&self) -> Store {
+        Store::open(&self.base().join("data/iprune/iprune.sqlite")).unwrap()
+    }
+
+    /// A library file the iPod does not have, indexed, with play counts.
+    /// Returns its path.
+    fn extra_track(&self) -> PathBuf {
+        let f = self.music.join("four.mp3");
+        fs::copy(fixture(Kind::Mp3, 7), &f).unwrap();
+        self.ok(&["scan"]);
+        let store = self.index();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO stats (track_id, plays) SELECT id, 4 FROM tracks WHERE path = ?1",
+                [f.to_str().unwrap()],
+            )
+            .unwrap();
+        f
+    }
+
+    /// Marks the track at `f` as missing for 31 days.
+    fn long_missing(&self, f: &Path) {
+        let then = iprune_core::now_unix() - iprune_core::doctor::FORGET_AFTER_SECS - 100;
+        self.index()
+            .conn()
+            .execute(
+                "UPDATE tracks SET missing_since = ?2 WHERE path = ?1",
+                (f.to_str().unwrap(), then),
+            )
+            .unwrap();
+    }
+
+    /// `(rows in tracks, rows in stats)` for the track at `f`.
+    fn kept(&self, f: &Path) -> (i64, i64) {
+        let store = self.index();
+        let c = store.conn();
+        let q = |sql: &str| -> i64 {
+            c.query_row(sql, [f.to_str().unwrap()], |r| r.get(0))
+                .unwrap()
+        };
+        (
+            q("SELECT COUNT(*) FROM tracks WHERE path = ?1"),
+            q(
+                "SELECT COUNT(*) FROM stats WHERE track_id IN (SELECT id FROM tracks WHERE path = ?1)",
+            ),
+        )
+    }
+}
+
+// Prevents (audit L38) a track whose file is back, but which no scan has
+// seen yet, being forgotten with its play counts by `doctor --fix`.
+#[test]
+fn doctor_fix_keeps_a_long_missing_track_whose_file_is_back() {
+    let sb = adopted();
+    let f = sb.extra_track();
+    sb.long_missing(&f); // marked missing 31 days ago, but the file is there
+    sb.lose_files([2]); // something else to repair, so the repair runs
+    assert_eq!(sb.kept(&f), (1, 1));
+
+    let o = sb.ok(&["doctor", "--fix", "--yes"]);
+    assert!(
+        out(&o).contains("removed 1 database entries"),
+        "{}",
+        out(&o)
+    );
+    assert!(
+        !out(&o).contains("long-missing tracks from the index"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(sb.kept(&f), (1, 1), "the row and its plays stay");
+}
+
+// Prevents (audit L38) an unmounted library disk making `doctor --fix`
+// forget every long-missing track: a failed scan means nothing is known.
+#[test]
+fn doctor_fix_forgets_nothing_when_the_library_cannot_be_scanned() {
+    let sb = adopted();
+    let f = sb.extra_track();
+    fs::remove_file(&f).unwrap();
+    sb.ok(&["scan"]);
+    sb.long_missing(&f);
+    sb.lose_files([2]);
+    assert_eq!(sb.kept(&f), (1, 1));
+
+    // The library folder is gone, as with an unmounted disk.
+    let away = sb.base().join("music-away");
+    fs::rename(&sb.music, &away).unwrap();
+    let o = sb.ok(&["doctor", "--fix", "--yes"]);
+    assert!(
+        err(&o).contains("scan"),
+        "the scan failure is said: {}",
+        err(&o)
+    );
+    assert!(
+        out(&o).contains("removed 1 database entries"),
+        "the rest is repaired: {}",
+        out(&o)
+    );
+    assert_eq!(sb.kept(&f), (1, 1), "nothing forgotten");
+
+    // Control: with the library back, the same track is forgotten.
+    fs::rename(&away, &sb.music).unwrap();
+    let o = sb.ok(&["doctor", "--fix", "--yes"]);
+    assert!(out(&o).contains("1 long-missing tracks"), "{}", out(&o));
+    assert_eq!(sb.kept(&f), (0, 0));
 }
 
 #[test]

@@ -715,7 +715,11 @@ Order of operations:
    gapless flag stay. A file that is not marked as part of a compilation never
    clears the iPod's mark. Copies run one at a time with progress in bytes;
    the USB link is the limit. Files sampled above 48 kHz, which the iPod
-   Classic cannot play, are skipped by the planner like FairPlay files.
+   Classic cannot play, and files of 4 GiB or more, which FAT32 cannot
+   hold, are skipped by the planner like FairPlay files. A copy that fails
+   is checked by reading the library file to its end: if that fails too (a
+   bad sector), the file is skipped like one gone and the sync goes on;
+   otherwise the iPod failed and the sync stops as below.
 7. Update tags on existing tracks: only the fields the plan lists, so an
    empty library field never clears an iPod value.
 8. Apply playlist operations: deletes, renames, creates, then member updates
@@ -735,8 +739,13 @@ Order of operations:
 13. Record the playlist mappings (with the ids of created playlists), drop
     the tombstones whose iPod playlist was deleted and set `last_sync_at`.
     Then export `stats.csv`, write the manifest to the iPod and keep the
-    newest `keep_backups` backups (at least one); a failure in these last
-    three is a warning, since the sync itself is done.
+    newest `keep_backups` backups, never deleting the one this sync took;
+    a failure in these last three is a warning, since the sync itself is
+    done. A new backup's stamp always sorts after the existing ones, even
+    with the clock set back (it then takes the latest stamp with a higher
+    `-N`). Only folders named like a stamp (`YYYYMMDD-HHMMSS`, with an
+    optional `-N`) count as backups; anything else in the folder is
+    ignored.
 
 Mappings are recorded right after each verified write. If a crash comes
 in between, the next `prepare` takes them back: an unmapped library
@@ -919,19 +928,32 @@ rebuilt by the next sync; an unmanaged one is only reported.
 ## 13. CLI
 
 ```
-iprune init
+iprune init --library DIR... --playlists DIR [--path-style S] [--force]
 iprune scan
 iprune adopt [--file <iTunesDB>] [--accept-proposals]
 iprune sync [--plan-only] [--verbose] [--json] [--yes] [--allow-mass-removal]
 iprune playlist list|show|new|rm|rename|add|remove|move ...
 iprune device info
 iprune backups
-iprune restore <stamp> [--guid GUID] [--discard-play-counts] [--yes]
+iprune restore <stamp> [--guid GUID] [--mountpoint DIR] [--discard-play-counts] [--yes]
 iprune doctor [--fix]
 iprune snapshot <mountpoint|iTunesDB>
 iprune eject
 iprune                    (no arguments: prints help; the window is iprune-gui)
 ```
+
+`init --force` changes an existing config: the library folders and the
+playlists folder given replace the old ones, `--path-style` when given, and
+every other setting is kept. A config that no longer passes its checks is
+mended this way; one that cannot be parsed is refused, to be fixed or
+removed by hand, and the result is checked before it is written. It warns
+when indexed tracks lie outside the new folders (compared in NFC), since
+the next scan marks them missing. `doctor --fix` finds the iPod, then scans
+the library before examining it; when the scan fails, no track is forgotten that time, and
+a track whose file is back is never forgotten. `restore` that finds no iPod
+with a database looks for a FAT32 mount with the iPod's device files
+(`SysInfo` or `SysInfoExtended`), the state a lost `iTunesDB` leaves, or
+takes `--mountpoint`.
 
 Exit codes: 0 success, 1 error, 2 usage, 3 verification failed, 4 user
 declined the plan.

@@ -152,7 +152,9 @@ fn list_returns_the_backups_oldest_first_and_ignores_other_entries() {
     let ipod = Ipod::new();
     ipod.full("x");
     let data = root();
-    // Created out of order on purpose; one pair shares a second.
+    // Taken with a clock that goes back: a new backup always sorts after
+    // the existing ones (audit L21), so the list is in creation order.
+    // One pair shares a second.
     let made = make(data.path(), &ipod, &[3000, 1000, 2000, 1000]);
     let base = data.path().join(GUID);
     fs::create_dir(base.join("19990101-000000")).unwrap(); // no iTunesDB inside
@@ -164,11 +166,15 @@ fn list_returns_the_backups_oldest_first_and_ignores_other_entries() {
         .collect();
     assert_eq!(
         listed,
+        made.iter().map(|b| b.stamp.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        listed,
         vec![
-            backup::stamp(1000),
-            format!("{}-2", backup::stamp(1000)),
-            backup::stamp(2000),
             backup::stamp(3000),
+            format!("{}-2", backup::stamp(3000)),
+            format!("{}-3", backup::stamp(3000)),
+            format!("{}-4", backup::stamp(3000)),
         ]
     );
     assert_eq!(made.len(), 4);
@@ -210,6 +216,197 @@ fn prune_keeps_the_newest_and_only_touches_its_own_ipod() {
 
     // Pruning again changes nothing.
     assert!(backup::prune(data.path(), GUID, 2).unwrap().is_empty());
+}
+
+// Prevents (audit L21) a backup taken with a clock behind the existing ones
+// sorting first, so the next prune deletes the backup just taken.
+#[test]
+fn a_backup_taken_with_the_clock_behind_sorts_after_every_existing_one() {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    let data = root();
+    let future = make(data.path(), &ipod, &[5000, 6000]);
+    ipod.full("now");
+    let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    assert_eq!(b.stamp, format!("{}-2", backup::stamp(6000)));
+    assert_eq!(
+        fs::read_to_string(b.dir.join("iTunesDB")).unwrap(),
+        "db now"
+    );
+    let listed = backup::list(data.path(), GUID).unwrap();
+    assert_eq!(listed.last(), Some(&b));
+    assert_eq!(listed.len(), 3);
+    assert_eq!(listed[0], future[0]);
+    // And the one after takes the next number, even with the clock still behind.
+    let c = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    assert_eq!(c.stamp, format!("{}-3", backup::stamp(6000)));
+    assert_eq!(backup::list(data.path(), GUID).unwrap().last(), Some(&c));
+}
+
+#[test]
+fn a_backup_with_the_clock_ahead_keeps_its_own_stamp() {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    let data = root();
+    make(data.path(), &ipod, &[1000, 1000]);
+    let b = backup::create(data.path(), GUID, ipod.root(), 2000, &[]).unwrap();
+    assert_eq!(b.stamp, backup::stamp(2000));
+}
+
+// Reported production bug: `create_with` feeds every entry name to
+// `stamp_key`, so a stray file makes the next backup `stray.txt-2`.
+#[test]
+fn a_stray_entry_in_the_backup_folder_does_not_change_the_new_stamp() {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    let data = root();
+    let base = data.path().join(GUID);
+    fs::create_dir_all(&base).unwrap();
+    fs::write(base.join("stray.txt"), "x").unwrap();
+    fs::create_dir(base.join(".hidden")).unwrap();
+    let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    assert_eq!(b.stamp, backup::stamp(100));
+}
+
+// The stamp shape check decides which folder names count for the new
+// stamp: a stamp-shaped name does (the new backup goes after it), anything
+// else does not.
+#[test]
+fn only_stamp_shaped_names_in_the_backup_folder_order_the_new_stamp() {
+    let cases: &[(&str, Option<&str>)] = &[
+        // Some(want): counted, the new stamp follows it. None: ignored.
+        ("20261015-101010", Some("20261015-101010-2")),
+        ("20261015-101010-12", Some("20261015-101010-13")),
+        ("20261015-101010-", None),
+        ("20261015-101010-x", None),
+        ("2026101-101010", None),
+        ("2026101x-101010", None),
+        ("20261015-10101x", None),
+        ("20261015-10101", None),
+        ("stray.txt", None),
+        ("20261015x101010", None),
+        ("20261015-101010.bak", None),
+        ("", None),
+    ];
+    for (name, want) in cases {
+        let ipod = Ipod::new();
+        ipod.full("x");
+        let data = root();
+        let base = data.path().join(GUID);
+        fs::create_dir_all(&base).unwrap();
+        if !name.is_empty() {
+            fs::create_dir(base.join(name)).unwrap();
+        }
+        let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+        let expect = want.map_or_else(|| backup::stamp(100), str::to_owned);
+        assert_eq!(b.stamp, expect, "folder {name:?}");
+    }
+}
+
+/// A folder named `name` holding an iTunesDB, in the backup folder of GUID.
+fn hand_made(data: &Path, name: &str) -> PathBuf {
+    let d = data.join(GUID).join(name);
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("iTunesDB"), "hand made").unwrap();
+    d
+}
+
+// A suffix that does not fit a u32 is not a stamp: it is neither listed nor
+// used for the next stamp, and taking a backup does not overflow on it.
+#[test]
+fn a_folder_whose_suffix_does_not_fit_a_u32_is_not_a_backup() {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    let data = root();
+    let odd = hand_made(data.path(), "20261015-101010-99999999999999999999");
+    assert!(backup::list(data.path(), GUID).unwrap().is_empty());
+    let b = backup::create(data.path(), GUID, ipod.root(), 100, &[]).unwrap();
+    assert_eq!(b.stamp, backup::stamp(100));
+    assert_eq!(backup::list(data.path(), GUID).unwrap(), vec![b]);
+    assert!(odd.join("iTunesDB").is_file(), "left alone");
+}
+
+// The largest suffix there is: the next one must not wrap or panic. It is
+// refused (the name is taken) and the existing backup is not damaged.
+#[test]
+fn the_largest_suffix_does_not_overflow_the_next_stamp() {
+    let ipod = Ipod::new();
+    ipod.full("new");
+    let data = root();
+    let last = hand_made(data.path(), "20261015-101010-4294967295");
+    let before = fs::read(last.join("iTunesDB")).unwrap();
+    let res = std::panic::catch_unwind(|| backup::create(data.path(), GUID, ipod.root(), 100, &[]));
+    let res = res.expect("create must not panic");
+    // The name is taken, so it is refused, not wrapped to a smaller number.
+    assert!(res.is_err(), "{res:?}");
+    assert_eq!(backup::list(data.path(), GUID).unwrap().len(), 1);
+    assert_eq!(fs::read(last.join("iTunesDB")).unwrap(), before);
+}
+
+// Prevents a hand-made folder with an iTunesDB being listed, pruned, or taken
+// for the newest backup.
+#[test]
+fn folders_not_named_like_stamps_are_not_listed_nor_pruned_nor_newest() {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    let data = root();
+    let made = make(data.path(), &ipod, &[1000, 2000, 3000]);
+    let manual = [
+        hand_made(data.path(), "zzz-manual"),
+        hand_made(data.path(), "99999999-999999x"),
+    ];
+    assert_eq!(backup::list(data.path(), GUID).unwrap(), made);
+    let removed = backup::prune(data.path(), GUID, 1).unwrap();
+    assert_eq!(removed, vec![made[0].dir.clone(), made[1].dir.clone()]);
+    for m in &manual {
+        assert!(m.join("iTunesDB").is_file(), "{m:?} was pruned");
+    }
+    let b = backup::create(data.path(), GUID, ipod.root(), 4000, &[]).unwrap();
+    assert_eq!(b.stamp, backup::stamp(4000));
+    assert_eq!(backup::list(data.path(), GUID).unwrap().last(), Some(&b));
+}
+
+#[test]
+fn prune_keeping_never_deletes_the_new_backup_whatever_its_stamp() {
+    // `new` is the oldest by stamp here, as if the clock had been behind.
+    for (keep, left) in [
+        (0usize, vec![0]),
+        (1, vec![0]),
+        (2, vec![0, 3]),
+        (3, vec![0, 2, 3]),
+    ] {
+        let ipod = Ipod::new();
+        ipod.full("x");
+        let data = root();
+        let made = make(data.path(), &ipod, &[1000, 2000, 3000, 4000]);
+        let removed = backup::prune_keeping(data.path(), GUID, keep, Some(&made[0])).unwrap();
+        let want_left: Vec<Backup> = left.iter().map(|i| made[*i].clone()).collect();
+        assert_eq!(
+            backup::list(data.path(), GUID).unwrap(),
+            want_left,
+            "keep {keep}"
+        );
+        let want_removed: Vec<PathBuf> = (0..4)
+            .filter(|i| !left.contains(i))
+            .map(|i| made[i].dir.clone())
+            .collect();
+        assert_eq!(removed, want_removed, "keep {keep}");
+        assert!(made[0].dir.join("iTunesDB").is_file(), "keep {keep}");
+    }
+}
+
+#[test]
+fn prune_keeping_with_the_newest_as_new_prunes_like_prune() {
+    let ipod = Ipod::new();
+    ipod.full("x");
+    let data = root();
+    let made = make(data.path(), &ipod, &[1000, 2000, 3000, 4000]);
+    let removed = backup::prune_keeping(data.path(), GUID, 2, Some(&made[3])).unwrap();
+    assert_eq!(removed, vec![made[0].dir.clone(), made[1].dir.clone()]);
+    // Without a `new`, keep 0 removes everything, as `prune` always did.
+    let removed = backup::prune_keeping(data.path(), GUID, 0, None).unwrap();
+    assert_eq!(removed.len(), 2);
+    assert!(backup::list(data.path(), GUID).unwrap().is_empty());
 }
 
 #[test]

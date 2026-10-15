@@ -444,6 +444,10 @@ pub fn describe(p: &Prepared, verbose: bool) -> String {
                     "{} (sampled above 48 kHz, which the iPod cannot play)",
                     t.path.display()
                 ),
+                SkipReason::TooLarge => format!(
+                    "{} (4 GiB or more, which a FAT32 iPod cannot hold)",
+                    t.path.display()
+                ),
             })
             .collect(),
     );

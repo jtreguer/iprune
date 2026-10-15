@@ -32,6 +32,13 @@ fn find_ipods_refuses_while_the_variable_is_set() {
 }
 
 #[test]
+fn find_ipods_without_database_refuses_while_the_variable_is_set() {
+    require_detection_off();
+    let e = device::find_ipods_without_database().unwrap_err();
+    assert!(matches!(e, Error::DetectionOff), "{e}");
+}
+
+#[test]
 fn an_empty_mountpoint_is_refused_not_detected_and_a_set_one_is_used() {
     require_detection_off();
     let cfg = Config::default();
@@ -62,6 +69,11 @@ fn child_probe() {
         !matches!(found, Err(Error::DetectionOff)),
         "detection refused with {VAR} unset"
     );
+    let found = device::find_ipods_without_database();
+    assert!(
+        !matches!(found, Err(Error::DetectionOff)),
+        "detection of iPods without a database refused with {VAR} unset"
+    );
     println!("probe-ran");
 }
 
@@ -80,6 +92,11 @@ fn child_probe_empty() {
     assert!(
         !matches!(found, Err(Error::DetectionOff)),
         "an empty {VAR} refused detection"
+    );
+    let found = device::find_ipods_without_database();
+    assert!(
+        !matches!(found, Err(Error::DetectionOff)),
+        "an empty {VAR} refused detection of iPods without a database"
     );
     println!("probe-ran");
 }

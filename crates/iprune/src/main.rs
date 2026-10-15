@@ -39,10 +39,12 @@ enum Command {
         /// Folder holding the .m3u8 playlists.
         #[arg(long, value_name = "DIR")]
         playlists: PathBuf,
-        /// How tracks are written in playlist files.
-        #[arg(long, value_enum, default_value_t = Style::Absolute)]
-        path_style: Style,
-        /// Overwrite an existing config file.
+        /// How tracks are written in playlist files (default absolute; with
+        /// --force, the current setting when not given).
+        #[arg(long, value_enum)]
+        path_style: Option<Style>,
+        /// Change an existing config file: the library folders and playlists
+        /// folder given replace the old ones, every other setting is kept.
         #[arg(long)]
         force: bool,
     },
@@ -106,6 +108,10 @@ enum Command {
         /// only when the iPod's GUID cannot be read.
         #[arg(long, value_name = "GUID")]
         guid: Option<String>,
+        /// The iPod's mountpoint, when it cannot be found: an iPod whose
+        /// database is gone is also looked for by its device files.
+        #[arg(long, value_name = "DIR")]
+        mountpoint: Option<PathBuf>,
         /// Restore even when the iPod's database cannot be read, so the
         /// plays in its Play Counts file cannot be pulled first. The file is
         /// kept in the backup taken before the restore.
@@ -202,27 +208,72 @@ fn absolute_dir(p: &Path) -> Result<PathBuf> {
     Ok(abs)
 }
 
-fn init(library: &[PathBuf], playlists_dir: &Path, style: Style, force: bool) -> Result<()> {
+fn init(
+    library: &[PathBuf],
+    playlists_dir: &Path,
+    style: Option<Style>,
+    force: bool,
+) -> Result<()> {
     let paths = paths()?;
-    if paths.config_file.exists() && !force {
+    let exists = paths.config_file.exists();
+    if exists && !force {
         bail!(
-            "{} already exists; use --force to overwrite it",
+            "{} already exists; use --force to change its folders",
             paths.config_file.display()
         );
     }
-    let mut config = Config::default();
+    // With --force, only what is given changes.
+    // One that no longer validates is mended here, so it is read unchecked;
+    // one that cannot be read at all is left for the user to fix or remove.
+    let mut config = match exists {
+        true => Config::load_unchecked(&paths.config_file).with_context(|| {
+            format!(
+                "the current config cannot be read; fix it, or remove {} to start over",
+                paths.config_file.display()
+            )
+        })?,
+        false => Config::default(),
+    };
     config.library.roots = library
         .iter()
         .map(|p| absolute_dir(p))
         .collect::<Result<_>>()?;
     config.playlists.dir = absolute_dir(playlists_dir)?;
-    config.playlists.path_style = match style {
-        Style::Absolute => PathStyle::Absolute,
-        Style::Relative => PathStyle::Relative,
-    };
+    match style {
+        Some(Style::Absolute) => config.playlists.path_style = PathStyle::Absolute,
+        Some(Style::Relative) => config.playlists.path_style = PathStyle::Relative,
+        None => {}
+    }
+    config.validate(&paths.config_file)?;
     config.save(&paths.config_file)?;
     println!("wrote {}", paths.config_file.display());
+    // Tracks a new set of folders leaves out are marked missing by the next
+    // scan, and the sync after it removes them from the iPod.
+    let db = paths.database();
+    if db.is_file() {
+        let store = iprune_core::store::Store::open(&db)?;
+        let outside = iprune_core::store::all_tracks(store.conn())?
+            .iter()
+            .filter(|t| t.missing_since.is_none())
+            .filter(|t| !config.library.roots.iter().any(|r| under(&t.path, r)))
+            .count();
+        if outside > 0 {
+            eprintln!(
+                "warning: {outside} indexed tracks are outside the library folders now; the next scan \
+                 marks them missing, and the sync after it removes them from the iPod"
+            );
+        }
+    }
     Ok(())
+}
+
+/// Whether `path` is inside `root`, compared in NFC as the index looks paths up.
+fn under(path: &Path, root: &Path) -> bool {
+    use iprune_core::paths::key;
+    match (key(path), key(root)) {
+        (Some(p), Some(r)) => Path::new(&p).starts_with(&r),
+        _ => path.starts_with(root),
+    }
 }
 
 fn print_list<T>(
@@ -562,10 +613,24 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 
 fn run_doctor(fix: bool, yes: bool, allow_mass_removal: bool) -> Result<Outcome> {
     use iprune_core::{doctor, ipod, store::devices};
-    let (config, store) = load()?;
+    let (config, mut store) = load()?;
     let paths = paths()?;
-    let conn = store.conn();
     let mp = find_mountpoint(&config)?;
+    // A repair forgets long-missing tracks: the library is scanned first, so
+    // one whose file came back is not forgotten. If the scan fails (a disk
+    // not mounted), nothing is forgotten this time.
+    let scanned = !fix || {
+        match scan_with_progress(&config, &mut store) {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!(
+                    "the library could not be scanned ({e:#}); no track is forgotten this time"
+                );
+                false
+            }
+        }
+    };
+    let conn = store.conn();
     // Held from the examination to the last repair: a sync in between
     // would make the report wrong (its new files would look orphaned).
     let lock = iprune_core::lock::ipod(&paths)?;
@@ -583,7 +648,10 @@ fn run_doctor(fix: bool, yes: bool, allow_mass_removal: bool) -> Result<Outcome>
     {
         return Err(iprune_core::Error::RestoreUnfinished(stamp).into());
     }
-    let report = doctor::examine(conn, &mp, &contents, device, iprune_core::now_unix())?;
+    let mut report = doctor::examine(conn, &mp, &contents, device, iprune_core::now_unix())?;
+    if !scanned {
+        report.forgotten.clear();
+    }
     let mut out = io::stdout().lock();
     print_list(
         &mut out,
@@ -749,12 +817,30 @@ fn run_backups() -> Result<()> {
 fn run_restore(
     stamp: &str,
     guid: Option<&str>,
+    mountpoint: Option<&Path>,
     discard_play_counts: bool,
     yes: bool,
 ) -> Result<Outcome> {
     let (config, store) = load()?;
     let paths = paths()?;
-    let mp = find_mountpoint(&config)?;
+    let mp = match mountpoint {
+        Some(m) => m.to_owned(),
+        None => match device::mountpoint(&config) {
+            Ok(m) => m,
+            // An iPod whose iTunesDB is gone, the state a restore is for.
+            Err(iprune_core::Error::NoIpod) => {
+                match device::find_ipods_without_database()?.as_slice() {
+                    [one] => one.mountpoint.clone(),
+                    [] => bail!(
+                        "no mounted iPod found, with or without a database; connect and mount it, \
+                         or pass --mountpoint"
+                    ),
+                    _ => bail!("several iPods without a database are mounted; pass --mountpoint"),
+                }
+            }
+            Err(e) => return Err(e.into()),
+        },
+    };
     // From the device files, not the database: the database may be damaged.
     let read = device::firewire_guid(&mp);
     if let (Some(read), Some(given)) = (&read, guid)
@@ -983,9 +1069,16 @@ fn main() -> ExitCode {
         Command::Restore {
             stamp,
             guid,
+            mountpoint,
             discard_play_counts,
             yes,
-        } => run_restore(stamp, guid.as_deref(), *discard_play_counts, *yes),
+        } => run_restore(
+            stamp,
+            guid.as_deref(),
+            mountpoint.as_deref(),
+            *discard_play_counts,
+            *yes,
+        ),
         Command::Playlist(cmd) => playlist(cmd),
         Command::Snapshot { path } => snapshot(path).map(|()| Outcome::Done),
     };

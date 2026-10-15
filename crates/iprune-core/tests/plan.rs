@@ -1758,15 +1758,105 @@ fn removals_free_room_before_copies_and_replaced_files_do_not() {
 
 #[test]
 fn huge_sizes_do_not_overflow_the_space_arithmetic() {
+    // Copies are capped below 4 GiB now (TooLarge), so the sums are
+    // reached through sizes the iPod reports: removals and replaced files.
     let mut w = World::default();
-    w.fresh(1).fresh(2);
-    w.lib_mut(1).size = u64::MAX;
-    w.lib_mut(2).size = u64::MAX;
+    w.synced(1, 0xA1).synced(2, 0xA2);
+    w.lib_mut(1).missing_since = Some(1);
+    w.lib_mut(2).missing_since = Some(1);
+    for t in &mut w.device.tracks {
+        t.adopt.size = u64::MAX;
+    }
     w.space = sp(10_000, 10_000);
     let p = w.plan();
-    assert_eq!(p.space.needed, i64::MAX);
-    assert_eq!(p.space.peak, i64::MAX);
-    assert!(!p.space.fits);
+    assert_eq!(p.remove.len(), 2, "{p:?}");
+    assert_eq!(p.space.needed, i64::MIN);
+    assert_eq!(p.space.peak, i64::MIN);
+    assert!(p.space.fits);
+
+    // Two replaces whose old files report u64::MAX: the net clamps, the
+    // peak is the new files only.
+    let mut w = World::default();
+    w.synced(1, 0xA1).synced(2, 0xA2);
+    for id in [1, 2] {
+        w.lib_mut(id).size = SIZE + 1;
+        w.lib_mut(id).info.duration_ms = Some(MS + 5_000);
+    }
+    for t in &mut w.device.tracks {
+        t.adopt.size = u64::MAX;
+    }
+    w.space = sp(10_000, 10_000);
+    let p = w.plan();
+    assert_eq!(p.replace.len(), 2, "{p:?}");
+    assert_eq!(p.space.peak, 2 * (SIZE + 1) as i64);
+    assert_eq!(p.space.needed, i64::MIN);
+}
+
+// Prevents (audit L6) a file a FAT32 iPod cannot hold being copied, which
+// fails at the end of a long transfer on every sync.
+#[test]
+fn a_new_file_of_4_gib_or_more_is_skipped_as_too_large() {
+    // 4 GiB less one byte is the biggest FAT32 file.
+    let max = 0xFFFF_FFFF_u64;
+    for (size, copied) in [
+        (max - 1, true),
+        (max, true),
+        (max + 1, false),
+        (max + 2, false),
+        (u64::MAX, false),
+    ] {
+        let mut w = World::default();
+        w.fresh(1);
+        w.lib_mut(1).size = size;
+        w.playlist(10, "Big", &ids(&[1]), None);
+        let p = w.plan();
+        assert_eq!(p.copy.len(), usize::from(copied), "{size}: {p:?}");
+        if copied {
+            assert!(p.skipped.is_empty(), "{size}");
+        } else {
+            assert_eq!(p.skipped.len(), 1, "{size}");
+            assert_eq!(p.skipped[0].track_id, 1);
+            assert_eq!(p.skipped[0].reason, SkipReason::TooLarge);
+            assert_eq!(
+                p.entries_skipped,
+                vec![EntrySkipped {
+                    playlist: "Big".into(),
+                    position: 1,
+                    reason: EntryReason::TrackSkipped,
+                }]
+            );
+            assert_eq!(p.expected.track_count, 0);
+            assert_eq!(p.space.peak, 0, "nothing is copied, so no room is needed");
+        }
+    }
+}
+
+// Prevents (audit L6) a synced file that grew past 4 GiB being replaced.
+#[test]
+fn a_synced_file_that_became_too_large_is_left_as_it_is() {
+    let mut w = World::default();
+    w.synced(1, 0xA1);
+    w.lib_mut(1).size = 1 << 32;
+    w.lib_mut(1).info.duration_ms = Some(MS + 5_000);
+    let p = w.plan();
+    assert!(p.replace.is_empty() && p.copy.is_empty(), "{p:?}");
+    assert!(p.remove.is_empty(), "the old file stays on the iPod");
+
+    // The biggest FAT32 file is still replaced.
+    w.lib_mut(1).size = 0xFFFF_FFFF;
+    assert_eq!(w.plan().replace.len(), 1);
+}
+
+#[test]
+fn a_stale_mapping_of_a_too_large_file_is_skipped_not_copied() {
+    let mut w = World::default();
+    w.synced(1, 0xA1);
+    w.lib_mut(1).size = 1 << 32;
+    w.device.tracks.clear();
+    let p = w.plan();
+    assert!(p.copy.is_empty());
+    assert_eq!(p.skipped.len(), 1);
+    assert_eq!(p.skipped[0].reason, SkipReason::TooLarge);
 }
 
 /// xorshift: a fixed, dependency free source of shuffles.

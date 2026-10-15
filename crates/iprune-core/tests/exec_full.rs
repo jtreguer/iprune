@@ -1655,6 +1655,158 @@ fn an_unreadable_file_is_skipped_too() {
     assert!(w.track(work.tracks.copies[1].dbid).is_none());
 }
 
+/// Replaces the library file of copy `i` with a directory, which opens
+/// and passes the size check (the copy's size is set to the directory's) but
+/// cannot be read: the stand-in for a file that fails mid-read. Returns where
+/// the real file went.
+fn make_unreadable(work: &mut FullWork, i: usize, keep: &Path) -> PathBuf {
+    let path = work.tracks.copies[i].path.clone();
+    let aside = keep.join(path.file_name().unwrap());
+    fs::rename(&path, &aside).unwrap();
+    fs::create_dir(&path).unwrap();
+    work.tracks.copies[i].audio.size = fs::metadata(&path).unwrap().len();
+    // Set up check: it opens, and reading fails.
+    let mut f = fs::File::open(&path).unwrap();
+    assert!(std::io::Read::read(&mut f, &mut [0u8; 8]).is_err());
+    aside
+}
+
+// Prevents (audit L6) one file that opens but cannot be read to its end
+// stopping every sync at the same place, with the retags and playlists
+// after it never applied.
+#[test]
+fn a_file_that_opens_but_cannot_be_read_is_skipped_and_the_rest_of_the_sync_goes_on() {
+    let mut w = World::new(3);
+    // A retag of track 1, applied only once the copies are done.
+    w.env
+        .add_bytes("s1.mp3", &retagged_mp3(1, "Renamed", "Artist1", None, None));
+    let news = with_three_new(&mut w);
+    let p = w.prepare();
+    let mut work = exec::full_work(&p);
+    assert_eq!(work.tracks.copies.len(), 3);
+    assert_eq!(work.tracks.retags.len(), 1);
+    let planned: Vec<(PathBuf, u64)> = work
+        .tracks
+        .copies
+        .iter()
+        .map(|c| (c.path.clone(), c.dbid))
+        .collect();
+    let keep = tempfile::tempdir().unwrap();
+    let aside = make_unreadable(&mut work, 1, keep.path());
+    let (bad, bad_dbid) = planned[1].clone();
+    let (first, second) = (planned[0].clone(), planned[2].clone());
+    let road_before = w.playlist("Road").unwrap();
+
+    let out = w
+        .run(
+            &p,
+            &work,
+            Options::default(),
+            &|_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(
+        out.stopped, None,
+        "an unreadable source does not stop the sync"
+    );
+    assert_eq!(out.copied, 2);
+    assert_eq!(out.retagged, 1, "the retag after the copies still applied");
+    assert_eq!(out.skipped.len(), 1, "{:?}", out.skipped);
+    assert_eq!(out.skipped[0].0, bad);
+    assert!(!out.skipped[0].1.is_empty());
+
+    // Both good files are on the iPod, mapped and in the playlists; the bad
+    // one is nowhere.
+    for (f, d) in [&first, &second] {
+        assert!(w.track(*d).is_some(), "{f:?}");
+        assert!(w.mapping().contains_key(&w.id_of(f)));
+    }
+    assert!(w.track(bad_dbid).is_none());
+    assert!(!w.mapping().values().any(|d| *d == bad_dbid));
+    assert_eq!(
+        w.track(dbid(1)).unwrap().tags.title.as_deref(),
+        Some("Renamed")
+    );
+    // In the order of the playlist files, the bad one left out.
+    let good: Vec<u64> = news
+        .iter()
+        .filter(|f| **f != bad)
+        .map(|f| planned.iter().find(|(p, _)| p == f).unwrap().1)
+        .collect();
+    assert_eq!(good.len(), 2);
+    let mut road = road_before;
+    road.extend(&good);
+    assert_eq!(w.playlist("Road"), Some(road));
+    assert_eq!(w.playlist("Fresh"), Some(good));
+
+    // The file comes back: the next plan holds that file and nothing else.
+    fs::remove_dir(&bad).unwrap();
+    fs::rename(&aside, &bad).unwrap();
+    w.rescan();
+    let p2 = w.prepare();
+    let work2 = exec::full_work(&p2);
+    let again: Vec<&Path> = work2
+        .tracks
+        .copies
+        .iter()
+        .map(|c| c.path.as_path())
+        .collect();
+    assert_eq!(again, [bad.as_path()], "{:?}", p2.plan);
+    assert!(work2.tracks.retags.is_empty() && work2.tracks.removes.is_empty());
+    let out = w
+        .run(
+            &p2,
+            &work2,
+            Options::default(),
+            &|_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!((out.copied, out.skipped.len(), out.stopped), (1, 0, None));
+    assert_eq!(w.playlist("Fresh").unwrap().len(), 3);
+    assert!(exec::full_work(&w.prepare()).is_empty());
+    let _ = news;
+}
+
+// Prevents (audit L6) the same for new audio of a track already on the iPod:
+// the old file and the track's places in the playlists stay.
+#[test]
+fn new_audio_that_cannot_be_read_leaves_the_existing_track_as_it_is() {
+    let mut w = World::new(3);
+    let src = w.files[2].clone();
+    let old_file = w.file_of(dbid(3));
+    let old_bytes = fs::read(&old_file).unwrap();
+    fs::copy(fixture_secs(Kind::Mp3, 3, 3), &src).unwrap();
+    w.rescan();
+    let p = w.prepare();
+    let mut work = exec::full_work(&p);
+    assert!(work.tracks.copies.len() == 1 && work.tracks.copies[0].replace);
+    let keep = tempfile::tempdir().unwrap();
+    make_unreadable(&mut work, 0, keep.path());
+    let road = w.playlist("Road").unwrap();
+    let mix = w.playlist("Mix").unwrap();
+
+    let out = w
+        .run(
+            &p,
+            &work,
+            Options::default(),
+            &|_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(out.stopped, None);
+    assert_eq!((out.recopied, out.copied), (0, 0));
+    assert_eq!(out.skipped.len(), 1);
+    assert_eq!(out.skipped[0].0, src);
+    assert_eq!(w.playlist("Road"), Some(road));
+    assert_eq!(w.playlist("Mix"), Some(mix));
+    assert_eq!(w.track(dbid(3)).unwrap().adopt.size, old_bytes.len() as u64);
+    assert_eq!(w.file_of(dbid(3)), old_file);
+    assert_eq!(fs::read(&old_file).unwrap(), old_bytes);
+}
+
 // A skipped copy of new audio must leave the track already on the iPod as it
 // is, in every playlist.
 #[test]
@@ -2974,6 +3126,103 @@ mod doctor_tests {
         )
         .unwrap();
         assert_eq!(r.forgotten.len(), 1);
+    }
+
+    // Prevents (audit L38) a track whose file is back at its path, but which
+    // the last scan has not seen yet, being forgotten with its play counts.
+    #[test]
+    fn a_long_missing_track_whose_file_is_back_is_not_forgotten() {
+        let mut w = World::new(3);
+        let now = now_unix();
+        let id = ghost(&mut w, now - FORGET_AFTER_SECS - 1);
+        let path: PathBuf = w
+            .env
+            .store
+            .conn()
+            .query_row("SELECT path FROM tracks WHERE id = ?1", [id], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap()
+            .into();
+        let contents = w.contents();
+        let found = |w: &World| {
+            doctor::examine(
+                w.env.store.conn(),
+                &w.root,
+                &contents,
+                Some(w.device()),
+                now,
+            )
+            .unwrap()
+            .forgotten
+            .iter()
+            .map(|(i, _)| *i)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            found(&w),
+            vec![id],
+            "set up: forgotten while the file is gone"
+        );
+        fs::write(&path, b"back").unwrap();
+        assert!(found(&w).is_empty(), "the file is back: kept");
+    }
+
+    // Prevents (audit L38) a repair acting on a report that went stale
+    // between the examination and the fix: a scan since found the file.
+    #[test]
+    fn fix_index_leaves_a_candidate_a_scan_found_again() {
+        let mut w = World::new(3);
+        let now = now_unix();
+        let id = ghost(&mut w, now - FORGET_AFTER_SECS - 1);
+        let (with, all_items) = items_of(&w, id);
+        let contents = w.contents();
+        let r = doctor::examine(
+            w.env.store.conn(),
+            &w.root,
+            &contents,
+            Some(w.device()),
+            now,
+        )
+        .unwrap();
+        assert_eq!(r.forgotten.len(), 1, "set up");
+        let conn = w.env.store.conn();
+        conn.execute("UPDATE tracks SET missing_since = NULL WHERE id = ?1", [id])
+            .unwrap();
+        doctor::fix_index(conn, Some(w.device()), &r).unwrap();
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [id], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM tracks WHERE id = ?1"), 1);
+        assert_eq!(
+            count("SELECT plays FROM stats WHERE track_id = ?1"),
+            4,
+            "its play counts stay"
+        );
+        assert_eq!(
+            items_of(&w, id),
+            (with, all_items),
+            "and its playlist entry"
+        );
+
+        // Still missing, but mapped to a device since: kept too.
+        let conn = w.env.store.conn();
+        conn.execute(
+            "UPDATE tracks SET missing_since = ?2 WHERE id = ?1",
+            [id, now - FORGET_AFTER_SECS - 1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO device_tracks (device_id, track_id, dbid, synced_tags_hash, synced_size, synced_duration_ms) \
+             VALUES (?1, ?2, 77, x'00', 1, 1)",
+            [w.device(), id],
+        )
+        .unwrap();
+        doctor::fix_index(conn, Some(w.device()), &r).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM tracks WHERE id = ?1", [id], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

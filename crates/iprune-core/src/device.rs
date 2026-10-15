@@ -333,6 +333,30 @@ fn pick(found: &[Mount]) -> Result<std::path::PathBuf> {
     }
 }
 
+/// FAT32 mounts that are iPods by their device files (`SysInfo` or
+/// `SysInfoExtended`) but have no database: what a restore can still put a
+/// backup back on, once [`find_ipods`] finds nothing.
+pub fn find_ipods_without_database() -> Result<Vec<Mount>> {
+    if std::env::var_os("IPRUNE_NO_DETECT").is_some_and(|v| !v.is_empty()) {
+        return Err(Error::DetectionOff);
+    }
+    let path = Path::new("/proc/self/mountinfo");
+    let text = std::fs::read_to_string(path).at(path)?;
+    Ok(ipods_without_database_in(&text))
+}
+
+/// [`find_ipods_without_database`] on the text of a mountinfo file.
+pub fn ipods_without_database_in(mountinfo: &str) -> Vec<Mount> {
+    parse_mountinfo(mountinfo)
+        .into_iter()
+        .filter(|m| m.fstype == "vfat" && !itunesdb(&m.mountpoint).is_file())
+        .filter(|m| {
+            let dev = m.mountpoint.join("iPod_Control/Device");
+            dev.join("SysInfo").is_file() || dev.join("SysInfoExtended").is_file()
+        })
+        .collect()
+}
+
 /// Mounted filesystems that hold an iPod database.
 pub fn find_ipods() -> Result<Vec<Mount>> {
     // Set for everything cargo runs (.cargo/config.toml): a test must never

@@ -177,11 +177,16 @@ pub fn examine(
         "SELECT id, path FROM tracks WHERE missing_since IS NOT NULL AND missing_since < ?1 \
          AND id NOT IN (SELECT track_id FROM device_tracks) ORDER BY path",
     )?;
-    report.forgotten = stmt
+    let forgotten: Vec<(i64, PathBuf)> = stmt
         .query_map(params![now - FORGET_AFTER_SECS], |r| {
             Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?)))
         })?
         .collect::<rusqlite::Result<_>>()?;
+    // A file back at its path since the last scan is not forgotten.
+    report.forgotten = forgotten
+        .into_iter()
+        .filter(|(_, p)| std::fs::symlink_metadata(p).is_err())
+        .collect();
     Ok(report)
 }
 
@@ -199,15 +204,23 @@ pub fn fix_index(conn: &Connection, device: Option<i64>, report: &Report) -> Res
             devices::apply_track_changes(conn, d, &[], &stale)?;
         }
         for (id, _) in &report.forgotten {
+            // Only while it is still missing and on no device: a scan since
+            // the examination (another iprune) may have found it again.
+            let still: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM tracks WHERE id = ?1 AND missing_since IS NOT NULL \
+                 AND id NOT IN (SELECT track_id FROM device_tracks))",
+                [id],
+                |r| r.get(0),
+            )?;
+            if !still {
+                continue;
+            }
             conn.execute("DELETE FROM stats WHERE track_id = ?1", [id])?;
             conn.execute(
                 "UPDATE playlist_items SET track_id = NULL WHERE track_id = ?1",
                 [id],
             )?;
-            conn.execute(
-                "DELETE FROM tracks WHERE id = ?1 AND id NOT IN (SELECT track_id FROM device_tracks)",
-                [id],
-            )?;
+            conn.execute("DELETE FROM tracks WHERE id = ?1", [id])?;
         }
         Ok(())
     })

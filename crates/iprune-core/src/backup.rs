@@ -304,19 +304,18 @@ fn create_with(
         }
     }
     let first = stamp(now);
-    // After the highest backup already taken in this second, never in a gap
-    // a prune left: the new backup must sort last.
-    let taken = fs::read_dir(&base)
+    // The new backup must sort last: after the highest backup already
+    // taken, never in a gap a prune left, and after every backup even when
+    // the clock is behind the one that took them.
+    let latest = fs::read_dir(&base)
         .at(&base)?
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
-        .filter_map(|n| match n.strip_prefix(&first)? {
-            "" => Some(1),
-            rest => rest.strip_prefix('-')?.parse::<u32>().ok(),
-        })
+        .filter(|n| is_stamp(n))
+        .map(|n| stamp_key(&n))
         .max();
-    let stamp = match taken {
-        None => first.clone(),
-        Some(n) => format!("{first}-{}", n + 1),
+    let stamp = match latest {
+        Some((b, n)) if b >= first => format!("{b}-{}", n.saturating_add(1)),
+        _ => first.clone(),
     };
     let dir = base.join(&stamp);
     // Filled under a hidden name and renamed when complete, so a backup
@@ -408,7 +407,7 @@ pub fn list(root: &Path, guid: &str) -> Result<Vec<Backup>> {
     let mut out: Vec<Backup> = fs::read_dir(&base)
         .at(&base)?
         .filter_map(|e| e.ok())
-        .filter(|e| !e.file_name().as_encoded_bytes().starts_with(b"."))
+        .filter(|e| e.file_name().to_str().is_some_and(is_stamp))
         .filter(|e| e.path().join("iTunesDB").is_file())
         .filter_map(|e| {
             Some(Backup {
@@ -418,22 +417,57 @@ pub fn list(root: &Path, guid: &str) -> Result<Vec<Backup>> {
         })
         .collect();
     // By time, then by the `-N` suffix taken as a number (`-10` after `-2`).
-    let key = |s: &str| {
-        let (base, n) = match s.get(15..).and_then(|r| r.strip_prefix('-')) {
-            Some(n) => (&s[..15], n.parse::<u32>().unwrap_or(u32::MAX)),
-            None => (s, 1),
-        };
-        (base.to_owned(), n)
-    };
-    out.sort_by_key(|b| key(&b.stamp));
+    out.sort_by_key(|b| stamp_key(&b.stamp));
     Ok(out)
+}
+
+/// Whether `name` is a backup stamp, `YYYYMMDD-HHMMSS` with an optional
+/// `-N`: anything else in the folder is left out of the ordering.
+fn is_stamp(name: &str) -> bool {
+    let b = name.as_bytes();
+    let digits =
+        |r: std::ops::Range<usize>| b.get(r).is_some_and(|d| d.iter().all(u8::is_ascii_digit));
+    b.len() >= 15
+        && digits(0..8)
+        && b[8] == b'-'
+        && digits(9..15)
+        && (b.len() == 15
+            || (b[15] == b'-'
+                && b.len() > 16
+                && digits(16..b.len())
+                && name[16..].parse::<u32>().is_ok()))
+}
+
+/// How stamps sort: by time, then by the `-N` suffix taken as a number
+/// (`-10` after `-2`).
+fn stamp_key(s: &str) -> (String, u32) {
+    let (base, n) = match s.get(15..).and_then(|r| r.strip_prefix('-')) {
+        Some(n) => (&s[..15], n.parse::<u32>().unwrap_or(u32::MAX)),
+        None => (s, 1),
+    };
+    (base.to_owned(), n)
 }
 
 /// Deletes the oldest backups so at most `keep` remain. Returns the removed
 /// folders.
 pub fn prune(root: &Path, guid: &str, keep: usize) -> Result<Vec<PathBuf>> {
-    let all = list(root, guid)?;
-    let excess = all.len().saturating_sub(keep);
+    prune_keeping(root, guid, keep, None)
+}
+
+/// [`prune`], never deleting `new`, the backup just taken, whatever its
+/// stamp says.
+pub fn prune_keeping(
+    root: &Path,
+    guid: &str,
+    keep: usize,
+    new: Option<&Backup>,
+) -> Result<Vec<PathBuf>> {
+    let all: Vec<Backup> = list(root, guid)?
+        .into_iter()
+        .filter(|b| new.is_none_or(|n| n.dir != b.dir))
+        .collect();
+    let kept_new = usize::from(new.is_some());
+    let excess = (all.len() + kept_new).saturating_sub(keep.max(kept_new));
     let mut removed = Vec::new();
     for b in all.into_iter().take(excess) {
         fs::remove_dir_all(&b.dir).at(&b.dir)?;

@@ -241,6 +241,15 @@ pub enum SkipReason {
     FairPlay,
     /// Sampled above 48 kHz, which the iPod Classic cannot play.
     SampleRate,
+    /// 4 GiB or more, which a FAT32 iPod cannot hold.
+    TooLarge,
+}
+
+/// The largest file FAT32 holds: 4 GiB less one byte.
+const FAT32_MAX: u64 = 0xFFFF_FFFF;
+
+fn too_big(t: &TrackRow) -> bool {
+    t.size > FAT32_MAX
 }
 
 /// The highest sample rate an iPod Classic plays.
@@ -501,13 +510,16 @@ pub fn plan(input: &PlanInput) -> Plan {
             });
         }
         match mapping.filter(|m| on_ipod.contains_key(&m.dbid)) {
-            None if t.drm || too_fast(t) => {
+            None if t.drm || too_fast(t) || too_big(t) => {
                 plan.skipped.push(Skipped {
                     track_id: id,
                     path: t.path.clone(),
-                    reason: match t.drm {
-                        true => SkipReason::FairPlay,
-                        false => SkipReason::SampleRate,
+                    reason: if t.drm {
+                        SkipReason::FairPlay
+                    } else if too_fast(t) {
+                        SkipReason::SampleRate
+                    } else {
+                        SkipReason::TooLarge
                     },
                 });
                 continue;
@@ -524,7 +536,7 @@ pub fn plan(input: &PlanInput) -> Plan {
                 let it = on_ipod[&m.dbid];
                 // A protected file already on the iPod stays as it is.
                 let file_missing = input.files_missing.contains(&m.dbid);
-                if !t.drm && !too_fast(t) && (file_missing || audio_changed(t, m)) {
+                if !t.drm && !too_fast(t) && !too_big(t) && (file_missing || audio_changed(t, m)) {
                     plan.replace.push(ReplaceOp {
                         track_id: id,
                         old_dbid: m.dbid,

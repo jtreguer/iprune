@@ -669,6 +669,11 @@ fn deletable(
     Ok(())
 }
 
+/// Whether `path` reads to its end.
+fn readable(path: &Path) -> std::io::Result<()> {
+    std::io::copy(&mut std::fs::File::open(path)?, &mut std::io::sink()).map(|_| ())
+}
+
 /// A dbid's mapping after a sync, from what was copied or retagged.
 fn copied_mapping(c: &transfer::Copy) -> TrackMapping {
     TrackMapping {
@@ -908,6 +913,17 @@ pub fn sync(
                 continue;
             }
             if let Err(e) = copy_one(&mut db, c, now, &mut w.doomed) {
+                // A file that cannot be read to its end (a bad sector) is
+                // skipped like a file gone: it would stop every later sync
+                // at the same place. Otherwise the iPod failed (full,
+                // disconnected), and the sync stops.
+                if let Err(why) = readable(&c.path) {
+                    skipped.push((c.path.clone(), format!("cannot be read: {why}")));
+                    if !c.replace {
+                        skipped_dbids.insert(c.dbid);
+                    }
+                    continue;
+                }
                 stopped = Some(e.to_string());
                 break;
             }
@@ -1050,7 +1066,7 @@ pub fn sync(
     }
     // Never delete the backup just taken.
     let keep = (cfg.sync.keep_backups as usize).max(1);
-    let pruned = match backup::prune(&backups, &prepared.guid, keep) {
+    let pruned = match backup::prune_keeping(&backups, &prepared.guid, keep, Some(&backup)) {
         Ok(p) => p.len(),
         Err(e) => {
             warnings.push(format!("deleting old backups: {e}"));

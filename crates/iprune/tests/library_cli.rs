@@ -175,6 +175,307 @@ fn init_refuses_to_overwrite_without_force() {
     assert!(after.contains(s(&other)));
 }
 
+// ---- init --force keeps what it was not asked to change (audit L41)
+
+impl Sandbox {
+    /// A config with every setting off its default, for the folders given.
+    fn write_custom_config(&self, music: &Path, lists: &Path) {
+        let text = format!(
+            "[library]\nroots = [{music:?}]\nexclude_extensions = [\"flac\"]\n\n\
+             [playlists]\ndir = {lists:?}\npath_style = \"relative\"\n\n\
+             [sync]\nscope = \"playlists\"\nplaylists = [\"Road\", \"Mix\"]\n\
+             remove_unmanaged = true\nkeep_backups = 7\n\n\
+             [device]\nmountpoint = \"/some/ipod\"\nallow_folder = true\n"
+        );
+        fs::create_dir_all(self.config_file().parent().unwrap()).unwrap();
+        fs::write(self.config_file(), text).unwrap();
+    }
+
+    fn config(&self) -> iprune_core::config::Config {
+        iprune_core::config::Config::load(&self.config_file()).unwrap()
+    }
+
+    fn folder(&self, name: &str) -> PathBuf {
+        let d = self.base().join(name);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+}
+
+// Prevents (audit L41) `init --force` resetting keep_backups, the sync scope,
+// the mountpoint and the rest to their defaults.
+#[test]
+fn init_force_changes_the_folders_and_keeps_every_other_setting() {
+    use iprune_core::config::{PathStyle, Scope};
+    let sb = Sandbox::new();
+    sb.write_custom_config(&sb.music, &sb.lists);
+    let before = sb.config();
+    let (music2, lists2) = (sb.folder("music2"), sb.folder("lists2"));
+
+    let o = sb.run(&[
+        "init",
+        "--force",
+        "--library",
+        s(&music2),
+        "--playlists",
+        s(&lists2),
+    ]);
+    assert_ok(&o);
+    let after = sb.config();
+    assert_eq!(after.library.roots, vec![music2.clone()]);
+    assert_eq!(after.playlists.dir, lists2);
+    // Everything else is exactly as it was.
+    assert_eq!(after.sync.keep_backups, 7);
+    assert_eq!(after.sync.scope, Scope::Playlists);
+    assert_eq!(after.sync.playlists, vec!["Road", "Mix"]);
+    assert!(after.sync.remove_unmanaged);
+    assert_eq!(after.device.mountpoint, Path::new("/some/ipod"));
+    assert!(after.device.allow_folder);
+    assert_eq!(after.library.exclude_extensions, vec!["flac"]);
+    assert_eq!(after.playlists.path_style, PathStyle::Relative, "not given");
+    let mut expect = before;
+    expect.library.roots = vec![music2];
+    expect.playlists.dir = after.playlists.dir.clone();
+    assert_eq!(after, expect);
+}
+
+#[test]
+fn init_force_changes_the_path_style_only_when_given() {
+    use iprune_core::config::PathStyle;
+    let sb = Sandbox::new();
+    sb.write_custom_config(&sb.music, &sb.lists);
+    let o = sb.run(&[
+        "init",
+        "--force",
+        "--library",
+        s(&sb.music),
+        "--playlists",
+        s(&sb.lists),
+        "--path-style",
+        "absolute",
+    ]);
+    assert_ok(&o);
+    let after = sb.config();
+    assert_eq!(after.playlists.path_style, PathStyle::Absolute);
+    assert_eq!(after.sync.keep_backups, 7, "still kept");
+
+    let o = sb.run(&[
+        "init",
+        "--force",
+        "--library",
+        s(&sb.music),
+        "--playlists",
+        s(&sb.lists),
+        "--path-style",
+        "relative",
+    ]);
+    assert_ok(&o);
+    assert_eq!(sb.config().playlists.path_style, PathStyle::Relative);
+
+    // A first init, without --force, still defaults to absolute.
+    let fresh = Sandbox::new();
+    fresh.init();
+    assert_eq!(fresh.config().playlists.path_style, PathStyle::Absolute);
+}
+
+// Prevents (audit L41) narrowing the library silently: the next scan marks
+// the tracks outside missing and the sync after it deletes them from the iPod.
+#[test]
+fn init_force_warns_about_indexed_tracks_outside_the_new_folders() {
+    let sb = Sandbox::new();
+    sb.init();
+    sb.add_track("a.mp3", Kind::Mp3, 1);
+    sb.add_track("b.mp3", Kind::Mp3, 2);
+    assert_ok(&sb.run(&["scan"]));
+    let other = sb.folder("other");
+    let args = |lib: &Path| {
+        [
+            "init".to_owned(),
+            "--force".into(),
+            "--library".into(),
+            s(lib).to_owned(),
+            "--playlists".into(),
+            s(&sb.lists).to_owned(),
+        ]
+    };
+    let run = |a: [String; 6]| sb.run(&a.iter().map(String::as_str).collect::<Vec<_>>());
+
+    // The same folder: nothing is outside, no warning.
+    let o = run(args(&sb.music));
+    assert_ok(&o);
+    assert!(!err(&o).contains("warning"), "{}", err(&o));
+
+    // Another folder: both tracks are outside.
+    let o = run(args(&other));
+    assert_ok(&o);
+    assert!(err(&o).contains("warning"), "{}", err(&o));
+    assert!(err(&o).contains("2 indexed tracks"), "{}", err(&o));
+    assert_eq!(sb.config().library.roots, vec![other], "still applied");
+}
+
+// An old config that cannot be parsed is not replaced behind the user's
+// back: its settings would be lost.
+#[test]
+fn init_force_over_an_unparseable_config_is_refused_and_leaves_it_as_it_is() {
+    let sb = Sandbox::new();
+    fs::create_dir_all(sb.config_file().parent().unwrap()).unwrap();
+    let junk = "this is [[ not toml\nkeep_backups = 7\n";
+    fs::write(sb.config_file(), junk).unwrap();
+    let o = sb.run(&[
+        "init",
+        "--force",
+        "--library",
+        s(&sb.music),
+        "--playlists",
+        s(&sb.lists),
+    ]);
+    assert_fails(&o, 1);
+    assert!(err(&o).contains("config.toml"), "{}", err(&o));
+    assert!(err(&o).contains("remove"), "{}", err(&o));
+    assert_eq!(fs::read_to_string(sb.config_file()).unwrap(), junk);
+    let dir = sb.config_file().parent().unwrap().to_owned();
+    assert_eq!(fs::read_dir(dir).unwrap().count(), 1, "no temporary file");
+}
+
+// A config that parses but no longer validates (here: no library folder) is
+// the one `init --force` exists to mend, keeping the other settings.
+#[test]
+fn init_force_mends_a_config_that_parses_but_does_not_validate() {
+    let sb = Sandbox::new();
+    sb.write_custom_config(&sb.music, &sb.lists);
+    let text = fs::read_to_string(sb.config_file()).unwrap();
+    let text = text.replace(&format!("roots = [{:?}]", sb.music), "roots = []");
+    fs::write(sb.config_file(), &text).unwrap();
+    assert!(
+        iprune_core::config::Config::load(&sb.config_file()).is_err(),
+        "set up: it does not validate"
+    );
+    let o = sb.run(&[
+        "init",
+        "--force",
+        "--library",
+        s(&sb.music),
+        "--playlists",
+        s(&sb.lists),
+    ]);
+    assert_ok(&o);
+    let after = sb.config();
+    assert_eq!(after.library.roots, vec![sb.music.clone()]);
+    assert_eq!(after.sync.keep_backups, 7);
+    assert_eq!(after.sync.playlists, vec!["Road", "Mix"]);
+    assert_eq!(after.device.mountpoint, Path::new("/some/ipod"));
+}
+
+// A result that would not validate is refused before anything is written.
+#[test]
+fn init_force_whose_result_does_not_validate_is_refused_and_leaves_the_old_config() {
+    let sb = Sandbox::new();
+    let ipod = sb.folder("ipod");
+    let inside = ipod.join("music");
+    fs::create_dir(&inside).unwrap();
+    sb.write_custom_config(&sb.music, &sb.lists);
+    let text = fs::read_to_string(sb.config_file()).unwrap();
+    fs::write(
+        sb.config_file(),
+        text.replace("/some/ipod", ipod.to_str().unwrap()),
+    )
+    .unwrap();
+    let before = fs::read(sb.config_file()).unwrap();
+    for lib in [&inside, &ipod] {
+        let o = sb.run(&[
+            "init",
+            "--force",
+            "--library",
+            s(lib),
+            "--playlists",
+            s(&sb.lists),
+        ]);
+        assert_fails(&o, 1);
+        assert!(err(&o).contains("mountpoint"), "{}", err(&o));
+        assert_eq!(fs::read(sb.config_file()).unwrap(), before, "{lib:?}");
+    }
+    let dir = sb.config_file().parent().unwrap().to_owned();
+    assert_eq!(fs::read_dir(dir).unwrap().count(), 1, "no temporary file");
+}
+
+// The warning compares paths the way the index looks them up (NFC), and by
+// whole folder names.
+#[test]
+fn init_force_warning_ignores_the_unicode_form_of_the_folder_names() {
+    let sb = Sandbox::new();
+    let nfc = sb.folder("Musi\u{e9}");
+    let run = |lib: &Path| {
+        sb.run(&[
+            "init",
+            "--force",
+            "--library",
+            s(lib),
+            "--playlists",
+            s(&sb.lists),
+        ])
+    };
+    let o = sb.run(&["init", "--library", s(&nfc), "--playlists", s(&sb.lists)]);
+    assert_ok(&o);
+    fs::copy(fixture(Kind::Mp3, 1), nfc.join("a.mp3")).unwrap();
+    assert_ok(&sb.run(&["scan"]));
+    // The index holds the track under the decomposed spelling of the folder.
+    let db = sb.base().join("data/iprune/iprune.sqlite");
+    let store = iprune_core::store::Store::open(&db).unwrap();
+    let changed = store
+        .conn()
+        .execute(
+            "UPDATE tracks SET path = replace(path, ?1, ?2)",
+            ("Musi\u{e9}", "Musie\u{301}"),
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(store);
+
+    let o = run(&nfc);
+    assert_ok(&o);
+    assert!(!err(&o).contains("warning"), "{}", err(&o));
+}
+
+#[test]
+fn init_force_warning_does_not_take_a_sibling_folder_for_the_new_folder() {
+    let sb = Sandbox::new();
+    let (music, music2) = (sb.folder("Music"), sb.folder("Music2"));
+    assert_ok(&sb.run(&["init", "--library", s(&music2), "--playlists", s(&sb.lists)]));
+    fs::copy(fixture(Kind::Mp3, 1), music2.join("a.mp3")).unwrap();
+    assert_ok(&sb.run(&["scan"]));
+    // Music2 shares its name's start with Music, but is not inside it.
+    let o = sb.run(&[
+        "init",
+        "--force",
+        "--library",
+        s(&music),
+        "--playlists",
+        s(&sb.lists),
+    ]);
+    assert_ok(&o);
+    assert!(err(&o).contains("1 indexed tracks"), "{}", err(&o));
+}
+
+// Prevents a doctor run with no iPod scanning (and changing) the index
+// before it fails for want of an iPod.
+#[test]
+fn doctor_fix_without_an_ipod_fails_before_scanning() {
+    let sb = Sandbox::new();
+    sb.init();
+    sb.add_track("a.mp3", Kind::Mp3, 1);
+    let o = sb.run(&["doctor", "--fix", "--yes"]);
+    assert_fails(&o, 1);
+    let db = sb.base().join("data/iprune/iprune.sqlite");
+    let tracks = iprune_core::store::Store::open(&db)
+        .map(|st| iprune_core::store::all_tracks(st.conn()).unwrap().len())
+        .unwrap_or(0);
+    assert_eq!(tracks, 0, "the library was not scanned");
+    // Control: a scan does index it.
+    assert_ok(&sb.run(&["scan"]));
+    let st = iprune_core::store::Store::open(&db).unwrap();
+    assert_eq!(iprune_core::store::all_tracks(st.conn()).unwrap().len(), 1);
+}
+
 #[test]
 fn init_rejects_nonexistent_folders_and_writes_no_config() {
     let sb = Sandbox::new();

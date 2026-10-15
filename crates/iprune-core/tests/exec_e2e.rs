@@ -518,6 +518,38 @@ fn old_backups_are_pruned_to_keep_backups_and_the_new_one_is_never_deleted() {
     assert_eq!(left[0], out.backup);
 }
 
+// Prevents (audit L21) a sync's own backup, stamped by a clock behind the
+// older backups, sorting first and being the one the prune deletes.
+#[test]
+fn a_sync_after_backups_stamped_in_the_future_keeps_its_own_backup_and_sorts_it_last() {
+    let mut w = world_with_old();
+    let root = w.paths.data_dir.join("backups");
+    let year = 365 * 86_400;
+    let now = iprune_core::now_unix();
+    let future: Vec<i64> = (1..=3).map(|k| now + k * year).collect();
+    for t in &future {
+        backup::create(&root, GUID, &w.root, *t, &[]).unwrap();
+    }
+    w.env.cfg.sync.keep_backups = 3;
+    w.write_list("Road", &[D2]);
+    w.reload();
+    let out = w.sync().unwrap();
+
+    assert_eq!(out.pruned, 1);
+    let left = w.backups();
+    assert_eq!(left.len(), 3);
+    assert_eq!(left.last(), Some(&out.backup), "the new backup sorts last");
+    assert!(
+        out.backup.dir.join("iTunesDB").is_file(),
+        "and is still there"
+    );
+    // The oldest of the three older ones went, not the new one.
+    let stamps: Vec<String> = left.iter().map(|b| b.stamp.clone()).collect();
+    assert_eq!(stamps[0], backup::stamp(future[1]));
+    assert_eq!(stamps[1], backup::stamp(future[2]));
+    assert_eq!(stamps[2], out.backup.stamp);
+}
+
 #[test]
 fn stats_csv_failing_is_a_warning_and_the_sync_still_stands() {
     let w = world_with_old();

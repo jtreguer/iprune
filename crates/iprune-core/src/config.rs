@@ -120,24 +120,38 @@ impl Default for Sync {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path).at(path)?;
-        let config: Config = toml::from_str(&text).map_err(|e| Error::Config {
-            path: path.to_owned(),
-            message: e.to_string(),
-        })?;
+        let config = Self::load_unchecked(path)?;
         config.validate(path)?;
         Ok(config)
     }
 
+    /// The config as written, before [`Config::validate`]: for `init
+    /// --force`, which mends one that no longer validates.
+    pub fn load_unchecked(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path).at(path)?;
+        toml::from_str(&text).map_err(|e| Error::Config {
+            path: path.to_owned(),
+            message: e.to_string(),
+        })
+    }
+
+    /// Writes the config through a temporary file, synced, then renamed
+    /// over the old one: a crash leaves either.
     pub fn save(&self, path: &Path) -> Result<()> {
+        use std::io::Write as _;
         let text = toml::to_string_pretty(self).expect("config always serializes");
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).at(dir)?;
         }
-        std::fs::write(path, text).at(path)
+        let tmp = path.with_extension("toml.tmp");
+        let mut f = std::fs::File::create(&tmp).at(&tmp)?;
+        f.write_all(text.as_bytes()).at(&tmp)?;
+        f.sync_all().at(&tmp)?;
+        std::fs::rename(&tmp, path).at(path)
     }
 
-    fn validate(&self, path: &Path) -> Result<()> {
+    /// The rules every loaded config meets; `path` is named in the error.
+    pub fn validate(&self, path: &Path) -> Result<()> {
         let fail = |message: &str| {
             Err(Error::Config {
                 path: path.to_owned(),
