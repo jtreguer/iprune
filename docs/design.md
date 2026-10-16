@@ -5,9 +5,9 @@ Status: draft, 2026-10-13
 ## 1. Purpose
 
 iprune is a small Linux tool that manages playlists for a local music library
-and keeps an iPod Classic in sync with that library. It replaces the parts of
-iTunes that Linux players either lack or get wrong: deliberate, verifiable
-sync of tracks and playlists to an iPod.
+and keeps iPods (a Classic and a Video) in sync with that library. It
+replaces the parts of iTunes that Linux players either lack or get wrong:
+deliberate, verifiable sync of tracks and playlists to an iPod.
 
 It does not play music, and it does not coordinate with music players.
 
@@ -25,6 +25,7 @@ The current setup, as of this document:
 | Strawberry | 341 playlists, 9,675 songs indexed from the same root |
 | iTunes export | `/mnt/seagate-1tb/Bibliothèque.xml`, with play counts and dates added |
 | iPod model | iPod Classic 7th generation, 160 GB, FAT32 (Windows formatted) |
+| Second iPod | iPod Video 5th generation (USB product 0x1209), 80 GB with 75 GB usable, FAT32, freshly restored and empty (2026-10-15) |
 | iPod | 9,669 tracks, 329 regular playlists, 7 smart playlists, 6,191 tracks with play counts |
 | iPod backup | `/mnt/seagate-1tb/iPod-backup-2026-10` |
 
@@ -39,7 +40,8 @@ predictable is worse than no sync tool.**
 
 1. Point at one or more local music folders and index them.
 2. Create, edit, reorder, rename and delete playlists.
-3. Sync tracks and playlists to an iPod Classic, one way, library to device.
+3. Sync tracks and playlists to each iPod, one way, library to device. Each
+   iPod has its own selection of the library.
 4. Show exactly what a sync will do before it does it, and verify afterwards
    that the iPod matches what was planned.
 5. Take over the iPod as it is today without copying 77 GB again.
@@ -58,7 +60,8 @@ predictable is worse than no sync tool.**
 - Tag editing. Use a tag editor (Picard, Kid3, beets); iprune rereads tags.
 - Video, podcasts, audiobooks, photos.
 - Smart playlists on the iPod. Existing ones are left untouched.
-- iPods other than the Classic, iPhones, MTP players.
+- iPods other than the Classic and the Video (5th generation), iPhones, MTP
+  players.
 - Syncing back from the iPod to the library (except play statistics).
 - Automatic sync on plug-in. Sync always starts from a command.
 
@@ -245,7 +248,7 @@ When local tags are empty (or only spaces) for a field that has a value on
 the iPod, the iPod value is kept. This protects metadata that iTunes stored only in its database,
 which matters for the 79 WAV files.
 
-Files the iPod Classic cannot play (anything other than MP3, AAC, ALAC, WAV,
+Files the iPods cannot play (anything other than MP3, AAC, ALAC, WAV,
 AIFF) are skipped and reported. The current library has none apart from the
 two videos. Transcoding is planned for later (section 12).
 
@@ -268,7 +271,11 @@ two videos. Transcoding is planned for later (section 12).
 
 On every sync, before anything is written, iprune reads plays and skips since
 the last sync, the current rating and the last-played date for every managed
-track, and adds them to its own totals. These totals are exported to
+track, and adds them to its own totals. With two iPods, the plays and
+skips of both add up. A rating is taken from an iPod only when it changed
+there since iprune last saw it (a rating seen for the first time counts as
+a change), and the latest play date wins. Nothing is written back, so each
+iPod shows its own counts. These totals are exported to
 `~/.local/share/iprune/stats.csv` after each sync so they outlive the
 database.
 
@@ -322,8 +329,7 @@ In rough order of value:
 2. Sync scope by rules (genre, rating, added in the last N months) to fit a
    smaller iPod.
 3. Watching the library folders for changes while the window is open.
-4. A second iPod.
-5. Recreating iTunes' "Ajouté récemment" (recently added) smart playlist,
+4. Recreating iTunes' "Ajouté récemment" (recently added) smart playlist,
    from the index's `added_at`.
 
 ## 13. Decisions
@@ -331,7 +337,9 @@ In rough order of value:
 Answers to the questions left open in the first draft (2026-10-13):
 
 1. The iPod is a Classic 7th generation, 160 GB, formatted FAT32. HFS+ is not
-   supported.
+   supported. On 2026-10-16 an iPod Video 5th generation, 80 GB, also
+   FAT32, was added. Each iPod has its own mappings, sync scope, backups and
+   adoption. The library does not fit on the Video, so it syncs a selection.
 2. Rhythmbox and Strawberry are out of scope. The `.m3u8` folder is the only
    place playlists live, and iprune is the tool that edits them.
 3. No cover art. iprune does not add or edit artwork; what libgpod rewrites

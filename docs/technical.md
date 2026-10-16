@@ -399,7 +399,7 @@ existing mappings.
 - libgpod signs a database with the GUID it reads in the device files, not
   the serial. A write to a signed database is refused before it starts
   when libgpod finds no GUID there.
-- Before parsing, check the filesystem type. The supported iPod is FAT32
+- Before parsing, check the filesystem type. The supported iPods are FAT32
   (`vfat`); anything else is refused for writes, as is a read-only mount.
 - Every write (sync, `doctor --fix`, restore) needs the mountpoint to be
   the root of a `vfat` mount of a `/dev` device in mountinfo. A folder,
@@ -412,7 +412,15 @@ existing mappings.
   alone is not enough. The iPod shows no music from an unsigned database,
   so when the current one is signed and libgpod would not sign, a write is
   refused before it starts, and after it the new header must carry the
-  same scheme and a hash, or the sync fails verification.
+  same scheme and a hash, or the sync fails verification. The Video's
+  database is not signed (scheme 0), and a restored Video has no model in
+  `SysInfo`, so libgpod writes it unsigned and neither check applies.
+  Without a model libgpod cannot read the Video's `ArtworkDB` either, so
+  once tracks with cover art are on it `exec::check_artwork` refuses a
+  sync; a `SysInfo` naming the model (`ModelNumStr: xA450` for the 80 GB
+  black one) fixes that. Capacity and free space always come from the
+  filesystem (`statvfs`); libgpod's capacity is only a label, missing
+  when it knows no model.
 - What the iPod is when read (blake3 of `iTunesDB` and `Play Counts`, the
   GUID in its device files) is kept with the plan (`sync::Identity`), and
   `exec::sync` refuses with nothing changed when it differs at write
@@ -742,8 +750,8 @@ Order of operations:
    Check and the resume position. Play counts, rating, dates and the album's
    gapless flag stay. A file that is not marked as part of a compilation never
    clears the iPod's mark. Copies run one at a time with progress in bytes;
-   the USB link is the limit. Files sampled above 48 kHz, which the iPod
-   Classic cannot play, and files of 4 GiB or more, which FAT32 cannot
+   the USB link is the limit. Files sampled above 48 kHz, which neither
+   iPod plays, and files of 4 GiB or more, which FAT32 cannot
    hold, are skipped by the planner like FairPlay files. A copy that fails
    is checked by reading the library file to its end: if that fails too (a
    bad sector), the file is skipped like one gone and the sync goes on;
@@ -1132,7 +1140,7 @@ the running one's window to the front.
 |---|---|---|
 | Unit | planner, playlist parsing, adoption scoring, tag diffing | pure functions, table-driven tests |
 | Bindings | struct layouts, strings, lists | Rust snapshot vs C `snapshot` on the backup `iTunesDB` |
-| Integration | full sync on a fake iPod | `itdb_init_ipod` into a temp dir with a `SysInfo` containing a `FirewireGuid`, small audio fixtures generated with ffmpeg |
+| Integration | full sync on a fake iPod | `itdb_init_ipod` into a temp dir with a `SysInfo` containing a `FirewireGuid`, small audio fixtures generated with ffmpeg. With no model in `SysInfo`, libgpod writes an unsigned database, as on the Video; tests of signing and artwork add a Classic model number |
 | Regression | playlist doubling | sync the same plan twice; the second plan must be empty and the snapshot unchanged |
 | Real data, read only | adoption on 9,669 tracks | `adopt --file` on the backup, compare match counts between versions |
 | Device | first write | playlists-only sync on the real iPod after a manual backup, then `snapshot` diff |

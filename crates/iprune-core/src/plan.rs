@@ -279,7 +279,7 @@ pub struct Unmanaged {
 pub enum SkipReason {
     /// An iTunes Store purchase the iPod may not be authorised to play.
     FairPlay,
-    /// Sampled above 48 kHz, which the iPod Classic cannot play.
+    /// Sampled above 48 kHz, which neither the iPod Classic nor the Video plays.
     SampleRate,
     /// 4 GiB or more, which a FAT32 iPod cannot hold.
     TooLarge,
@@ -292,7 +292,7 @@ fn too_big(t: &TrackRow) -> bool {
     t.size > FAT32_MAX
 }
 
-/// The highest sample rate an iPod Classic plays.
+/// The highest sample rate the iPod Classic and Video play.
 const MAX_SAMPLE_RATE: u32 = 48_000;
 
 fn too_fast(t: &TrackRow) -> bool {
