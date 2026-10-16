@@ -23,7 +23,10 @@ const EXIT_DECLINED: u8 = 4;
 const EXIT_VERIFICATION: u8 = 3;
 
 #[derive(Parser)]
-#[command(version, about = "Playlist manager and sync tool for the iPod Classic")]
+#[command(
+    version,
+    about = "Playlist manager and sync tool for the iPod Classic and Video"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

@@ -2,7 +2,7 @@
 Type=Application
 Name=iprune
 GenericName=iPod Sync
-Comment=Edit playlists and sync the music library to an iPod Classic
+Comment=Edit playlists and sync the music library to an iPod
 Exec=iprune-gui
 Icon=multimedia-player
 Terminal=false
