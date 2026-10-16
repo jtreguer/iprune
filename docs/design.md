@@ -206,7 +206,9 @@ theme Omarchy sets.
   are dropped. Dragging inside a playlist sorted by `#` reorders it. Delete
   removes the selected rows from the playlist (never a file from the library).
   A context menu offers Add to playlist (a list of the playlists with a
-  filter field), Remove from playlist and Show in folder. Playlists are
+  filter field), Show in playlist (the same list, of the other playlists
+  holding the song clicked; picking one shows it with the song selected,
+  as in iTunes), Remove from playlist and Show in folder. Playlists are
   created, renamed and deleted from the sidebar, and a filter field above
   it narrows the playlists shown as you type. Each
   change is written to the `.m3u8` file at once. Sorting a playlist by

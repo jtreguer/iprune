@@ -93,6 +93,11 @@ impl Data {
             .collect())
     }
 
+    /// The playlists holding the library track `track_id`, by name.
+    pub fn playlists_holding(&self, track_id: i64) -> Result<Vec<String>> {
+        Ok(store::playlists_holding(self.store.conn(), track_id)?)
+    }
+
     pub fn playlist(&self, name: &str) -> Result<Vec<Row>> {
         let items = playlists::show(self.store.conn(), &self.config, name)?;
         Ok(view_model::playlist_rows(&items, &self.stats.borrow()))

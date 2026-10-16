@@ -57,6 +57,15 @@ enum Source {
     Playlist(String),
 }
 
+/// What a playlist picked in the picker is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    /// Add to Playlist: the selected tracks go at its end.
+    Add,
+    /// Show in Playlist: it is shown with this library track selected.
+    Show(i64),
+}
+
 /// Rows being dragged.
 #[derive(Debug, Clone)]
 struct Drag {
@@ -79,6 +88,8 @@ struct Ui {
     status: gtk::Label,
     filtered: gtk::FilterListModel,
     title: gtk::Label,
+    /// The grid's search field.
+    search: gtk::SearchEntry,
     sidebar: gtk::ListBox,
     sources: RefCell<Vec<Option<Source>>>,
     current: RefCell<Source>,
@@ -96,6 +107,10 @@ struct Ui {
     /// The grid's right-click menu and the actions only a playlist enables.
     row_menu: gtk::PopoverMenu,
     playlist_actions: RefCell<Vec<gio::SimpleAction>>,
+    /// Show in Playlist, enabled when another playlist holds the track the
+    /// menu was opened on, `menu_track`.
+    show_in_action: RefCell<Option<gio::SimpleAction>>,
+    menu_track: Cell<Option<i64>>,
     /// The sidebar's iPod panel and the actions on the iPod.
     device_box: gtk::Box,
     sync_action: RefCell<Option<gio::SimpleAction>>,
@@ -113,7 +128,10 @@ struct Ui {
     picker_list: gtk::ListBox,
     picker_names: RefCell<Vec<String>>,
     picker_query: RefCell<view_model::Query>,
+    pick_mode: Cell<Pick>,
     menu_point: Cell<(i32, i32)>,
+    /// Sidebar and grid; its position is the sidebar's width.
+    paned: gtk::Paned,
     /// True while a sync writes to the iPod: the window cannot close.
     writing: Cell<bool>,
     /// The running sync's Stop flag, which a SIGTERM, SIGHUP or SIGINT sets.
@@ -679,6 +697,12 @@ impl Ui {
         for a in self.playlist_actions.borrow().iter() {
             a.set_enabled(current.is_some());
         }
+        // Show in Playlist acts on the row clicked, even among several.
+        let track = self.selection.item(pos).and_then(|o| row_of(&o).track_id);
+        self.menu_track.set(track);
+        if let Some(a) = &*self.show_in_action.borrow() {
+            a.set_enabled(track.is_some_and(|id| !self.playlists_holding(id).is_empty()));
+        }
         let at = cell
             .compute_point(&self.view, &gtk::graphene::Point::new(x as f32, y as f32))
             .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
@@ -692,20 +716,31 @@ impl Ui {
         self.row_menu.popup();
     }
 
-    /// Opens the Add to Playlist picker where the grid menu was: every
-    /// playlist but the one shown, the filter empty and focused.
-    fn open_picker(&self) {
+    /// The playlists holding the library track `id`, but the one shown.
+    fn playlists_holding(&self, id: i64) -> Vec<String> {
+        let holding = self.data.playlists_holding(id).unwrap_or_default();
+        view_model::other_playlists(holding, self.playlist_name().as_deref())
+    }
+
+    /// Opens the picker where the grid menu was, the filter empty and
+    /// focused: for Add to Playlist every playlist but the one shown, for
+    /// Show in Playlist those holding the track but the one shown.
+    fn open_picker(&self, pick: Pick) {
         let current = self.playlist_name();
         while let Some(row) = self.picker_list.row_at_index(0) {
             self.picker_list.remove(&row);
         }
-        let names: Vec<String> = self
-            .data
-            .playlist_names()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|n| Some(n) != current.as_ref())
-            .collect();
+        let names: Vec<String> = match pick {
+            Pick::Add => self
+                .data
+                .playlist_names()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|n| Some(n) != current.as_ref())
+                .collect(),
+            Pick::Show(id) => self.playlists_holding(id),
+        };
+        self.pick_mode.set(pick);
         for name in &names {
             self.picker_list.append(&sidebar_item(name));
         }
@@ -733,7 +768,8 @@ impl Ui {
         first
     }
 
-    /// Adds the selected tracks to the picker's playlist at `row`.
+    /// Adds the selected tracks to the picker's playlist at `row`, or
+    /// shows that playlist with the track selected.
     fn pick(&self, row: &gtk::ListBoxRow) {
         let name = self
             .picker_names
@@ -742,8 +778,43 @@ impl Ui {
             .cloned();
         if let Some(name) = name {
             self.picker.popdown();
-            self.add_selected_to(&name);
+            match self.pick_mode.get() {
+                Pick::Add => self.add_selected_to(&name),
+                Pick::Show(id) => self.show_track_in(&name, id),
+            }
         }
+    }
+
+    /// Shows the playlist `name` with every entry of the library track `id`
+    /// selected, the first one scrolled to.
+    fn show_track_in(&self, name: &str, id: i64) {
+        let index = self
+            .sources
+            .borrow()
+            .iter()
+            .position(|s| matches!(s, Some(Source::Playlist(n)) if n == name));
+        let Some(row) = index.and_then(|i| self.sidebar.row_at_index(i as i32)) else {
+            return;
+        };
+        // A search would hide the track there. The query is reset here
+        // rather than by the field's signal, which may come later.
+        self.search.set_text("");
+        *self.query.borrow_mut() = view_model::Query::default();
+        self.filter.changed(gtk::FilterChange::LessStrict);
+        // Selecting it shows it, at once; the sidebar's filter keeps the
+        // playlist on screen, so it is shown there too. The focus scrolls
+        // the sidebar to it, then goes to the grid.
+        self.sidebar.select_row(Some(&row));
+        self.sidebar.invalidate_filter();
+        row.grab_focus();
+        let objects: Vec<glib::Object> = (0..self.selection.n_items())
+            .filter_map(|i| self.selection.item(i))
+            .collect();
+        let rows: Vec<std::cell::Ref<'_, Row>> = objects.iter().map(row_of).collect();
+        let positions = view_model::positions_of_track(rows.iter().map(|r| &**r), id);
+        drop(rows);
+        self.select_positions(&positions);
+        self.view.grab_focus();
     }
 
     /// The background colour picked from the menu, if any. A value the file
@@ -848,6 +919,7 @@ impl Ui {
     fn save_layouts(&self) {
         let now = self.capture_layout();
         let mut layouts = self.layouts.borrow().clone();
+        layouts.note_sidebar(self.paned.position());
         match self.playlist_layout.get() {
             true => layouts.playlist = now,
             false => layouts.library = now,
@@ -1784,6 +1856,7 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     // Opened by each cell's right-click, see `make_column`.
     let grid_menu = gio::Menu::new();
     grid_menu.append(Some("Add to Playlist…"), Some("win.add-to-playlist"));
+    grid_menu.append(Some("Show in Playlist…"), Some("win.show-in-playlist"));
     grid_menu.append(Some("Remove from Playlist"), Some("win.remove"));
     grid_menu.append(Some("Show in Folder"), Some("win.show-in-folder"));
     let row_menu = gtk::PopoverMenu::from_model(Some(&grid_menu));
@@ -1927,7 +2000,8 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
     paned.set_start_child(Some(&side));
     paned.set_end_child(Some(&main));
-    paned.set_position(260);
+    let layouts = load_layouts();
+    paned.set_position(layouts.sidebar_width());
     paned.set_shrink_start_child(false);
     window.set_child(Some(&paned));
 
@@ -1943,18 +2017,21 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         status,
         filtered,
         title,
+        search: search.clone(),
         sidebar: sidebar.clone(),
         sources: RefCell::new(Vec::new()),
         current: RefCell::new(Source::Library),
         drag: RefCell::new(None),
         context_playlist: RefCell::new(None),
-        layouts: RefCell::new(load_layouts()),
+        layouts: RefCell::new(layouts),
         playlist_layout: Cell::new(false),
         reload_pending: Cell::new(false),
         monitor: RefCell::new(None),
         shown_mtime: Cell::new(None),
         row_menu,
         playlist_actions: RefCell::new(Vec::new()),
+        show_in_action: RefCell::new(None),
+        menu_track: Cell::new(None),
         device_box: device_box.clone(),
         sync_action: RefCell::new(None),
         adopt_action: RefCell::new(None),
@@ -1967,7 +2044,9 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         picker_list: picker_list.clone(),
         picker_names: RefCell::new(Vec::new()),
         picker_query: RefCell::new(view_model::Query::default()),
+        pick_mode: Cell::new(Pick::Add),
         menu_point: Cell::new((0, 0)),
+        paned: paned.clone(),
         writing: Cell::new(false),
         cancel: RefCell::new(None),
         busy: Cell::new(false),
@@ -2021,10 +2100,22 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         let weak = Rc::downgrade(ui);
         glib::idle_add_local_once(move || {
             if let Some(ui) = weak.upgrade() {
-                ui.open_picker();
+                ui.open_picker(Pick::Add);
             }
         });
     });
+    let show_in = action(window, "show-in-playlist", &ui, |ui| {
+        let Some(id) = ui.menu_track.get() else {
+            return;
+        };
+        let weak = Rc::downgrade(ui);
+        glib::idle_add_local_once(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.open_picker(Pick::Show(id));
+            }
+        });
+    });
+    *ui.show_in_action.borrow_mut() = Some(show_in);
     {
         let weak = Rc::downgrade(&ui);
         picker_list.set_filter_func(move |row| {

@@ -766,3 +766,42 @@ fn a_mounted_adopted_ipod_carries_its_own_id_and_selection() {
     assert_eq!(info.id, Some(id));
     assert_eq!(info.selection.as_deref(), Some("syncs 2 playlists"));
 }
+
+fn track_id_of(sb: &Sandbox, i: usize) -> i64 {
+    store::all_tracks(sb.data.store.conn())
+        .unwrap()
+        .into_iter()
+        .find(|t| t.path == sb.tracks[i])
+        .unwrap()
+        .id
+}
+
+#[test]
+fn playlists_holding_follows_the_playlists_edited_through_data() {
+    let sb = sandbox(3);
+    let (t0, t1, t2) = (
+        track_id_of(&sb, 0),
+        track_id_of(&sb, 1),
+        track_id_of(&sb, 2),
+    );
+    for name in ["zulu", "alpha", "mike"] {
+        sb.data.create(name).unwrap();
+    }
+    sb.data.add("zulu", &sb.pick(&[0, 1]), None).unwrap();
+    sb.data.add("alpha", &sb.pick(&[0]), None).unwrap();
+    // twice in one playlist: still listed once
+    sb.data.add("mike", &sb.pick(&[0, 0]), None).unwrap();
+
+    assert_eq!(
+        sb.data.playlists_holding(t0).unwrap(),
+        ["alpha", "mike", "zulu"]
+    );
+    assert_eq!(sb.data.playlists_holding(t1).unwrap(), ["zulu"]);
+    assert!(sb.data.playlists_holding(t2).unwrap().is_empty());
+
+    // removing the entries, or the playlist, takes it out of the answer
+    sb.data.remove("alpha", &[1]).unwrap();
+    sb.data.delete("zulu").unwrap();
+    assert_eq!(sb.data.playlists_holding(t0).unwrap(), ["mike"]);
+    assert!(sb.data.playlists_holding(t1).unwrap().is_empty());
+}

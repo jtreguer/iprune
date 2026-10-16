@@ -1230,6 +1230,7 @@ fn complete_keeps_position_hidden_in_the_library_only() {
 fn layouts_round_trip_through_toml() {
     let layouts = Layouts {
         background: None,
+        sidebar: None,
         library: Layout {
             columns: vec![cs("name", 310, true), cs("album_artist", 77, false)],
         },
@@ -1483,11 +1484,13 @@ fn parse_reads_back_what_serializing_wrote() {
         Layouts::default(),
         Layouts {
             background: None,
+            sidebar: None,
             library: Layout::default_for(false),
             playlist: Layout::default_for(true),
         },
         Layouts {
             background: None,
+            sidebar: None,
             library: Layout {
                 columns: vec![cs("album_artist", 24, false), cs("name", 4000, true)],
             },
@@ -1507,6 +1510,7 @@ fn background_round_trips_through_toml_with_columns() {
     // not fail on a value coming after a table
     let layouts = Layouts {
         background: Some("#2b1d4e".to_owned()),
+        sidebar: None,
         library: Layout {
             columns: vec![cs("name", 310, true)],
         },
@@ -1524,6 +1528,7 @@ fn background_round_trips_through_toml_with_columns() {
 fn no_background_is_not_written_and_reads_back_as_none() {
     let layouts = Layouts {
         background: None,
+        sidebar: None,
         library: Layout {
             columns: vec![cs("name", 310, true)],
         },
@@ -1552,4 +1557,195 @@ fn parse_ignores_a_background_that_is_not_a_string() {
     );
     assert_eq!(l.background, None);
     assert_eq!(l.library.columns.len(), 1);
+}
+
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| (*s).to_owned()).collect()
+}
+
+#[test]
+fn other_playlists_drops_only_the_one_on_screen() {
+    let holding = names(&["alpha", "beta", "gamma"]);
+    // the library is on screen: nothing to drop
+    assert_eq!(other_playlists(holding.clone(), None), holding);
+    // order kept, only the exact name dropped
+    assert_eq!(
+        other_playlists(holding.clone(), Some("beta")),
+        names(&["alpha", "gamma"])
+    );
+    // a playlist that is not offered, or a name differing by case or by a
+    // prefix, drops nothing
+    assert_eq!(other_playlists(holding.clone(), Some("delta")), holding);
+    assert_eq!(other_playlists(holding.clone(), Some("Beta")), holding);
+    assert_eq!(other_playlists(holding.clone(), Some("bet")), holding);
+    // the only holder is the one on screen
+    assert!(other_playlists(names(&["beta"]), Some("beta")).is_empty());
+    assert!(other_playlists(Vec::new(), Some("beta")).is_empty());
+}
+
+fn with_sidebar(w: Option<i32>) -> Layouts {
+    Layouts {
+        sidebar: w,
+        ..Layouts::default()
+    }
+}
+
+#[test]
+fn sidebar_width_keeps_a_saved_width_within_120_and_600() {
+    assert_eq!(SIDEBAR_WIDTH, 200);
+    assert_eq!(with_sidebar(None).sidebar_width(), SIDEBAR_WIDTH);
+    assert_eq!(Layouts::default().sidebar_width(), SIDEBAR_WIDTH);
+    for (saved, shown) in [
+        (-1, SIDEBAR_WIDTH),
+        (-300, SIDEBAR_WIDTH),
+        (0, SIDEBAR_WIDTH),
+        (119, SIDEBAR_WIDTH),
+        (120, 120),
+        (260, 260),
+        (600, 600),
+        (601, SIDEBAR_WIDTH),
+        (i32::MAX, SIDEBAR_WIDTH),
+        (i32::MIN, SIDEBAR_WIDTH),
+    ] {
+        assert_eq!(with_sidebar(Some(saved)).sidebar_width(), shown, "{saved}");
+    }
+}
+
+#[test]
+fn parse_reads_the_sidebar_width_and_keeps_the_other_keys() {
+    let text = "sidebar = 230\nbackground = \"#2b1d4e\"\n\
+                [[library.columns]]\nid = \"name\"\nwidth = 120\nvisible = true\n";
+    let l = Layouts::parse(text);
+    assert_eq!(l.sidebar, Some(230));
+    assert_eq!(l.sidebar_width(), 230);
+    assert_eq!(l.background.as_deref(), Some("#2b1d4e"));
+    assert_eq!(l.library.columns.len(), 1);
+}
+
+#[test]
+fn parse_ignores_a_sidebar_that_is_not_an_integer_in_range_and_loads_the_rest() {
+    for text in [
+        "sidebar = \"wide\"",
+        "sidebar = 230.5",
+        "sidebar = true",
+        "sidebar = [230]",
+        "sidebar = 99999999999999",
+        "sidebar = -99999999999999",
+        "sidebar = 2147483648",
+    ] {
+        assert_eq!(Layouts::parse(text).sidebar, None, "{text}");
+        let with_rest = format!(
+            "background = \"#2b1d4e\"\n{text}\n\
+             [[library.columns]]\nid = \"name\"\nwidth = 120\nvisible = true\n"
+        );
+        let l = Layouts::parse(&with_rest);
+        assert_eq!(l.sidebar, None, "{text}");
+        assert_eq!(l.sidebar_width(), SIDEBAR_WIDTH, "{text}");
+        assert_eq!(l.background.as_deref(), Some("#2b1d4e"), "{text}");
+        assert_eq!(l.library.columns.len(), 1, "{text}");
+    }
+    // the largest i32 still reads, and is then refused as a width
+    let l = Layouts::parse("sidebar = 2147483647");
+    assert_eq!(l.sidebar, Some(i32::MAX));
+    assert_eq!(l.sidebar_width(), SIDEBAR_WIDTH);
+}
+
+#[test]
+fn sidebar_round_trips_through_toml_with_columns_and_is_not_written_when_none() {
+    let layouts = Layouts {
+        background: Some("#2b1d4e".to_owned()),
+        sidebar: Some(333),
+        library: Layout {
+            columns: vec![cs("name", 310, true)],
+        },
+        playlist: Layout::default_for(true),
+    };
+    let text = toml::to_string(&layouts).unwrap();
+    let back = Layouts::parse(&text);
+    assert_eq!(back.sidebar, Some(333), "{text}");
+    assert_eq!(back, layouts, "{text}");
+
+    let none = Layouts {
+        sidebar: None,
+        ..layouts
+    };
+    let text = toml::to_string(&none).unwrap();
+    assert!(!text.contains("sidebar"), "{text}");
+    assert_eq!(Layouts::parse(&text).sidebar, None);
+    // an old ui.toml without the key
+    assert_eq!(Layouts::parse("[library]\n").sidebar, None);
+}
+
+fn at(position: Option<usize>, track_id: Option<i64>) -> Row {
+    row(|r| {
+        r.position = position;
+        r.track_id = track_id;
+    })
+}
+
+#[test]
+fn positions_of_track_lists_every_entry_of_the_track_in_row_order() {
+    // twice in the playlist, among other tracks
+    let rows = [
+        at(Some(1), Some(7)),
+        at(Some(2), Some(8)),
+        at(Some(3), Some(7)),
+    ];
+    assert_eq!(positions_of_track(rows.iter(), 7), [1, 3]);
+    assert_eq!(positions_of_track(rows.iter(), 8), [2]);
+    // sorted away from position order: the output follows the rows given
+    let sorted = [
+        at(Some(3), Some(7)),
+        at(Some(2), Some(8)),
+        at(Some(1), Some(7)),
+    ];
+    assert_eq!(positions_of_track(sorted.iter(), 7), [3, 1]);
+    // absent track, and no rows at all
+    assert!(positions_of_track(rows.iter(), 99).is_empty());
+    assert!(positions_of_track([].iter(), 7).is_empty());
+}
+
+#[test]
+fn positions_of_track_skips_unresolved_rows_and_rows_without_position() {
+    let rows = [
+        at(Some(1), None),
+        at(None, Some(7)), // library row
+        at(Some(3), Some(7)),
+        at(None, None),
+    ];
+    assert_eq!(positions_of_track(rows.iter(), 7), [3]);
+    // library view only: nothing to select
+    let library = [at(None, Some(7)), at(None, Some(7))];
+    assert!(positions_of_track(library.iter(), 7).is_empty());
+}
+
+#[test]
+fn note_sidebar_records_only_a_width_that_was_dragged() {
+    let noted = |start: Option<i32>, width: i32| {
+        let mut l = with_sidebar(start);
+        l.note_sidebar(width);
+        l.sidebar
+    };
+    assert_eq!(noted(None, 200), None);
+    assert_eq!(noted(None, 250), Some(250));
+    assert_eq!(noted(Some(250), 250), Some(250));
+    assert_eq!(noted(Some(250), 200), Some(200));
+    // a saved value out of range counts as 200, so 200 is no change, yet
+    // the key is already there and is rewritten
+    assert_eq!(noted(Some(50), 200), Some(200));
+    // None with an out-of-range width is a change from 200
+    assert_eq!(noted(None, 50), Some(50));
+}
+
+#[test]
+fn an_untouched_sidebar_width_writes_no_key() {
+    let mut l = Layouts::default();
+    l.note_sidebar(SIDEBAR_WIDTH);
+    let text = toml::to_string(&l).unwrap();
+    assert!(!text.contains("sidebar"), "{text}");
+    assert_eq!(Layouts::parse(&text).sidebar, None);
+    // a dragged one is written and read back
+    l.note_sidebar(250);
+    let back = Layouts::parse(&toml::to_string(&l).unwrap());
+    assert_eq!(back.sidebar, Some(250));
 }

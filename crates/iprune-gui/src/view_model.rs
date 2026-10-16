@@ -542,6 +542,9 @@ pub struct Layouts {
     /// the theme.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<String>,
+    /// The sidebar's width as last dragged, in pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar: Option<i32>,
     #[serde(default)]
     pub library: Layout,
     #[serde(default)]
@@ -613,7 +616,44 @@ pub fn drop_before(position: usize, y: f64, height: f64) -> usize {
     }
 }
 
+/// The sidebar's width when none was saved: most playlist names (median 15
+/// characters, nine in ten under 25) show in full.
+pub const SIDEBAR_WIDTH: i32 = 200;
+
+/// The playlists to offer in Show in Playlist: those holding the track,
+/// but the one on screen.
+pub fn other_playlists(holding: Vec<String>, current: Option<&str>) -> Vec<String> {
+    holding
+        .into_iter()
+        .filter(|n| Some(n.as_str()) != current)
+        .collect()
+}
+
+/// The playlist positions of the entries of library track `id` among
+/// `rows`.
+pub fn positions_of_track<'a>(rows: impl Iterator<Item = &'a Row>, id: i64) -> Vec<usize> {
+    rows.filter(|r| r.track_id == Some(id))
+        .filter_map(|r| r.position)
+        .collect()
+}
+
 impl Layouts {
+    /// Records the sidebar's width to save, only once it differs from the
+    /// one it started at: a width never dragged follows `SIDEBAR_WIDTH`.
+    pub fn note_sidebar(&mut self, width: i32) {
+        if self.sidebar.is_some() || width != self.sidebar_width() {
+            self.sidebar = Some(width);
+        }
+    }
+
+    /// The sidebar's width: the one saved, unless it is out of reason
+    /// (below 120 or above 600 pixels).
+    pub fn sidebar_width(&self) -> i32 {
+        self.sidebar
+            .filter(|w| (120..=600).contains(w))
+            .unwrap_or(SIDEBAR_WIDTH)
+    }
+
     /// Reads `ui.toml`, keeping whatever is readable: a malformed column is
     /// dropped on its own, and a view that cannot be read gets the default.
     pub fn parse(text: &str) -> Layouts {
@@ -638,6 +678,10 @@ impl Layouts {
                 .get("background")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned),
+            sidebar: table
+                .get("sidebar")
+                .and_then(|v| v.as_integer())
+                .and_then(|w| i32::try_from(w).ok()),
             library: view("library"),
             playlist: view("playlist"),
         }

@@ -358,6 +358,20 @@ pub fn playlists(conn: &Connection) -> Result<Vec<PlaylistRow>> {
     Ok(rows)
 }
 
+/// Names of the playlists holding the track `track_id`, each once, in the
+/// order of [`playlists`].
+pub fn playlists_holding(conn: &Connection, track_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.name FROM playlists p WHERE p.removed_at IS NULL AND EXISTS \
+         (SELECT 1 FROM playlist_items i WHERE i.playlist_id = p.id AND i.track_id = ?1) \
+         ORDER BY p.name",
+    )?;
+    let names = stmt
+        .query_map([track_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(names)
+}
+
 pub fn playlist_summaries(conn: &Connection) -> Result<Vec<PlaylistSummary>> {
     let mut stmt = conn.prepare(
         "SELECT p.name, COUNT(i.position), COUNT(i.position) - COUNT(i.track_id) \

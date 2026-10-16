@@ -256,3 +256,103 @@ fn migration_0002_upgrades_a_version_1_database_in_place() {
     drop(s);
     Store::open(&db).unwrap();
 }
+
+fn track_id(s: &Store, name: &str) -> i64 {
+    store::insert_track(s.conn(), &record(name, None, false), 0).unwrap()
+}
+
+fn holding(s: &Store, id: i64) -> Vec<String> {
+    store::playlists_holding(s.conn(), id).unwrap()
+}
+
+fn put_items(s: &Store, name: &str, items: &[(Option<i64>, &str)]) {
+    let items: Vec<(Option<i64>, String)> =
+        items.iter().map(|(i, t)| (*i, (*t).to_string())).collect();
+    store::put_playlist(
+        s.conn(),
+        name,
+        Path::new(&format!("/p/{name}.m3u8")),
+        1,
+        &items,
+    )
+    .unwrap();
+}
+
+#[test]
+fn playlists_holding_lists_every_holder_in_name_order_and_skips_the_others() {
+    let s = Store::open_in_memory().unwrap();
+    let a = track_id(&s, "a.m4a");
+    let b = track_id(&s, "b.m4a");
+    // inserted out of name order on purpose
+    put_items(&s, "zeta", &[(Some(a), "a")]);
+    put_items(&s, "alpha", &[(Some(b), "b"), (Some(a), "a")]);
+    put_items(&s, "mid", &[(Some(a), "a")]);
+    put_items(&s, "only-b", &[(Some(b), "b")]);
+    assert_eq!(holding(&s, a), ["alpha", "mid", "zeta"]);
+    assert_eq!(holding(&s, b), ["alpha", "only-b"]);
+}
+
+#[test]
+fn playlists_holding_lists_a_playlist_once_however_often_it_holds_the_track() {
+    let s = Store::open_in_memory().unwrap();
+    let a = track_id(&s, "a.m4a");
+    put_items(
+        &s,
+        "twice",
+        &[(Some(a), "a"), (Some(a), "a"), (Some(a), "a")],
+    );
+    assert_eq!(holding(&s, a), ["twice"]);
+}
+
+#[test]
+fn playlists_holding_ignores_a_tombstoned_playlist_even_if_its_items_remain() {
+    let s = Store::open_in_memory().unwrap();
+    let a = track_id(&s, "a.m4a");
+    put_items(&s, "live", &[(Some(a), "a")]);
+    put_items(&s, "gone", &[(Some(a), "a")]);
+    s.conn()
+        .execute(
+            "UPDATE playlists SET removed_at = 5 WHERE name = 'gone'",
+            [],
+        )
+        .unwrap();
+    let kept: i64 = s
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM playlist_items i JOIN playlists p ON p.id = i.playlist_id \
+             WHERE p.name = 'gone'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, 1, "the fixture must keep the tombstone's item");
+    assert_eq!(holding(&s, a), ["live"]);
+}
+
+#[test]
+fn playlists_holding_never_matches_unresolved_entries() {
+    let s = Store::open_in_memory().unwrap();
+    let a = track_id(&s, "a.m4a");
+    put_items(
+        &s,
+        "unresolved",
+        &[(None, "missing.mp3"), (None, "other.mp3")],
+    );
+    put_items(&s, "mixed", &[(None, "missing.mp3"), (Some(a), "a")]);
+    assert_eq!(holding(&s, a), ["mixed"]);
+    // a track id that exists nowhere matches nothing, NULL rows included
+    assert!(holding(&s, 987_654).is_empty());
+}
+
+#[test]
+fn playlists_holding_is_empty_for_a_track_in_no_playlist() {
+    let s = Store::open_in_memory().unwrap();
+    let a = track_id(&s, "a.m4a");
+    let b = track_id(&s, "b.m4a");
+    assert!(holding(&s, a).is_empty(), "no playlist at all");
+    put_items(&s, "x", &[(Some(b), "b")]);
+    assert!(
+        holding(&s, a).is_empty(),
+        "a playlist holding another track"
+    );
+}
