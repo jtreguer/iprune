@@ -15,6 +15,20 @@ headerbar {
   box-shadow: inset 0 -1px @ip_line;
 }
 
+/* The IPRUNE badge in the header, which tells this window from fiio-tunes'.
+   A fixed orange: clear on dark and most mid backgrounds, weaker on very
+   light ones, and the border keeps it visible there. */
+headerbar .app-mark {
+  color: #f57900;
+  border: 1px solid #f57900;
+  border-radius: 4px;
+  padding: 1px 7px;
+  margin-left: 6px;
+  font-size: 0.8em;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+}
+
 /* Widgets that keep the theme's background keep its text colour too,
    rather than inheriting @ip_fg from the window. */
 popover > contents,

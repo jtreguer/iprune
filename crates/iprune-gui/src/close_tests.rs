@@ -17,6 +17,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -77,7 +78,9 @@ enum Start {
 /// printed "Listening on <socket>"; a daemon that exits or stays silent for
 /// 5 s counts as a failed attempt and the next number is tried.
 fn start_broadway() -> Start {
-    let base = 200 + std::process::id() % 700;
+    // Tests run in parallel in one process: each takes its own range.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let base = 200 + (std::process::id() + 25 * NEXT.fetch_add(1, Ordering::Relaxed)) % 700;
     for n in base..base + 20 {
         let mut child = match Command::new("gtk4-broadwayd")
             .arg(format!(":{n}"))
@@ -154,15 +157,10 @@ fn drain<R: Read + Send + 'static>(from: R) -> JoinHandle<String> {
     })
 }
 
-// Prevents: a Close or Cancel button capturing its dialog strongly, so the
-// dialog is never destroyed and the busy flag is never cleared.
-#[test]
-fn a_closes_button_lets_the_dialog_be_destroyed() {
-    if std::env::var_os(CHILD_MARKER).is_some() {
-        check_in_child();
-        return;
-    }
-
+/// Runs the test `test_name` again as a child against a private broadway
+/// display, where it takes the `CHILD_MARKER` branch. Skips when
+/// `gtk4-broadwayd` is missing, unless `IPRUNE_REQUIRE_GUI_TESTS` is set.
+fn run_in_broadway(test_name: &str) {
     let (_daemon, display) = match start_broadway() {
         Start::Running(daemon, display) => (daemon, display),
         Start::NotInstalled => {
@@ -176,7 +174,7 @@ fn a_closes_button_lets_the_dialog_be_destroyed() {
     };
 
     let mut child = Command::new(std::env::current_exe().expect("current_exe"))
-        .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
         .env(CHILD_MARKER, "1")
         .env("GDK_BACKEND", "broadway")
         .env("BROADWAY_DISPLAY", format!(":{display}"))
@@ -203,14 +201,97 @@ fn a_closes_button_lets_the_dialog_be_destroyed() {
     let err = err.join().unwrap_or_default();
 
     match status {
-        // A TEST_NAME that no longer matches runs nothing and exits 0.
+        // A test name that no longer matches runs nothing and exits 0.
         Some(status) if status.success() => assert!(
             out.contains(CHECKED),
-            "the child ran no check (is TEST_NAME still the test's path?)\n--- stdout\n{out}"
+            "the child ran no check (is the test name still the test's path?)\n--- stdout\n{out}"
         ),
         Some(status) => {
             panic!("child test failed ({status})\n--- stdout\n{out}\n--- stderr\n{err}")
         }
         None => panic!("child test timed out\n--- stdout\n{out}\n--- stderr\n{err}"),
     }
+}
+
+// Prevents: a Close or Cancel button capturing its dialog strongly, so the
+// dialog is never destroyed and the busy flag is never cleared.
+#[test]
+fn a_closes_button_lets_the_dialog_be_destroyed() {
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        check_in_child();
+        return;
+    }
+    run_in_broadway(TEST_NAME);
+}
+
+/// Every widget under `root`, depth first.
+fn descendants(root: &gtk::Widget, found: &mut Vec<gtk::Widget>) {
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        found.push(widget.clone());
+        descendants(&widget, found);
+        child = widget.next_sibling();
+    }
+}
+
+fn check_header_mark_in_child() {
+    gtk::init().expect("gtk::init against broadway");
+    crate::style::install();
+
+    let header = gtk::HeaderBar::new();
+    let columns = gtk::Button::with_label("Columns");
+    header.pack_start(&columns);
+    let sync = gtk::Button::with_label("Sync");
+    crate::pack_sync_and_mark(&header, &sync);
+    let window = gtk::Window::new();
+    window.set_titlebar(Some(&header));
+    window.present();
+    pump();
+
+    let mut all = Vec::new();
+    descendants(header.upcast_ref(), &mut all);
+    let marks: Vec<gtk::Label> = all
+        .iter()
+        .filter(|w| w.has_css_class("app-mark"))
+        .filter_map(|w| w.clone().downcast::<gtk::Label>().ok())
+        .collect();
+    assert_eq!(marks.len(), 1, "labels with the app-mark class");
+    let mark = &marks[0];
+    assert_eq!(mark.text(), "IPRUNE");
+
+    // Right after Sync, in the same (start) box, not at the end.
+    let sync_widget: &gtk::Widget = sync.upcast_ref();
+    assert_eq!(
+        mark.prev_sibling().as_ref(),
+        Some(sync_widget),
+        "the badge does not directly follow the Sync button"
+    );
+    assert_eq!(mark.parent(), sync.parent(), "different boxes");
+    assert_eq!(
+        sync.prev_sibling().as_ref(),
+        Some(columns.upcast_ref::<gtk::Widget>()),
+        "Sync moved relative to the buttons packed before it"
+    );
+
+    // The stylesheet rule really reaches the badge: a fixed orange.
+    let color = mark.color();
+    let orange = (0xf5 as f32 / 255.0, 0x79 as f32 / 255.0, 0.0);
+    assert!(
+        (color.red() - orange.0).abs() < 0.01
+            && (color.green() - orange.1).abs() < 0.01
+            && color.blue().abs() < 0.01,
+        "badge colour is {color}, not #f57900"
+    );
+    println!("{CHECKED}");
+}
+
+// Prevents: the badge that tells this window from fiio-tunes' going missing,
+// changing its text, moving away from the Sync button, or losing its colour.
+#[test]
+fn the_header_badge_follows_the_sync_button_in_orange() {
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        check_header_mark_in_child();
+        return;
+    }
+    run_in_broadway("close_tests::the_header_badge_follows_the_sync_button_in_orange");
 }

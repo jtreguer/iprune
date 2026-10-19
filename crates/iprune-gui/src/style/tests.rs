@@ -486,3 +486,23 @@ fn the_theme_stylesheet_defines_the_stripe_and_hover_once() {
     assert_eq!(css.matches("@define-color ip_grid_odd ").count(), 1);
     assert_eq!(css.matches("@define-color ip_hover ").count(), 1);
 }
+
+// Prevents: the header badge's rule being dropped from the sheet. The test
+// above only says the sheet parses; the colour on a real label is checked in
+// close_tests, which needs a display.
+#[test]
+fn the_sheet_has_the_orange_badge_rule() {
+    for background in [
+        None,
+        Some(Rgb(0x2b, 0x1d, 0x4e)),
+        Some(Rgb(0xf4, 0xe8, 0xc1)),
+    ] {
+        let sheet = stylesheet(background);
+        let at = sheet
+            .find("headerbar .app-mark {")
+            .unwrap_or_else(|| panic!("{background:?}: no `headerbar .app-mark` rule"));
+        let rule = &sheet[at..];
+        let rule = &rule[..rule.find('}').expect("rule is closed")];
+        assert!(rule.contains("color: #f57900;"), "{background:?}: {rule}");
+    }
+}

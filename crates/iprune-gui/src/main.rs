@@ -1791,6 +1791,19 @@ fn shortcut(controller: &gtk::ShortcutController, trigger: &str, action: &str) {
     ));
 }
 
+/// The text of the badge that follows the Sync button in the header.
+const APP_MARK: &str = "IPRUNE";
+
+/// Packs the Sync button at the start of `header`, then the badge that tells
+/// this window from fiio-tunes', which it otherwise matches.
+fn pack_sync_and_mark(header: &gtk::HeaderBar, sync_button: &gtk::Button) {
+    header.pack_start(sync_button);
+    let mark = gtk::Label::new(Some(APP_MARK));
+    mark.add_css_class("app-mark");
+    mark.set_valign(gtk::Align::Center);
+    header.pack_start(&mark);
+}
+
 /// `button` closes `dialog`. Through a weak reference: a button inside the
 /// dialog holding it would keep it alive, and its `destroy` handlers, which
 /// end a sync or an adoption, would never run.
@@ -1966,7 +1979,7 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     let sync_button = gtk::Button::with_label("Sync");
     sync_button.set_tooltip_text(Some("Show the sync plan for the connected iPod"));
     sync_button.set_action_name(Some("win.sync"));
-    header.pack_start(&sync_button);
+    pack_sync_and_mark(&header, &sync_button);
 
     let side_search = gtk::SearchEntry::new();
     side_search.set_placeholder_text(Some("Filter playlists"));

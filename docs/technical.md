@@ -1015,6 +1015,10 @@ libadwaita's widgets.
   so widgets exist only for the visible rows; the ~9,700 track objects are
   plain data that sorting and filtering go through. Column visibility, width
   and order are saved per view in `~/.local/state/iprune/ui.toml`.
+- **Badge.** An "IPRUNE" label (`app-mark`, a fixed orange with a border,
+  clear on dark and most mid backgrounds, weaker on very light ones)
+  follows the Sync button in the header, so the window is not taken for
+  fiio-tunes', its fork, which shows "FIIO-TUNES".
 - **Sidebar.** A `gtk::ListBox` (about 340 rows) with headers for Library
   and Playlists, and the iPod's state below it. It starts 200 pixels wide,
   enough for nine playlist names in ten. Once dragged, its width is saved
