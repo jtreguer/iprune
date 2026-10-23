@@ -7,6 +7,7 @@ mod adopt_job;
 #[cfg(test)]
 mod close_tests;
 mod data;
+mod scan_job;
 mod selection_dialog;
 mod style;
 mod sync_job;
@@ -113,6 +114,7 @@ struct Ui {
     menu_track: Cell<Option<i64>>,
     /// The sidebar's iPod panel and the actions on the iPod.
     device_box: gtk::Box,
+    scan_action: RefCell<Option<gio::SimpleAction>>,
     sync_action: RefCell<Option<gio::SimpleAction>>,
     adopt_action: RefCell<Option<gio::SimpleAction>>,
     selection_action: RefCell<Option<gio::SimpleAction>>,
@@ -1008,6 +1010,7 @@ impl Ui {
 
     /// Shows the iPod's state in the sidebar and enables Sync and Eject for
     /// an adopted iPod that is mounted, Adopt and Eject for one not adopted.
+    /// Scan needs no iPod; like them, it waits for whatever is running.
     fn refresh_device(&self) {
         while let Some(child) = self.device_box.first_child() {
             self.device_box.remove(&child);
@@ -1018,6 +1021,7 @@ impl Ui {
         let connected = device.as_ref().is_some_and(|d| d.connected);
         let adopted = device.as_ref().is_some_and(|d| d.adopted);
         for (action, on) in [
+            (&self.scan_action, true),
             (&self.sync_action, connected && adopted),
             (&self.adopt_action, connected && !adopted),
             (&self.eject_action, connected),
@@ -1156,6 +1160,70 @@ impl Ui {
             }),
             Err(e) => self.show_error(&format!("Nothing was added to {target}"), &e),
         }
+    }
+
+    /// Scans the library on a worker thread, as `iprune scan` does, and shows
+    /// its report in a dialog.
+    fn scan_library(self: &Rc<Self>) {
+        // One thing at a time: Sync and Adopt scan too, and a scan during a
+        // sync would change the index under it.
+        if self.busy.replace(true) {
+            return;
+        }
+        self.refresh_device();
+        self.status.set_text("Scanning the library…");
+        let dialog = gtk::Window::builder()
+            .title("Scan")
+            .transient_for(&self.window)
+            .modal(true)
+            .default_width(640)
+            .default_height(480)
+            .build();
+        let gone = Rc::new(Cell::new(false));
+        {
+            let gone = gone.clone();
+            // Closed during the scan, the scan goes on: the report then
+            // goes to the status line.
+            dialog.connect_destroy(move |_| gone.set(true));
+        }
+        let stack = gtk::Stack::new();
+        dialog.set_child(Some(&stack));
+        working_page(&stack, "Scanning the library…");
+        dialog.present();
+
+        let config = self.data.config().clone();
+        let paths = self.data.paths().clone();
+        let ui = Rc::downgrade(self);
+        let dialog_weak = dialog.downgrade();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || scan_job::scan(&config, &paths)).await;
+            let Some(ui) = ui.upgrade() else { return };
+            ui.busy.set(false);
+            ui.refresh_device();
+            // Show the library as the scan left it. It reloads the playlists
+            // too: the sidebar follows one added or removed, and falls back
+            // to the library if the one shown is gone.
+            if ui.sidebar_stale() {
+                ui.fill_sidebar();
+            } else {
+                ui.refresh();
+            }
+            let result = result.unwrap_or_else(|_| Err(anyhow::anyhow!("the scan worker crashed")));
+            let dialog = dialog_weak.upgrade().filter(|_| !gone.get());
+            match (result, dialog) {
+                (Ok(report), Some(dialog)) => report_page(&dialog, &stack, &report),
+                (Ok(report), None) => ui
+                    .status
+                    .set_text(report.lines().next().unwrap_or_default()),
+                (Err(e), Some(dialog)) => result_page(
+                    &dialog,
+                    &stack,
+                    "The library could not be scanned",
+                    &format!("{e:#}"),
+                ),
+                (Err(e), None) => ui.show_error("The library could not be scanned", &e),
+            }
+        });
     }
 
     /// Plans a sync on a worker thread and shows the plan in a dialog, from
@@ -1606,6 +1674,17 @@ impl Ui {
             Source::Playlist(name) => self.data.playlist_mtime(name) != self.shown_mtime.get(),
             Source::Library => false,
         };
+        if self.sidebar_stale() {
+            // The sidebar falls back to the library if the playlist shown
+            // is gone.
+            self.fill_sidebar();
+        } else if shown_changed {
+            self.refresh();
+        }
+    }
+
+    /// Whether the sidebar's playlists differ from the index's.
+    fn sidebar_stale(&self) -> bool {
         let listed: Vec<String> = self
             .sources
             .borrow()
@@ -1615,14 +1694,7 @@ impl Ui {
                 _ => None,
             })
             .collect();
-        let names = self.data.playlist_names().ok();
-        if names.as_ref() != Some(&listed) {
-            // The sidebar falls back to the library if the playlist shown
-            // is gone.
-            self.fill_sidebar();
-        } else if shown_changed {
-            self.refresh();
-        }
+        self.data.playlist_names().ok().as_ref() != Some(&listed)
     }
 }
 
@@ -1642,6 +1714,38 @@ fn working_page(stack: &gtk::Stack, text: &str) {
     page.append(&gtk::Label::new(Some(text)));
     stack.add_child(&page);
     stack.set_visible_child(&page);
+}
+
+/// A scan's report, which can run to thousands of lines (every missing
+/// file), so it scrolls.
+fn report_page(dialog: &gtk::Window, stack: &gtk::Stack, report: &str) {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    page.set_margin_top(16);
+    page.set_margin_bottom(16);
+    page.set_margin_start(16);
+    page.set_margin_end(16);
+    let heading = gtk::Label::new(Some("Library scanned"));
+    heading.add_css_class("title-2");
+    heading.set_xalign(0.0);
+    let text = gtk::TextView::new();
+    text.set_editable(false);
+    text.set_cursor_visible(false);
+    text.set_wrap_mode(gtk::WrapMode::WordChar);
+    text.buffer().set_text(report.trim_end());
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&text)
+        .build();
+    let close = gtk::Button::with_label("Close");
+    close.set_halign(gtk::Align::End);
+    closes(&close, dialog);
+    page.append(&heading);
+    page.append(&scroll);
+    page.append(&close);
+    stack.add_child(&page);
+    stack.set_visible_child(&page);
+    close.grab_focus();
 }
 
 fn result_page(dialog: &gtk::Window, stack: &gtk::Stack, title: &str, text: &str) {
@@ -1794,9 +1898,14 @@ fn shortcut(controller: &gtk::ShortcutController, trigger: &str, action: &str) {
 /// The text of the badge that follows the Sync button in the header.
 const APP_MARK: &str = "IPRUNE";
 
-/// Packs the Sync button at the start of `header`, then the badge that tells
-/// this window from fiio-tunes', which it otherwise matches.
-fn pack_sync_and_mark(header: &gtk::HeaderBar, sync_button: &gtk::Button) {
+/// Packs the Scan and Sync buttons at the start of `header`, then the badge
+/// that tells this window from fiio-tunes', which it otherwise matches.
+fn pack_buttons_and_mark(
+    header: &gtk::HeaderBar,
+    scan_button: &gtk::Button,
+    sync_button: &gtk::Button,
+) {
+    header.pack_start(scan_button);
     header.pack_start(sync_button);
     let mark = gtk::Label::new(Some(APP_MARK));
     mark.add_css_class("app-mark");
@@ -1976,10 +2085,15 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     new_button.set_margin_bottom(4);
 
     let device_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let scan_button = gtk::Button::with_label("Scan");
+    scan_button.set_tooltip_text(Some(
+        "Scan the library for added, changed, moved and missing files",
+    ));
+    scan_button.set_action_name(Some("win.scan"));
     let sync_button = gtk::Button::with_label("Sync");
     sync_button.set_tooltip_text(Some("Show the sync plan for the connected iPod"));
     sync_button.set_action_name(Some("win.sync"));
-    pack_sync_and_mark(&header, &sync_button);
+    pack_buttons_and_mark(&header, &scan_button, &sync_button);
 
     let side_search = gtk::SearchEntry::new();
     side_search.set_placeholder_text(Some("Filter playlists"));
@@ -2046,6 +2160,7 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         show_in_action: RefCell::new(None),
         menu_track: Cell::new(None),
         device_box: device_box.clone(),
+        scan_action: RefCell::new(None),
         sync_action: RefCell::new(None),
         adopt_action: RefCell::new(None),
         selection_action: RefCell::new(None),
@@ -2100,6 +2215,8 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         }
     });
     *ui.playlist_actions.borrow_mut() = vec![remove.clone(), up.clone(), down.clone()];
+    let scan = action(window, "scan", &ui, |ui| ui.scan_library());
+    *ui.scan_action.borrow_mut() = Some(scan);
     let sync = action(window, "sync", &ui, |ui| ui.open_sync());
     *ui.sync_action.borrow_mut() = Some(sync);
     let adopt = action(window, "adopt", &ui, |ui| ui.open_adopt());

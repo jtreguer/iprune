@@ -73,8 +73,8 @@ crates/iprune-core/  config, store, scan, playlist (.m3u8 format), playlists (op
                      after a sync)
 crates/iprune/       binary `iprune`: CLI
 crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6); view_model
-                     (rows, columns, sort, search) is plain and tested, data loads, sync_job
-                     and adopt_job are the workers (no GTK, tested), main and adopt_dialog
+                     (rows, columns, sort, search) is plain and tested, data loads, scan_job,
+                     sync_job and adopt_job are the workers (no GTK, tested), main and adopt_dialog
                      are GTK
 crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c
 packaging/           iprune.desktop and install.sh (cargo install and the desktop entry)

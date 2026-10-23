@@ -1111,7 +1111,13 @@ checked. Save stores the scope for that iPod as `iprune scope` does; the
 panel shows it in a few words.
 Eject runs `device::eject` on a worker: the block device mounted at the
 mountpoint, from mountinfo, is unmounted then powered off with `udisksctl`.
-Sync, Adopt and Eject share one busy flag: one of them at a time. Across
+The Scan button, between the header's menu and Sync, runs `scan::scan` on
+a worker (`scan_job`, no GTK) with its own connection to the index, then
+shows `scan::describe`, the text `iprune scan` prints, in a scrolling
+dialog, and reloads the grid, and the sidebar when the scan added or
+removed a playlist. Closed early, the scan goes on and its first
+line goes to the status line.
+Scan, Sync, Adopt and Eject share one busy flag: one of them at a time. Across
 processes, an advisory `flock` on `ipod.lock` in the data folder, taken
 without waiting, keeps the CLI and the window from writing or unmounting
 the iPod under each other; the second is refused and changes nothing. A

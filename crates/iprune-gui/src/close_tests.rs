@@ -241,8 +241,9 @@ fn check_header_mark_in_child() {
     let header = gtk::HeaderBar::new();
     let columns = gtk::Button::with_label("Columns");
     header.pack_start(&columns);
+    let scan = gtk::Button::with_label("Scan");
     let sync = gtk::Button::with_label("Sync");
-    crate::pack_sync_and_mark(&header, &sync);
+    crate::pack_buttons_and_mark(&header, &scan, &sync);
     let window = gtk::Window::new();
     window.set_titlebar(Some(&header));
     window.present();
@@ -267,10 +268,26 @@ fn check_header_mark_in_child() {
         "the badge does not directly follow the Sync button"
     );
     assert_eq!(mark.parent(), sync.parent(), "different boxes");
+    // Header order: menu button, Scan, Sync, badge, all in one box.
     assert_eq!(
         sync.prev_sibling().as_ref(),
+        Some(scan.upcast_ref::<gtk::Widget>()),
+        "Scan does not sit directly before Sync"
+    );
+    assert_eq!(
+        scan.prev_sibling().as_ref(),
         Some(columns.upcast_ref::<gtk::Widget>()),
-        "Sync moved relative to the buttons packed before it"
+        "Scan does not sit directly after the buttons packed before it"
+    );
+    assert_eq!(
+        scan.parent(),
+        sync.parent(),
+        "Scan and Sync in different boxes"
+    );
+    assert_eq!(
+        scan.parent(),
+        columns.parent(),
+        "Scan and menu in different boxes"
     );
 
     // The stylesheet rule really reaches the badge: a fixed orange.
@@ -286,7 +303,8 @@ fn check_header_mark_in_child() {
 }
 
 // Prevents: the badge that tells this window from fiio-tunes' going missing,
-// changing its text, moving away from the Sync button, or losing its colour.
+// changing its text, moving away from the Sync button, or losing its colour;
+// Scan leaving its place between the menu button and Sync.
 #[test]
 fn the_header_badge_follows_the_sync_button_in_orange() {
     if std::env::var_os(CHILD_MARKER).is_some() {

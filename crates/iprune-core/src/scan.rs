@@ -481,6 +481,78 @@ pub fn scan(
     Ok(report)
 }
 
+/// What a scan found, as `iprune scan` prints it and the window shows it:
+/// the counts, then each non-empty list, one item per indented line.
+pub fn describe(r: &ScanReport) -> String {
+    fn list<T>(out: &mut String, title: &str, items: &[T], line: impl Fn(&T) -> String) {
+        if !items.is_empty() {
+            out.push_str(&format!("{title}: {}\n", items.len()));
+            for i in items {
+                out.push_str(&format!("  {}\n", line(i)));
+            }
+        }
+    }
+    let shown = |p: &PathBuf| p.display().to_string();
+    let with_why = |(p, why): &(PathBuf, String)| format!("{}: {why}", p.display());
+    let mut out = format!(
+        "library: {} unchanged, {} added, {} updated, {} back from missing, {} moved, {} missing\n",
+        r.unchanged,
+        r.added,
+        r.updated,
+        r.returned,
+        r.moved.len(),
+        r.missing.len()
+    );
+    list(&mut out, "moved", &r.moved, |(a, b)| {
+        format!("{} -> {}", a.display(), b.display())
+    });
+    list(&mut out, "missing", &r.missing, shown);
+    list(&mut out, "unreadable", &r.unreadable, with_why);
+    list(
+        &mut out,
+        "iPods inside the library folders, not indexed",
+        &r.ipods,
+        shown,
+    );
+    list(&mut out, "unsupported", &r.unsupported, with_why);
+    list(
+        &mut out,
+        "indexed without tags (tags could not be parsed)",
+        &r.untagged,
+        with_why,
+    );
+    list(
+        &mut out,
+        "FairPlay protected, indexed as AAC",
+        &r.drm,
+        shown,
+    );
+    list(&mut out, "names not in UTF-8", &r.non_utf8, shown);
+    list(
+        &mut out,
+        "playlists rewritten for moved files",
+        &r.rewritten_playlists,
+        |n| n.clone(),
+    );
+    let pl = &r.playlists;
+    out.push_str(&format!(
+        "playlists: {} loaded, {} unresolved entries\n",
+        pl.loaded,
+        pl.unresolved.len()
+    ));
+    list(&mut out, "unresolved", &pl.unresolved, |(n, e)| {
+        format!("{n}: {e}")
+    });
+    list(
+        &mut out,
+        "playlists removed from the index",
+        &pl.removed,
+        |n| n.clone(),
+    );
+    list(&mut out, "playlist files skipped", &pl.skipped, with_why);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,5 +626,183 @@ UUID=1111 / ext4 rw 0 1
             "# only a comment\n\n",
             Path::new("/mnt/nas")
         ));
+    }
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    const COUNTS_ZERO: &str = "library: 0 unchanged, 0 added, 0 updated, 0 back from missing, 0 moved, 0 missing\n\
+         playlists: 0 loaded, 0 unresolved entries\n";
+
+    #[test]
+    fn describe_of_an_empty_report_is_the_two_count_lines() {
+        assert_eq!(describe(&ScanReport::default()), COUNTS_ZERO);
+    }
+
+    #[test]
+    fn describe_prints_the_counts_in_their_fixed_order() {
+        let r = ScanReport {
+            unchanged: 1,
+            added: 2,
+            updated: 3,
+            returned: 4,
+            moved: vec![(p("/a"), p("/b")); 5],
+            missing: vec![p("/m"); 6],
+            playlists: LoadReport {
+                loaded: 7,
+                unresolved: vec![("pl".into(), "x".into()); 8],
+                ..LoadReport::default()
+            },
+            ..ScanReport::default()
+        };
+        let text = describe(&r);
+        let mut lines = text.lines();
+        assert_eq!(
+            lines.next(),
+            Some(
+                "library: 1 unchanged, 2 added, 3 updated, 4 back from missing, 5 moved, 6 missing"
+            )
+        );
+        assert!(
+            text.contains("\nplaylists: 7 loaded, 8 unresolved entries\n"),
+            "{text}"
+        );
+    }
+
+    // One list at a time: its heading with the count, then the items indented
+    // by two spaces, and nothing else when the list is empty.
+    #[test]
+    fn describe_each_list_alone_has_its_heading_count_and_item_lines() {
+        type Fill = fn(&mut ScanReport);
+        let cases: Vec<(&str, Fill, &str)> = vec![
+            (
+                "moved",
+                |r| r.moved = vec![(p("/old.mp3"), p("/new.mp3")), (p("/o2"), p("/n2"))],
+                "moved: 2\n  /old.mp3 -> /new.mp3\n  /o2 -> /n2\n",
+            ),
+            (
+                "missing",
+                |r| r.missing = vec![p("/gone.mp3")],
+                "missing: 1\n  /gone.mp3\n",
+            ),
+            (
+                "unreadable",
+                |r| r.unreadable = vec![(p("/bad.mp3"), "truncated".into())],
+                "unreadable: 1\n  /bad.mp3: truncated\n",
+            ),
+            (
+                "ipods",
+                |r| r.ipods = vec![p("/music/ipod")],
+                "iPods inside the library folders, not indexed: 1\n  /music/ipod\n",
+            ),
+            (
+                "unsupported",
+                |r| r.unsupported = vec![(p("/c.flac"), "FLAC".into())],
+                "unsupported: 1\n  /c.flac: FLAC\n",
+            ),
+            (
+                "untagged",
+                |r| r.untagged = vec![(p("/u.mp3"), "bad frame".into())],
+                "indexed without tags (tags could not be parsed): 1\n  /u.mp3: bad frame\n",
+            ),
+            (
+                "drm",
+                |r| r.drm = vec![p("/buy.m4a")],
+                "FairPlay protected, indexed as AAC: 1\n  /buy.m4a\n",
+            ),
+            (
+                "non_utf8",
+                |r| r.non_utf8 = vec![p("/odd")],
+                "names not in UTF-8: 1\n  /odd\n",
+            ),
+            (
+                "rewritten",
+                |r| r.rewritten_playlists = vec!["mix".into(), "road".into()],
+                "playlists rewritten for moved files: 2\n  mix\n  road\n",
+            ),
+        ];
+        for (name, fill, section) in cases {
+            let mut r = ScanReport::default();
+            fill(&mut r);
+            let text = describe(&r);
+            // Counts line first; the section sits before the playlists line.
+            let (head, rest) = text.split_once('\n').unwrap();
+            assert!(head.starts_with("library: "), "{name}: {text}");
+            let tail = "playlists: 0 loaded, 0 unresolved entries\n";
+            assert_eq!(rest, format!("{section}{tail}"), "{name}");
+        }
+    }
+
+    #[test]
+    fn describe_playlist_lists_follow_the_playlists_line() {
+        let r = ScanReport {
+            playlists: LoadReport {
+                loaded: 3,
+                unresolved: vec![("mix".into(), "lost.mp3".into())],
+                removed: vec!["old".into()],
+                skipped: vec![(p("/l/x.m3u8"), "not UTF-8".into())],
+            },
+            ..ScanReport::default()
+        };
+        let text = describe(&r);
+        let want = format!(
+            "{}playlists: 3 loaded, 1 unresolved entries\n\
+             unresolved: 1\n  mix: lost.mp3\n\
+             playlists removed from the index: 1\n  old\n\
+             playlist files skipped: 1\n  /l/x.m3u8: not UTF-8\n",
+            COUNTS_ZERO.lines().next().unwrap().to_owned() + "\n"
+        );
+        assert_eq!(text, want);
+    }
+
+    // The order of sections is part of the output people read and script.
+    #[test]
+    fn describe_sections_come_in_the_documented_order() {
+        let r = ScanReport {
+            moved: vec![(p("/a"), p("/b"))],
+            missing: vec![p("/c")],
+            unreadable: vec![(p("/d"), "w".into())],
+            ipods: vec![p("/e")],
+            unsupported: vec![(p("/f"), "w".into())],
+            untagged: vec![(p("/g"), "w".into())],
+            drm: vec![p("/h")],
+            non_utf8: vec![p("/i")],
+            rewritten_playlists: vec!["j".into()],
+            playlists: LoadReport {
+                loaded: 1,
+                unresolved: vec![("k".into(), "l".into())],
+                removed: vec!["m".into()],
+                skipped: vec![(p("/n"), "w".into())],
+            },
+            ..ScanReport::default()
+        };
+        let text = describe(&r);
+        let headings = [
+            "library: ",
+            "moved: ",
+            "missing: ",
+            "unreadable: ",
+            "iPods inside the library folders",
+            "unsupported: ",
+            "indexed without tags",
+            "FairPlay protected",
+            "names not in UTF-8: ",
+            "playlists rewritten for moved files: ",
+            "playlists: 1 loaded",
+            "unresolved: ",
+            "playlists removed from the index: ",
+            "playlist files skipped: ",
+        ];
+        let at: Vec<usize> = headings
+            .iter()
+            .map(|h| {
+                text.find(&format!("\n{h}"))
+                    .or_else(|| text.starts_with(h).then_some(0))
+                    .unwrap_or_else(|| panic!("no {h:?} in\n{text}"))
+            })
+            .collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?}\n{text}");
+        assert!(text.ends_with('\n'));
     }
 }

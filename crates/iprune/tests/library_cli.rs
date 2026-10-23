@@ -830,3 +830,59 @@ fn scan_of_ordinary_files_prints_no_untagged_or_fairplay_section() {
         "{text}"
     );
 }
+
+// Prevents: `scan` output drifting from the format it had when the CLI
+// printed it line by line (the report text now comes from `scan::describe`,
+// which the window shares). The expected text was taken from the binary built
+// before that change.
+#[test]
+fn scan_output_is_byte_for_byte_the_report_format() {
+    let sb = Sandbox::new();
+    sb.init();
+    let a = sb.add_track("a.mp3", Kind::Mp3, 1);
+    let b = sb.add_track("b.mp3", Kind::Mp3, 2);
+    sb.add_track("keep.mp3", Kind::Mp3, 3);
+    assert_ok(&sb.run(&["scan"]));
+    assert_ok(&sb.run(&["playlist", "new", "mix"]));
+    assert_ok(&sb.run(&["playlist", "add", "mix", s(&a)]));
+    fs::write(sb.playlist_file("dangling"), "/nowhere/lost.mp3\n").unwrap();
+
+    let moved = sb.music.join("moved.mp3");
+    fs::rename(&a, &moved).unwrap();
+    fs::remove_file(&b).unwrap();
+    sb.add_track("c.flac", Kind::Flac, 4);
+    fs::write(sb.music.join("bad.mp3"), b"nope").unwrap();
+
+    let o = sb.run(&["scan"]);
+    assert_ok(&o);
+    let want = format!(
+        "library: 1 unchanged, 0 added, 0 updated, 0 back from missing, 1 moved, 1 missing\n\
+         moved: 1\n  {a} -> {moved}\n\
+         missing: 1\n  {b}\n\
+         unreadable: 1\n  {bad}: {why}\n\
+         unsupported: 1\n  {flac}: {flac_why}\n\
+         playlists rewritten for moved files: 1\n  mix\n\
+         playlists: 2 loaded, 1 unresolved entries\n\
+         unresolved: 1\n  dangling: /nowhere/lost.mp3\n",
+        a = a.display(),
+        moved = moved.display(),
+        b = b.display(),
+        bad = sb.music.join("bad.mp3").display(),
+        why = "WHY_BAD",
+        flac = sb.music.join("c.flac").display(),
+        flac_why = "WHY_FLAC",
+    );
+    let got = out(&o);
+    // The reasons come from lofty and the codec check; compare around them.
+    let bad_line = format!("  {}: ", sb.music.join("bad.mp3").display());
+    let flac_line = format!("  {}: ", sb.music.join("c.flac").display());
+    let why = got.lines().find(|l| l.starts_with(&bad_line)).unwrap()[bad_line.len()..].to_owned();
+    let flac_why =
+        got.lines().find(|l| l.starts_with(&flac_line)).unwrap()[flac_line.len()..].to_owned();
+    let want = want.replace("WHY_BAD", &why).replace("WHY_FLAC", &flac_why);
+    assert_eq!(got, want);
+    assert!(
+        err(&o).lines().all(|l| !l.starts_with("library:")),
+        "report on stderr"
+    );
+}

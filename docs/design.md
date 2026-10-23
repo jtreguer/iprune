@@ -213,6 +213,10 @@ theme Omarchy sets.
   it narrows the playlists shown as you type. Each
   change is written to the `.m3u8` file at once. Sorting a playlist by
   another column changes only the view, never the file.
+- **Scanning.** The Scan button, left of Sync, runs `iprune scan` and shows
+  its report in a dialog: the counts, then the moved, missing, unreadable
+  and unsupported files and the unresolved playlist entries. It needs no
+  iPod.
 - **Syncing.** The Sync button scans, reads the iPod and opens the plan in a
   dialog with expandable sections (copy, remove, tag updates, playlists,
   unmanaged items, statistics pulled) and the space it needs. Apply runs it

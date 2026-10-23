@@ -345,76 +345,9 @@ fn scan_with_progress(config: &Config, store: &mut Store) -> Result<scan::ScanRe
 fn run_scan() -> Result<()> {
     let (config, mut store) = load()?;
     let r = scan_with_progress(&config, &mut store)?;
-    let mut out = io::stdout().lock();
-    writeln!(
-        out,
-        "library: {} unchanged, {} added, {} updated, {} back from missing, {} moved, {} missing",
-        r.unchanged,
-        r.added,
-        r.updated,
-        r.returned,
-        r.moved.len(),
-        r.missing.len()
-    )?;
-    print_list(&mut out, "moved", &r.moved, |(a, b)| {
-        format!("{} -> {}", a.display(), b.display())
-    })?;
-    print_list(&mut out, "missing", &r.missing, |p| p.display().to_string())?;
-    print_list(&mut out, "unreadable", &r.unreadable, |(p, why)| {
-        format!("{}: {why}", p.display())
-    })?;
-    print_list(
-        &mut out,
-        "iPods inside the library folders, not indexed",
-        &r.ipods,
-        |p| p.display().to_string(),
-    )?;
-    print_list(&mut out, "unsupported", &r.unsupported, |(p, why)| {
-        format!("{}: {why}", p.display())
-    })?;
-    print_list(
-        &mut out,
-        "indexed without tags (tags could not be parsed)",
-        &r.untagged,
-        |(p, why)| format!("{}: {why}", p.display()),
-    )?;
-    print_list(
-        &mut out,
-        "FairPlay protected, indexed as AAC",
-        &r.drm,
-        |p| p.display().to_string(),
-    )?;
-    print_list(&mut out, "names not in UTF-8", &r.non_utf8, |p| {
-        p.display().to_string()
-    })?;
-    print_list(
-        &mut out,
-        "playlists rewritten for moved files",
-        &r.rewritten_playlists,
-        |n| n.clone(),
-    )?;
-    let pl = &r.playlists;
-    writeln!(
-        out,
-        "playlists: {} loaded, {} unresolved entries",
-        pl.loaded,
-        pl.unresolved.len()
-    )?;
-    print_list(&mut out, "unresolved", &pl.unresolved, |(n, e)| {
-        format!("{n}: {e}")
-    })?;
-    print_list(
-        &mut out,
-        "playlists removed from the index",
-        &pl.removed,
-        |n| n.clone(),
-    )?;
-    print_list(
-        &mut out,
-        "playlist files skipped",
-        &pl.skipped,
-        |(p, why)| format!("{}: {why}", p.display()),
-    )?;
+    io::stdout()
+        .lock()
+        .write_all(scan::describe(&r).as_bytes())?;
     Ok(())
 }
 
