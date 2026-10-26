@@ -20,6 +20,7 @@ pub mod scan;
 pub mod stats;
 pub mod store;
 pub mod sync;
+pub mod tag_edit;
 pub mod tags;
 pub mod transfer;
 pub mod verify;

@@ -85,6 +85,30 @@ impl Data {
         Ok(view_model::library_rows(&tracks, &self.stats.borrow()))
     }
 
+    pub fn track(&self, id: i64) -> Result<Option<TrackRow>> {
+        Ok(store::track(self.store.conn(), id)?)
+    }
+
+    /// The tracks `ids` as the index has them now, read in one pass.
+    pub fn tracks(&self, ids: &std::collections::HashSet<i64>) -> Result<HashMap<i64, TrackRow>> {
+        Ok(store::all_tracks(self.store.conn())?
+            .into_iter()
+            .filter(|t| ids.contains(&t.id))
+            .map(|t| (t.id, t))
+            .collect())
+    }
+
+    /// The grid row of `t` at playlist `position`.
+    pub fn row(&self, t: &TrackRow, position: Option<usize>) -> Row {
+        Row::from_track(t, self.stats.borrow().get(&t.id), position)
+    }
+
+    /// The values Get Info suggests, from the whole library.
+    pub fn completions(&self) -> Result<view_model::Completions> {
+        let tracks = store::all_tracks(self.store.conn())?;
+        Ok(view_model::Completions::new(&tracks))
+    }
+
     /// Playlist names, as the files are named.
     pub fn playlist_names(&self) -> Result<Vec<String>> {
         Ok(store::playlists(self.store.conn())?

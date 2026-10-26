@@ -138,11 +138,69 @@ enum Command {
     /// List and edit playlists.
     #[command(subcommand)]
     Playlist(PlaylistCommand),
+    /// Show or edit the tags of library files: the fields synced to the
+    /// iPod. With no field option, prints them. An empty value clears a
+    /// field.
+    Tag {
+        /// Indexed library files.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        #[command(flatten)]
+        fields: TagFields,
+    },
     /// Print every track and playlist in a stable form for diffing.
     Snapshot {
         /// iPod mountpoint, or an iTunesDB file.
         path: PathBuf,
     },
+}
+
+#[derive(clap::Args)]
+struct TagFields {
+    #[arg(long)]
+    title: Option<String>,
+    #[arg(long)]
+    artist: Option<String>,
+    #[arg(long)]
+    album_artist: Option<String>,
+    #[arg(long)]
+    album: Option<String>,
+    #[arg(long)]
+    composer: Option<String>,
+    #[arg(long)]
+    genre: Option<String>,
+    #[arg(long, value_name = "N", value_parser = number)]
+    year: Option<Number>,
+    #[arg(long, value_name = "N", value_parser = number)]
+    track: Option<Number>,
+    #[arg(long, value_name = "N", value_parser = number)]
+    track_total: Option<Number>,
+    #[arg(long, value_name = "N", value_parser = number)]
+    disc: Option<Number>,
+    #[arg(long, value_name = "N", value_parser = number)]
+    disc_total: Option<Number>,
+    #[arg(long, value_enum)]
+    compilation: Option<YesNo>,
+}
+
+/// A number option's value; none when given empty, to clear the field.
+#[derive(Clone, Copy)]
+struct Number(Option<u32>);
+
+fn number(s: &str) -> std::result::Result<Number, String> {
+    match s.trim() {
+        "" => Ok(Number(None)),
+        t => t
+            .parse()
+            .map(|n| Number(Some(n)))
+            .map_err(|_| format!("{s:?} is not a whole number")),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum YesNo {
+    Yes,
+    No,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1008,6 +1066,137 @@ fn playlist(cmd: &PlaylistCommand) -> Result<Outcome> {
     Ok(Outcome::Done)
 }
 
+fn run_tag(files: &[PathBuf], f: &TagFields) -> Result<()> {
+    use iprune_core::tag_edit::{self, Changes, Outcome};
+    let text = |v: &Option<String>| v.clone().map(Some);
+    let changes = Changes {
+        title: text(&f.title),
+        artist: text(&f.artist),
+        album: text(&f.album),
+        album_artist: text(&f.album_artist),
+        composer: text(&f.composer),
+        genre: text(&f.genre),
+        year: f.year.map(|n| n.0),
+        track_no: f.track.map(|n| n.0),
+        track_total: f.track_total.map(|n| n.0),
+        disc_no: f.disc.map(|n| n.0),
+        disc_total: f.disc_total.map(|n| n.0),
+        compilation: f.compilation.map(|c| c == YesNo::Yes),
+    };
+    // As in the window: one name and one track number make no sense for
+    // several songs.
+    if files.len() > 1 && (f.title.is_some() || f.track.is_some()) {
+        use clap::CommandFactory;
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--title and --track take a single file",
+            )
+            .exit();
+    }
+    if let Err(why) = changes.cleaned().check() {
+        use clap::CommandFactory;
+        Cli::command()
+            .error(clap::error::ErrorKind::ValueValidation, why)
+            .exit();
+    }
+    let (_, store) = load()?;
+    let conn = store.conn();
+    let cwd = std::env::current_dir().context("reading the current folder")?;
+    // Each file given, with its track when it is indexed.
+    let mut given = Vec::new();
+    for file in files {
+        let abs = iprune_core::paths::absolute(file, &cwd);
+        let track = match iprune_core::paths::key(&abs) {
+            Some(k) => iprune_core::store::present_track_by_key(conn, &k)?,
+            None => None,
+        };
+        given.push((abs, track));
+    }
+    let not_indexed = "not in the library index; run `iprune scan` first";
+    let mut refused = 0;
+    if changes.is_empty() {
+        let mut out = io::stdout().lock();
+        for (abs, track) in &given {
+            let Some(t) = track else {
+                refused += 1;
+                writeln!(out, "refused    {}: {not_indexed}", abs.display())?;
+                continue;
+            };
+            let g = &t.tags;
+            let text = |v: &Option<String>| v.clone().unwrap_or_default();
+            let num = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_default();
+            writeln!(out, "{}", t.path.display())?;
+            for (name, value) in [
+                ("title", text(&g.title)),
+                ("artist", text(&g.artist)),
+                ("album artist", text(&g.album_artist)),
+                ("album", text(&g.album)),
+                ("composer", text(&g.composer)),
+                ("genre", text(&g.genre)),
+                ("year", num(g.year)),
+                ("track", num(g.track_no)),
+                ("track total", num(g.track_total)),
+                ("disc", num(g.disc_no)),
+                ("disc total", num(g.disc_total)),
+                (
+                    "compilation",
+                    (if g.compilation { "yes" } else { "no" }).into(),
+                ),
+            ] {
+                writeln!(out, "  {name:<14}{value}")?;
+            }
+        }
+    } else {
+        let ids: Vec<i64> = given
+            .iter()
+            .filter_map(|(_, t)| t.as_ref().map(|t| t.id))
+            .collect();
+        let _held = applying("Writing tags to library files");
+        let report = tag_edit::edit(conn, &ids, &changes, &mut |_| {}, &CANCEL)?;
+        let mut shown = std::collections::HashSet::new();
+        for (abs, track) in &given {
+            let Some(t) = track else {
+                refused += 1;
+                say!("refused    {}: {not_indexed}", abs.display());
+                continue;
+            };
+            // A file given twice is edited, and reported, once.
+            if !shown.insert(t.id) {
+                continue;
+            }
+            match report
+                .results
+                .iter()
+                .find(|r| r.track_id == t.id)
+                .map(|r| &r.outcome)
+            {
+                Some(Outcome::Written) => {
+                    say!("written    {}", t.path.display());
+                }
+                Some(Outcome::Unchanged) => {
+                    say!("unchanged  {}", t.path.display());
+                }
+                Some(Outcome::Refused(why)) => {
+                    refused += 1;
+                    say!("refused    {}: {why}", t.path.display());
+                }
+                None => {
+                    refused += 1;
+                    say!("stopped    {}: not edited", t.path.display());
+                }
+            }
+        }
+        if let Some(e) = &report.index_error {
+            bail!("the index could not be updated: {e}");
+        }
+    }
+    if refused > 0 {
+        bail!("{refused} of {} files were not edited", files.len());
+    }
+    Ok(())
+}
+
 fn snapshot(path: &Path) -> Result<()> {
     let db = if path.is_dir() {
         gpod::Database::open(path)
@@ -1115,6 +1304,7 @@ fn main() -> ExitCode {
             run_scope(set.as_ref(), guid.as_deref()).map(|()| Outcome::Done)
         }
         Command::Playlist(cmd) => playlist(cmd),
+        Command::Tag { files, fields } => run_tag(files, fields).map(|()| Outcome::Done),
         Command::Snapshot { path } => snapshot(path).map(|()| Outcome::Done),
     };
     match result {

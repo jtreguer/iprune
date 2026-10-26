@@ -6245,3 +6245,67 @@ fn an_empty_adopted_ipod_receives_the_library_and_then_has_an_empty_plan() {
     w.sync().unwrap();
     assert_eq!(w.snapshot(), before);
 }
+
+// Prevents: a tag edit of an already synced track making the next sync copy
+// the audio again (its size changes, not its duration) or leaving its row
+// without the new `tags_hash`, so the iPod never gets the new tags.
+#[test]
+fn a_tag_edit_of_a_synced_track_is_a_retag_and_then_an_empty_plan() {
+    use iprune_core::tag_edit::{self, Changes};
+    let w = World::new(3);
+    w.sync().unwrap();
+    assert!(w.prepare().plan.is_empty(), "set up: in step");
+    let id = w.id_of(&w.files[2]);
+    let before_size = w.env.track(&w.files[2]).size;
+    let before_other = w.env.track(&w.files[0]);
+
+    // No rescan: the edit updates the index itself.
+    let report = tag_edit::edit(
+        w.env.store.conn(),
+        &[id],
+        &Changes {
+            // Longer than the padding, so the file's size changes.
+            title: Some(Some(format!("Edited Title {}", "x".repeat(3000)))),
+            artist: Some(Some("Edited Artist".into())),
+            ..Changes::default()
+        },
+        &mut |_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(report.written(), 1, "{report:?}");
+    assert_ne!(w.env.track(&w.files[2]).size, before_size, "the file grew");
+    assert_eq!(w.env.track(&w.files[0]), before_other, "others untouched");
+
+    let p = w.prepare();
+    let work = exec::full_work(&p);
+    assert!(work.tracks.copies.is_empty(), "no copy: {:?}", p.plan.copy);
+    assert!(work.tracks.removes.is_empty());
+    assert_eq!(work.tracks.retags.len(), 1, "{:?}", work.tracks.retags);
+    assert_eq!(work.tracks.retags[0].dbid, dbid(3));
+    let snapshot_before = w.snapshot();
+
+    let out = w.sync().unwrap();
+    assert_eq!(
+        (out.copied, out.recopied, out.removed, out.retagged),
+        (0, 0, 0, 1),
+        "{out:?}"
+    );
+    let t = w.track(dbid(3)).unwrap();
+    assert!(
+        t.tags
+            .title
+            .as_deref()
+            .unwrap()
+            .starts_with("Edited Title x")
+    );
+    assert_eq!(t.tags.artist.as_deref(), Some("Edited Artist"));
+    assert_ne!(w.snapshot(), snapshot_before, "the iPod changed");
+
+    let again = w.prepare();
+    assert!(again.plan.is_empty(), "{:?}", again.plan);
+    assert!(exec::full_work(&again).tracks.retags.is_empty());
+    let settled = w.snapshot();
+    w.sync().unwrap();
+    assert_eq!(w.snapshot(), settled);
+}

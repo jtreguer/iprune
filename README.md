@@ -12,8 +12,11 @@ It has two parts:
   playlists, a sortable grid of tracks, drag and drop, and a Sync button.
 - `iprune`, a command line tool that does everything the window does.
 
-iprune does not play music, edit tags or touch cover art. Your music
-folder and its `.m3u8` playlist files are the reference. The iPod is a
+iprune does not play music or touch cover art. It edits the tags the iPod
+uses (name, artist, album, genre, year and the like) in a Get Info form, as
+iTunes did, for one song or several at once, or with `iprune tag`; only the
+fields you change are rewritten in the file. Your music folder and its
+`.m3u8` playlist files are the reference. The iPod is a
 copy of them, kept up to date one way, from the library to the device.
 
 ## How a sync works

@@ -49,6 +49,8 @@ predictable is worse than no sync tool.**
    not lost.
 7. Fit Omarchy: a native Wayland window that follows the GTK theme, usable
    from the keyboard, with every action also available as a command.
+8. Edit the tags of one song or of several at once in a Get Info form, as
+   in iTunes, written to the audio files themselves.
 
 ## 4. Non-goals
 
@@ -57,7 +59,12 @@ predictable is worse than no sync tool.**
   artwork files when it writes the database, so iprune backs them up with
   the database and refuses to write when it cannot read them.
 - Importing statistics from the iTunes export. The iPod's counts are used.
-- Tag editing. Use a tag editor (Picard, Kid3, beets); iprune rereads tags.
+- Tag fields beyond the ones synced to the iPod (comments, grouping,
+  lyrics, sort fields, BPM). Use a tag editor (Picard, Kid3, beets) for
+  those; iprune rereads tags.
+- Ratings in Get Info. Ratings come from the iPod (section 9).
+- Renaming or moving files after a tag edit, as iTunes did when it kept
+  the media folder organised. A file keeps its name and folder.
 - Video, podcasts, audiobooks, photos.
 - Smart playlists on the iPod. Existing ones are left untouched.
 - iPods other than the Classic and the Video (5th generation), iPhones, MTP
@@ -75,6 +82,8 @@ is then executed and checked.
 **Files are the truth for content, the iPod is the truth for listening
 history.** Tags come from the audio files. Playlists come from the `.m3u8`
 files. Play counts, skips, ratings and last-played dates come from the iPod.
+Tags edited in iprune are written to the files, so they reach the iPod the
+same way as tags edited anywhere else.
 
 **Leave alone what you do not own.** iprune only changes iPod tracks and
 playlists it knows it manages. Anything else is reported and kept unless the
@@ -159,7 +168,26 @@ From the command line, for scripts:
    write it, then read it back and compare it to the plan.
 4. `iprune eject` unmounts and powers off the iPod.
 
-### 7.4 Recovering
+### 7.4 Editing tags
+
+In the window: select one song or several, right-click and pick Get Info
+(or press Ctrl+I). For one song the form shows its tags; Previous and Next
+move to the songs above and below it in the grid, saving first, as in
+iTunes. For several it becomes Multiple Item Information: a value every
+selected song shares is shown, the others are blank, and only the fields
+you change are written, to every selected file. OK writes the files and the
+grid shows the new values at once. The next sync sends them to the iPod as
+tag updates, without copying the files again.
+
+The fields are the ones synced to the iPod: name, artist, album artist,
+album, composer, genre, year, track and disc number with their totals, and
+the compilation flag. Clearing a field removes it from the file, but the
+iPod keeps its value, since an empty library tag never overwrites the iPod
+(section 9).
+
+From the command line: `iprune tag <path>... --artist "a-ha" --year 1985`.
+
+### 7.5 Recovering
 
 - `iprune backups` lists saved iPod databases.
 - `iprune restore <backup>` puts one back. It first pulls the plays waiting
@@ -205,14 +233,42 @@ theme Omarchy sets.
   sidebar to append them, or into a playlist's grid to insert them where they
   are dropped. Dragging inside a playlist sorted by `#` reorders it. Delete
   removes the selected rows from the playlist (never a file from the library).
-  A context menu offers Add to playlist (a list of the playlists with a
-  filter field), Show in playlist (the same list, of the other playlists
+  A context menu offers Get Info (see Editing tags below), Add to playlist
+  (a list of the playlists with a filter field), Show in playlist (the same list, of the other playlists
   holding the song clicked; picking one shows it with the song selected,
   as in iTunes), Remove from playlist and Show in folder. Playlists are
   created, renamed and deleted from the sidebar, and a filter field above
   it narrows the playlists shown as you type. Each
   change is written to the `.m3u8` file at once. Sorting a playlist by
   another column changes only the view, never the file.
+- **Editing tags.** Get Info opens a form modelled on the Info tab of
+  iTunes 10:
+
+  ```
+  ┌ Take On Me ────────────────────────────────────────────────────┐
+  │ Name          [Take On Me                                    ] │
+  │ Artist        [a-ha                      ]  Year  [1985]       │
+  │ Album Artist  [a-ha                      ]  Track [ 1] of [10] │
+  │ Album         [Hunting High and Low      ]  Disc  [ 1] of [ 1] │
+  │ Composer      [Furuholmen, Harket, Waaktaar                  ] │
+  │ Genre         [Pop               ]  [ ] Part of a compilation  │
+  │                                                                │
+  │ /mnt/seagate-1tb/Music/a-ha/Hunting High and Low/01 Take On…   │
+  │ MPEG audio, 3:46, 320 kbit/s, 44.1 kHz, 9.1 MB                 │
+  │ [Previous] [Next]                              [Cancel]  [OK]  │
+  └────────────────────────────────────────────────────────────────┘
+  ```
+
+  With several songs selected the title reads "Multiple Item Information
+  (12 songs)", Name and track number are gone (a track total stays), and
+  each field has a check box. A field whose value differs between the songs
+  is blank with "Mixed" greyed in it. Typing in a field ticks its box; only
+  ticked fields are written, and a ticked empty field clears that tag in
+  every file. The compilation box shows a dash when the songs differ.
+  Artist, Album Artist, Album, Composer and Genre suggest the values
+  already in the library as you type. Songs whose file is missing are left
+  out, and protected iTunes Store files, or files whose tags could not be
+  read, are shown but not edited, with the reason.
 - **Scanning.** The Scan button, left of Sync, runs `iprune scan` and shows
   its report in a dialog: the counts, then the moved, missing, unreadable
   and unsupported files and the unresolved playlist entries. It needs no
@@ -223,13 +279,14 @@ theme Omarchy sets.
   with a progress bar; Eject unmounts and powers off the iPod.
 - **Adoption review.** On first connection, the proposals appear as a grid,
   one row per iPod track with its candidates, to accept or reject one by one.
-- **Keyboard.** Ctrl+F search, Delete remove, Ctrl+N new playlist, F2 rename,
+- **Keyboard.** Ctrl+F search, Ctrl+I Get Info, Delete remove, Ctrl+N new
+  playlist, F2 rename,
   Ctrl+Up and Ctrl+Down move the selected rows in a playlist, plus the
   usual GTK navigation.
 
 Every action in the window is also a command, so syncing can be bound to a
-Hyprland key or run from a script. The window does not play music or edit
-tags (section 4).
+Hyprland key or run from a script. The window does not play music
+(section 4).
 
 ## 9. Sync rules
 
@@ -351,3 +408,9 @@ Answers to the questions left open in the first draft (2026-10-13):
 3. No cover art. iprune does not add or edit artwork; what libgpod rewrites
    is backed up and restored with the database.
 4. Play statistics come from the iPod only. The iTunes export is not imported.
+5. Tag editing, a non-goal in the first draft, was added on 2026-10-26: a
+   Get Info form for one or several songs, as in iTunes, limited to the
+   fields synced to the iPod. It writes to the library files, which iprune
+   had never done before, so iprune's own tag writer changes only the
+   edited frames, and each new file is read back and checked before it
+   replaces the original (technical document, section 7.1).

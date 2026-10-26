@@ -1749,3 +1749,550 @@ fn an_untouched_sidebar_width_writes_no_key() {
     let back = Layouts::parse(&toml::to_string(&l).unwrap());
     assert_eq!(back.sidebar, Some(250));
 }
+
+// ---- Get Info
+
+fn info_tags(f: impl FnOnce(&mut Tags)) -> Tags {
+    let mut t = Tags {
+        title: Some("Take On Me".into()),
+        artist: Some("a-ha".into()),
+        album: Some("Hunting High and Low".into()),
+        album_artist: Some("a-ha".into()),
+        composer: Some("Waaktaar".into()),
+        genre: Some("Pop".into()),
+        year: Some(1985),
+        track_no: Some(3),
+        track_total: Some(10),
+        disc_no: Some(1),
+        disc_total: Some(2),
+        compilation: false,
+    };
+    f(&mut t);
+    t
+}
+
+/// The form for these songs as it opens.
+fn opened_for(tags: &[Tags]) -> (Opened, Entered) {
+    let refs: Vec<&Tags> = tags.iter().collect();
+    let o = Opened::new(&refs);
+    let e = Entered::new(&o);
+    (o, e)
+}
+
+#[test]
+fn info_fields_know_what_the_form_does_with_them() {
+    let several: Vec<InfoField> = InfoField::ALL
+        .into_iter()
+        .filter(|f| f.for_several())
+        .collect();
+    assert!(!several.contains(&InfoField::Title));
+    assert!(!several.contains(&InfoField::Track));
+    assert_eq!(several.len(), InfoField::ALL.len() - 2);
+    let numeric: Vec<InfoField> = InfoField::ALL.into_iter().filter(|f| f.numeric()).collect();
+    assert_eq!(
+        numeric,
+        [
+            InfoField::Year,
+            InfoField::Track,
+            InfoField::TrackTotal,
+            InfoField::Disc,
+            InfoField::DiscTotal
+        ]
+    );
+    let completing: Vec<InfoField> = InfoField::ALL
+        .into_iter()
+        .filter(|f| f.completes())
+        .collect();
+    assert_eq!(
+        completing,
+        [
+            InfoField::Artist,
+            InfoField::AlbumArtist,
+            InfoField::Album,
+            InfoField::Composer,
+            InfoField::Genre
+        ]
+    );
+    // Each field shows its own value.
+    let t = info_tags(|_| {});
+    let shown: Vec<String> = InfoField::ALL.iter().map(|f| f.text(&t)).collect();
+    assert_eq!(
+        shown,
+        [
+            "Take On Me",
+            "a-ha",
+            "a-ha",
+            "Hunting High and Low",
+            "Waaktaar",
+            "Pop",
+            "1985",
+            "3",
+            "10",
+            "1",
+            "2"
+        ]
+    );
+    assert_eq!(InfoField::Year.text(&Tags::default()), "");
+}
+
+#[test]
+fn opened_shows_one_songs_values_and_nothing_ticked() {
+    let (o, e) = opened_for(&[info_tags(|t| t.disc_no = None)]);
+    assert_eq!(o.get(InfoField::Title), Some("Take On Me"));
+    assert_eq!(o.get(InfoField::Year), Some("1985"));
+    assert_eq!(o.get(InfoField::Disc), Some(""), "empty, not mixed");
+    assert_eq!(o.compilation, Some(false));
+    assert_eq!(e.get(InfoField::Title), "Take On Me");
+    assert_eq!(e.get(InfoField::Disc), "");
+    assert!(InfoField::ALL.iter().all(|&f| !e.ticked(f)));
+    assert!(!e.compilation_ticked);
+    assert_eq!(e.compilation, Some(false));
+}
+
+#[test]
+fn opened_shows_a_shared_value_and_none_for_a_mixed_one() {
+    let a = info_tags(|_| {});
+    let b = info_tags(|t| {
+        t.title = Some("Other".into());
+        t.year = Some(1986);
+        t.genre = None;
+        t.compilation = true;
+    });
+    let c = info_tags(|t| t.genre = None);
+    let (o, e) = opened_for(&[a.clone(), b.clone(), c.clone()]);
+    assert_eq!(o.get(InfoField::Artist), Some("a-ha"), "shared");
+    assert_eq!(o.get(InfoField::Title), None, "mixed");
+    assert_eq!(o.get(InfoField::Year), None);
+    assert_eq!(o.get(InfoField::Genre), None, "one has a genre, two do not");
+    assert_eq!(o.compilation, None);
+    // A mixed field opens empty and so does its compilation box.
+    assert_eq!(e.get(InfoField::Title), "");
+    assert_eq!(e.compilation, None);
+    // Empty in all is shared, not mixed.
+    let (o, _) = opened_for(&[info_tags(|t| t.genre = None), info_tags(|t| t.genre = None)]);
+    assert_eq!(o.get(InfoField::Genre), Some(""));
+    // The same compilation flag in all.
+    let (o, _) = opened_for(&[
+        info_tags(|t| t.compilation = true),
+        info_tags(|t| t.compilation = true),
+    ]);
+    assert_eq!(o.compilation, Some(true));
+}
+
+#[test]
+fn one_song_with_no_change_sends_an_empty_edit() {
+    let (o, e) = opened_for(&[info_tags(|_| {})]);
+    let c = info_changes(false, &o, &e).unwrap();
+    assert!(c.is_empty(), "{c:?}");
+}
+
+#[test]
+fn one_song_sends_only_the_fields_that_differ() {
+    let (o, mut e) = opened_for(&[info_tags(|_| {})]);
+    e.set(InfoField::Title, "  Take On You ");
+    e.set(InfoField::Year, "1986");
+    e.set(InfoField::Genre, "Synth-pop");
+    e.set(InfoField::TrackTotal, "11");
+    let c = info_changes(false, &o, &e).unwrap();
+    assert_eq!(
+        c,
+        iprune_core::tag_edit::Changes {
+            title: Some(Some("Take On You".into())),
+            year: Some(Some(1986)),
+            genre: Some(Some("Synth-pop".into())),
+            track_total: Some(Some(11)),
+            ..Default::default()
+        }
+    );
+}
+
+#[test]
+fn one_song_clears_a_field_emptied_in_the_form() {
+    let (o, mut e) = opened_for(&[info_tags(|_| {})]);
+    e.set(InfoField::Composer, "");
+    e.set(InfoField::Album, "   ");
+    e.set(InfoField::Disc, "");
+    e.set(InfoField::DiscTotal, " ");
+    let c = info_changes(false, &o, &e).unwrap();
+    assert_eq!(
+        c,
+        iprune_core::tag_edit::Changes {
+            composer: Some(None),
+            album: Some(None),
+            disc_no: Some(None),
+            disc_total: Some(None),
+            ..Default::default()
+        }
+    );
+}
+
+#[test]
+fn one_song_ignores_ticks() {
+    let (o, mut e) = opened_for(&[info_tags(|_| {})]);
+    e.tick(InfoField::Artist, true);
+    e.compilation_ticked = true;
+    let c = info_changes(false, &o, &e).unwrap();
+    assert!(c.is_empty(), "{c:?}");
+}
+
+#[test]
+fn numbers_are_digits_from_one_to_the_limit() {
+    let (o, base) = opened_for(&[info_tags(|_| {})]);
+    for (f, text, ok) in [
+        (InfoField::Year, "1000", true),
+        (InfoField::Year, "9999", true),
+        (InfoField::Year, "999", false),
+        (InfoField::Year, "0", false),
+        (InfoField::Year, "10000", false),
+        (InfoField::Track, "999", true),
+        (InfoField::Track, "1000", false),
+        (InfoField::Track, "0", false),
+        (InfoField::TrackTotal, "1000", false),
+        (InfoField::Disc, "0", false),
+        (InfoField::DiscTotal, "1000", false),
+        (InfoField::Year, "19a", false),
+        (InfoField::Year, "+5", false),
+        (InfoField::Year, "-5", false),
+        (InfoField::Year, "5.0", false),
+        (InfoField::Year, "١٩٨٥", false), // Arabic-Indic digits
+        (InfoField::Year, " 1990 ", true),
+    ] {
+        let mut e = base.clone();
+        e.set(f, text);
+        let r = info_changes(false, &o, &e);
+        assert_eq!(r.is_ok(), ok, "{f:?} {text:?}: {r:?}");
+        if let Err(why) = r {
+            assert!(why.contains(f.label()), "{why}");
+        } else {
+            let c = r.unwrap();
+            let want = text.trim().parse::<u32>().unwrap();
+            let got = match f {
+                InfoField::Year => c.year,
+                InfoField::Track => c.track_no,
+                InfoField::TrackTotal => c.track_total,
+                InfoField::Disc => c.disc_no,
+                _ => c.disc_total,
+            };
+            assert_eq!(got, Some(Some(want)), "{f:?} {text:?}");
+        }
+    }
+}
+
+#[test]
+fn a_number_out_of_range_that_is_left_alone_does_not_block_the_other_fields() {
+    // A file can hold a track number 1000 or 0 ("0/12"): the form opens with
+    // it, and editing the title must still go through without sending it.
+    let (o, mut e) = opened_for(&[info_tags(|t| {
+        t.track_no = Some(1000);
+        t.year = Some(12);
+    })]);
+    assert_eq!(e.get(InfoField::Track), "1000");
+    e.set(InfoField::Title, "Renamed");
+    let c = info_changes(false, &o, &e).unwrap();
+    assert_eq!(c.title, Some(Some("Renamed".into())));
+    assert_eq!((c.track_no, c.year), (None, None), "left alone, not sent");
+    // The same for several songs when the field is not ticked.
+    let (o, mut e) = opened_for(&[
+        info_tags(|t| t.disc_total = Some(5000)),
+        info_tags(|t| t.disc_total = Some(5000)),
+    ]);
+    assert_eq!(e.get(InfoField::DiscTotal), "5000");
+    e.set(InfoField::Album, "Shared");
+    e.tick(InfoField::Album, true);
+    let c = info_changes(true, &o, &e).unwrap();
+    assert_eq!(c.album, Some(Some("Shared".into())));
+    assert_eq!(c.disc_total, None);
+}
+
+#[test]
+fn a_bad_number_is_reported_once_it_would_be_written() {
+    // One song: changed to another bad value, or typed over a bad one.
+    let (o, mut e) = opened_for(&[info_tags(|t| t.track_no = Some(1000))]);
+    e.set(InfoField::Track, "1001");
+    let why = info_changes(false, &o, &e).unwrap_err();
+    assert!(why.contains("Track"), "{why}");
+    e.set(InfoField::Track, "abc");
+    assert!(info_changes(false, &o, &e).is_err());
+    e.set(InfoField::Track, "4");
+    assert_eq!(info_changes(false, &o, &e).unwrap().track_no, Some(Some(4)));
+    // Several songs: ticking the field makes its value count, shown as it
+    // was or not.
+    let (o, mut e) = opened_for(&[
+        info_tags(|t| t.disc_total = Some(5000)),
+        info_tags(|t| t.disc_total = Some(5000)),
+    ]);
+    e.tick(InfoField::DiscTotal, true);
+    let why = info_changes(true, &o, &e).unwrap_err();
+    assert!(why.contains("Disc total"), "{why}");
+    let (o, mut e) = opened_for(&[info_tags(|_| {}), info_tags(|_| {})]);
+    e.set(InfoField::Year, "abc");
+    assert!(info_changes(true, &o, &e).is_ok(), "not ticked: ignored");
+    e.tick(InfoField::Year, true);
+    let why = info_changes(true, &o, &e).unwrap_err();
+    assert!(why.contains("Year"), "{why}");
+}
+
+#[test]
+fn the_first_bad_field_in_form_order_is_named() {
+    let (o, mut e) = opened_for(&[info_tags(|_| {})]);
+    e.set(InfoField::DiscTotal, "x");
+    e.set(InfoField::Track, "y");
+    e.set(InfoField::Year, "z");
+    let why = info_changes(false, &o, &e).unwrap_err();
+    assert!(why.contains("Year") && !why.contains("Track"), "{why}");
+}
+
+#[test]
+fn several_songs_send_only_the_ticked_fields() {
+    let (o, mut e) = opened_for(&[
+        info_tags(|_| {}),
+        info_tags(|t| {
+            t.artist = Some("Other".into());
+            t.genre = None;
+        }),
+    ]);
+    e.set(InfoField::Artist, "Various");
+    e.tick(InfoField::Artist, true);
+    e.set(InfoField::Album, "Typed but not ticked");
+    e.set(InfoField::Genre, "Rock");
+    e.tick(InfoField::Genre, true);
+    e.set(InfoField::Year, "2001");
+    e.tick(InfoField::Year, true);
+    e.set(InfoField::Composer, "");
+    e.tick(InfoField::Composer, true);
+    let c = info_changes(true, &o, &e).unwrap();
+    assert_eq!(
+        c,
+        iprune_core::tag_edit::Changes {
+            artist: Some(Some("Various".into())),
+            genre: Some(Some("Rock".into())),
+            year: Some(Some(2001)),
+            composer: Some(None),
+            ..Default::default()
+        }
+    );
+}
+
+#[test]
+fn several_songs_never_send_a_title_or_a_track_number() {
+    let (o, mut e) = opened_for(&[info_tags(|_| {}), info_tags(|_| {})]);
+    e.set(InfoField::Title, "One name for all");
+    e.tick(InfoField::Title, true);
+    e.set(InfoField::Track, "abc");
+    e.tick(InfoField::Track, true);
+    let c = info_changes(true, &o, &e).unwrap();
+    assert!(c.is_empty(), "{c:?}");
+    // The track total is a field of the album and does go.
+    e.set(InfoField::TrackTotal, "12");
+    e.tick(InfoField::TrackTotal, true);
+    let c = info_changes(true, &o, &e).unwrap();
+    assert_eq!(c.track_total, Some(Some(12)));
+    assert_eq!((c.title.clone(), c.track_no), (None, None));
+}
+
+#[test]
+fn a_ticked_field_left_unchanged_is_still_sent_for_several_songs() {
+    // The user ticked it: every song gets the shown value.
+    let (o, mut e) = opened_for(&[info_tags(|_| {}), info_tags(|_| {})]);
+    e.tick(InfoField::Artist, true);
+    assert_eq!(e.get(InfoField::Artist), "a-ha");
+    let c = info_changes(true, &o, &e).unwrap();
+    assert_eq!(c.artist, Some(Some("a-ha".into())));
+}
+
+#[test]
+fn compilation_for_one_song_is_sent_when_it_differs() {
+    let (o, mut e) = opened_for(&[info_tags(|_| {})]);
+    assert_eq!(info_changes(false, &o, &e).unwrap().compilation, None);
+    e.compilation = Some(true);
+    assert_eq!(info_changes(false, &o, &e).unwrap().compilation, Some(true));
+    let (o, mut e) = opened_for(&[info_tags(|t| t.compilation = true)]);
+    e.compilation = Some(false);
+    assert_eq!(
+        info_changes(false, &o, &e).unwrap().compilation,
+        Some(false)
+    );
+}
+
+#[test]
+fn compilation_for_several_songs_needs_a_tick_and_a_value() {
+    let (o, mut e) = opened_for(&[info_tags(|_| {}), info_tags(|t| t.compilation = true)]);
+    assert_eq!(o.compilation, None, "mixed");
+    assert_eq!(e.compilation, None);
+    // Untouched: nothing.
+    assert_eq!(info_changes(true, &o, &e).unwrap().compilation, None);
+    // A value chosen but not ticked: nothing.
+    e.compilation = Some(true);
+    assert_eq!(info_changes(true, &o, &e).unwrap().compilation, None);
+    // Ticked and on, or off.
+    e.compilation_ticked = true;
+    assert_eq!(info_changes(true, &o, &e).unwrap().compilation, Some(true));
+    e.compilation = Some(false);
+    assert_eq!(info_changes(true, &o, &e).unwrap().compilation, Some(false));
+    // Ticked while the box still shows mixed: nothing to send.
+    e.compilation = None;
+    assert_eq!(info_changes(true, &o, &e).unwrap().compilation, None);
+}
+
+#[test]
+fn clearing_is_announced_only_for_a_field_that_had_a_value() {
+    let (o, mut e) = opened_for(&[info_tags(|t| t.genre = None)]);
+    assert!(!info_clears(false, &o, &e), "nothing emptied");
+    e.set(InfoField::Genre, "  ");
+    assert!(!info_clears(false, &o, &e), "it was empty already");
+    e.set(InfoField::Artist, "");
+    assert!(info_clears(false, &o, &e), "the artist is emptied");
+    e.set(InfoField::Artist, "a-ha");
+    assert!(!info_clears(false, &o, &e));
+    e.set(InfoField::Year, " ");
+    assert!(info_clears(false, &o, &e), "a number too");
+}
+
+#[test]
+fn clearing_for_several_songs_counts_only_ticked_fields_with_a_value_somewhere() {
+    let (o, mut e) = opened_for(&[info_tags(|t| t.genre = None), info_tags(|_| {})]);
+    // Genre is mixed (one has Pop): emptying it clears Pop on one song.
+    assert_eq!(o.get(InfoField::Genre), None);
+    assert!(!info_clears(true, &o, &e), "not ticked");
+    e.tick(InfoField::Genre, true);
+    assert!(info_clears(true, &o, &e));
+    // Empty on both songs: ticking and emptying clears nothing.
+    let (o, mut e) = opened_for(&[
+        info_tags(|t| t.composer = None),
+        info_tags(|t| t.composer = None),
+    ]);
+    e.tick(InfoField::Composer, true);
+    assert!(!info_clears(true, &o, &e));
+    // Title and track are not in the form for several songs.
+    let (o, mut e) = opened_for(&[info_tags(|_| {}), info_tags(|_| {})]);
+    e.set(InfoField::Title, "");
+    e.tick(InfoField::Title, true);
+    e.set(InfoField::Track, "");
+    e.tick(InfoField::Track, true);
+    assert!(!info_clears(true, &o, &e));
+}
+
+fn tracks_with(f: impl Fn(&mut Tags, usize), n: usize) -> Vec<TrackRow> {
+    (0..n)
+        .map(|i| track(i as i64 + 1, |t| f(&mut t.tags, i)))
+        .collect()
+}
+
+#[test]
+fn completions_are_distinct_sorted_and_left_out_for_missing_tracks() {
+    let artists = [
+        Some("the Beatles"),
+        Some("björk"),
+        Some("Abba"),
+        Some("Abba"),
+        Some("Zed Missing"),
+        Some("ÉMILE"),
+        None,
+    ];
+    let mut tracks = tracks_with(
+        |t, i| t.artist = artists[i].map(String::from),
+        artists.len(),
+    );
+    tracks[4].missing_since = Some(1_700_000_000);
+    tracks[0].tags.genre = Some("Rock".into());
+    tracks[1].tags.genre = Some("Pop".into());
+    tracks[2].tags.genre = Some("Rock".into());
+    tracks[5].tags.album = Some("Étude".into());
+    tracks[4].tags.album = Some("Only On The Missing".into());
+    let c = Completions::new(&tracks);
+    assert_eq!(c.artist, ["Abba", "björk", "ÉMILE", "the Beatles"]);
+    assert_eq!(c.genre, ["Pop", "Rock"]);
+    assert_eq!(c.album, ["Étude"]);
+    assert!(c.composer.is_empty() && c.album_artist.is_empty());
+    // `of` hands out the list of the field, and nothing for the others.
+    assert_eq!(c.of(InfoField::Artist), c.artist);
+    assert_eq!(c.of(InfoField::Genre), c.genre);
+    assert_eq!(c.of(InfoField::Album), c.album);
+    assert!(c.of(InfoField::Title).is_empty());
+    assert!(c.of(InfoField::Year).is_empty());
+}
+
+#[test]
+fn completions_keep_spellings_that_differ_only_in_case() {
+    let artists = ["Abba", "ABBA", "Abba"];
+    let tracks = tracks_with(|t, i| t.artist = Some(artists[i].into()), artists.len());
+    let c = Completions::new(&tracks);
+    assert_eq!(c.artist.len(), 2, "{:?}", c.artist);
+    assert!(c.artist.contains(&"Abba".to_string()) && c.artist.contains(&"ABBA".to_string()));
+}
+
+fn pool() -> Vec<String> {
+    ["Beatles", "Beach Boys", "Björk", "bj", "Blur", "The Wall"]
+        .map(String::from)
+        .to_vec()
+}
+
+#[test]
+fn suggestions_start_with_what_was_typed_ignoring_case_and_accents() {
+    assert_eq!(suggestions(&pool(), "be", 10), ["Beatles", "Beach Boys"]);
+    assert_eq!(suggestions(&pool(), "BE", 10), ["Beatles", "Beach Boys"]);
+    assert_eq!(suggestions(&pool(), "bjo", 10), ["Björk"]);
+    assert_eq!(suggestions(&pool(), "Bjö", 10), ["Björk"]);
+    assert_eq!(suggestions(&pool(), "bl", 10), ["Blur"]);
+    // Starts with, not contains.
+    assert!(suggestions(&pool(), "eat", 10).is_empty());
+    assert!(suggestions(&pool(), "zzz", 10).is_empty());
+    // A leading "the" is kept.
+    assert_eq!(suggestions(&pool(), "the w", 10), ["The Wall"]);
+    assert!(suggestions(&pool(), "wall", 10).is_empty());
+}
+
+#[test]
+fn suggestions_leave_out_the_typed_value_itself_and_stop_at_the_maximum() {
+    // Exactly what was typed is not suggested; the same word in another
+    // case is, as it offers the spelling in the library.
+    assert_eq!(suggestions(&pool(), "bj", 10), ["Björk"]);
+    assert_eq!(suggestions(&pool(), " bj ", 10), ["Björk"], "trimmed");
+    assert_eq!(suggestions(&pool(), "BJ", 10), ["Björk", "bj"]);
+    assert_eq!(suggestions(&pool(), "Beatles", 10), Vec::<String>::new());
+    assert_eq!(suggestions(&pool(), "be", 1), ["Beatles"]);
+    assert_eq!(
+        suggestions(&pool(), "b", 3),
+        ["Beatles", "Beach Boys", "Björk"]
+    );
+    assert!(suggestions(&pool(), "b", 0).is_empty());
+}
+
+#[test]
+fn suggestions_are_empty_for_an_empty_field() {
+    assert!(suggestions(&pool(), "", 10).is_empty());
+    assert!(suggestions(&pool(), "   ", 10).is_empty());
+    assert!(suggestions(&pool(), "...", 10).is_empty());
+    assert!(suggestions(&[], "be", 10).is_empty());
+}
+
+#[test]
+fn facts_name_the_kind_and_the_known_properties() {
+    let full = track(1, |t| {
+        t.info = AudioInfo {
+            kind: FileKind::Aac,
+            duration_ms: Some(215_000),
+            bitrate: Some(256),
+            samplerate: Some(44_100),
+        };
+        t.size = 6_900_000;
+    });
+    let text = facts(&full);
+    assert!(text.starts_with("AAC"), "{text}");
+    for part in ["3:35", "256", "44.1 kHz", "6.9 MB"] {
+        assert!(text.contains(part), "{part} in {text}");
+    }
+    let bare = track(2, |t| {
+        t.info = AudioInfo {
+            kind: FileKind::Wav,
+            duration_ms: None,
+            bitrate: None,
+            samplerate: None,
+        };
+        t.size = 1_000_000;
+    });
+    let text = facts(&bare);
+    assert!(text.starts_with("WAV"), "{text}");
+    assert!(!text.contains("kbit") && !text.contains("kHz"), "{text}");
+    assert!(text.contains("1.0 MB"), "{text}");
+}

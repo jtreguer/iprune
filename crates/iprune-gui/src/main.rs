@@ -7,10 +7,12 @@ mod adopt_job;
 #[cfg(test)]
 mod close_tests;
 mod data;
+mod info_dialog;
 mod scan_job;
 mod selection_dialog;
 mod style;
 mod sync_job;
+mod tag_job;
 mod view_model;
 
 use std::cell::{Cell, OnceCell, RefCell};
@@ -67,6 +69,16 @@ enum Pick {
     Show(i64),
 }
 
+/// What an open Get Info form edits.
+struct InfoState {
+    /// The tracks it writes to.
+    ids: RefCell<Vec<i64>>,
+    /// The row shown, for one song, in the grid's order.
+    at: Cell<Option<u32>>,
+    /// The running write's Stop flag.
+    stop: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+}
+
 /// Rows being dragged.
 #[derive(Debug, Clone)]
 struct Drag {
@@ -112,6 +124,8 @@ struct Ui {
     /// menu was opened on, `menu_track`.
     show_in_action: RefCell<Option<gio::SimpleAction>>,
     menu_track: Cell<Option<i64>>,
+    /// Get Info, enabled when a row the menu acts on has a file.
+    info_action: RefCell<Option<gio::SimpleAction>>,
     /// The sidebar's iPod panel and the actions on the iPod.
     device_box: gtk::Box,
     scan_action: RefCell<Option<gio::SimpleAction>>,
@@ -705,6 +719,9 @@ impl Ui {
         if let Some(a) = &*self.show_in_action.borrow() {
             a.set_enabled(track.is_some_and(|id| !self.playlists_holding(id).is_empty()));
         }
+        if let Some(a) = &*self.info_action.borrow() {
+            a.set_enabled(!self.info_ids().is_empty());
+        }
         let at = cell
             .compute_point(&self.view, &gtk::graphene::Point::new(x as f32, y as f32))
             .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
@@ -1160,6 +1177,340 @@ impl Ui {
             }),
             Err(e) => self.show_error(&format!("Nothing was added to {target}"), &e),
         }
+    }
+
+    /// The library tracks of the selected rows, each once, in view order.
+    fn info_ids(&self) -> Vec<i64> {
+        let mut ids = Vec::new();
+        for id in self.selected_rows().iter().filter_map(|r| r.track_id) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// Where the row of track `id`, at playlist `position`, is in the
+    /// grid as sorted and filtered.
+    fn view_position(&self, id: i64, position: Option<usize>) -> Option<u32> {
+        (0..self.selection.n_items()).find(|&i| {
+            self.selection.item(i).is_some_and(|o| {
+                let r = row_of(&o);
+                r.track_id == Some(id) && r.position == position
+            })
+        })
+    }
+
+    /// The nearest row from view position `from`, one way, that has a file:
+    /// its track and playlist position.
+    fn neighbour(&self, from: u32, up: bool) -> Option<(i64, Option<usize>)> {
+        let mut i = from;
+        loop {
+            i = if up { i.checked_sub(1)? } else { i + 1 };
+            let obj = self.selection.item(i)?;
+            let r = row_of(&obj);
+            if let Some(id) = r.track_id {
+                return Some((id, r.position));
+            }
+        }
+    }
+
+    /// Shows the rows of the tracks `ids` as the index has them now: the
+    /// rows are replaced in one go, so the grid sorts once however many
+    /// were edited, and the selection and the scroll are kept.
+    fn update_rows(&self, ids: &HashSet<i64>) {
+        if ids.is_empty() {
+            return;
+        }
+        let tracks = match self.data.tracks(ids) {
+            Ok(t) => t,
+            Err(e) => return self.status.set_text(&format!("{e:#}")),
+        };
+        let selected: HashSet<(Option<i64>, Option<usize>)> = self
+            .selected_rows()
+            .iter()
+            .map(|r| (r.track_id, r.position))
+            .collect();
+        let scrolled = self.view.vadjustment().map(|a| a.value());
+        let n = self.store.n_items();
+        let objects: Vec<glib::Object> = (0..n)
+            .filter_map(|i| self.store.item(i))
+            .map(|obj| {
+                let fresh = {
+                    let r = row_of(&obj);
+                    r.track_id
+                        .and_then(|id| tracks.get(&id))
+                        .map(|t| self.data.row(t, r.position))
+                };
+                match fresh {
+                    Some(row) => glib::BoxedAnyObject::new(row).upcast(),
+                    None => obj,
+                }
+            })
+            .collect();
+        self.store.splice(0, n, &objects);
+        // Replaced rows come back unselected.
+        let keep = gtk::Bitset::new_empty();
+        for i in 0..self.selection.n_items() {
+            let hit = self.selection.item(i).is_some_and(|o| {
+                let r = row_of(&o);
+                selected.contains(&(r.track_id, r.position))
+            });
+            if hit {
+                keep.add(i);
+            }
+        }
+        self.selection
+            .set_selection(&keep, &gtk::Bitset::new_range(0, self.selection.n_items()));
+        if let (Some(v), Some(a)) = (scrolled, self.view.vadjustment()) {
+            a.set_value(v);
+        }
+        self.update_status();
+    }
+
+    /// Gives the grid the focus, on the first selected row: replacing the
+    /// rows forgets the one that had it, and the grid alone would then
+    /// pass the focus on to the playlist filter.
+    fn focus_grid(&self) {
+        let bits = self.selection.selection();
+        if bits.is_empty() {
+            self.view.grab_focus();
+        } else {
+            self.view
+                .scroll_to(bits.nth(0), None, gtk::ListScrollFlags::FOCUS, None);
+            // That sets the row the grid focuses; this moves the focus there.
+            self.view.grab_focus();
+        }
+    }
+
+    /// Opens Get Info on the selected rows that have a file: their tags, to
+    /// edit as in iTunes.
+    fn get_info(self: &Rc<Self>) {
+        let ids = self.info_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let tracks: anyhow::Result<Vec<_>> = ids.iter().map(|&id| self.data.track(id)).collect();
+        let tracks: Vec<_> = match tracks {
+            Ok(t) => t.into_iter().flatten().collect(),
+            Err(e) => return self.show_error("The songs could not be read", &e),
+        };
+        if tracks.is_empty() {
+            return;
+        }
+        let several = tracks.len() > 1;
+        let completions = self.data.completions().unwrap_or_default();
+        let dialog = info_dialog::InfoDialog::new(&self.window, several, completions);
+        dialog.fill(&tracks);
+        let state = Rc::new(InfoState {
+            ids: RefCell::new(tracks.iter().map(|t| t.id).collect()),
+            // The row shown, for Previous and Next.
+            at: Cell::new(
+                self.selected_rows()
+                    .iter()
+                    .find(|r| r.track_id == Some(tracks[0].id))
+                    .and_then(|r| self.view_position(tracks[0].id, r.position)),
+            ),
+            stop: RefCell::new(None),
+        });
+        self.update_neighbours(&dialog, &state);
+        {
+            let (ui, d, st) = (Rc::downgrade(self), Rc::downgrade(&dialog), state.clone());
+            dialog.ok.connect_clicked(move |_| {
+                let (Some(ui), Some(d)) = (ui.upgrade(), d.upgrade()) else {
+                    return;
+                };
+                ui.info_done(&d, &st, None);
+            });
+        }
+        for (button, up) in [(&dialog.previous, true), (&dialog.next, false)] {
+            let (ui, d, st) = (Rc::downgrade(self), Rc::downgrade(&dialog), state.clone());
+            button.connect_clicked(move |_| {
+                let (Some(ui), Some(d)) = (ui.upgrade(), d.upgrade()) else {
+                    return;
+                };
+                let target = st.at.get().and_then(|at| ui.neighbour(at, up));
+                if target.is_some() {
+                    ui.info_done(&d, &st, target);
+                }
+            });
+        }
+        {
+            let d = Rc::downgrade(&dialog);
+            dialog.cancel.connect_clicked(move |_| {
+                if let Some(d) = d.upgrade() {
+                    d.window.close();
+                }
+            });
+        }
+        {
+            let st = state.clone();
+            dialog.stop.connect_clicked(move |b| {
+                if let Some(stop) = &*st.stop.borrow() {
+                    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    b.set_sensitive(false);
+                }
+            });
+        }
+        {
+            // The dialog lives until its window closes: every way of
+            // closing it asks first (the dialog's own handler, connected
+            // earlier, refuses while it writes). The grid then has the
+            // focus back, once the window is active again, which resets
+            // its focus when the widget that had it is gone.
+            let keep = RefCell::new(Some(dialog.clone()));
+            let ui = Rc::downgrade(self);
+            dialog.window.connect_close_request(move |_| {
+                keep.borrow_mut().take();
+                let ui = ui.clone();
+                glib::timeout_add_local_once(Duration::from_millis(100), move || {
+                    if let Some(ui) = ui.upgrade() {
+                        ui.focus_grid();
+                    }
+                });
+                glib::Propagation::Proceed
+            });
+        }
+        dialog.window.present();
+    }
+
+    fn update_neighbours(&self, dialog: &info_dialog::InfoDialog, state: &InfoState) {
+        let at = state.at.get();
+        dialog
+            .previous
+            .set_sensitive(at.and_then(|a| self.neighbour(a, true)).is_some());
+        dialog
+            .next
+            .set_sensitive(at.and_then(|a| self.neighbour(a, false)).is_some());
+    }
+
+    /// OK, or Previous and Next with the row to go to: writes what the
+    /// form changed, then closes it or shows that row.
+    fn info_done(
+        self: &Rc<Self>,
+        dialog: &Rc<info_dialog::InfoDialog>,
+        state: &Rc<InfoState>,
+        go_to: Option<(i64, Option<usize>)>,
+    ) {
+        let Ok(changes) = dialog.changes() else {
+            return;
+        };
+        if changes.is_empty() {
+            self.info_next(dialog, state, go_to);
+            return;
+        }
+        // One thing at a time: a scan or a sync reads the files and the index.
+        if self.busy.replace(true) {
+            dialog.say("A scan, sync or adoption is under way; try again once it is done.");
+            return;
+        }
+        self.refresh_device();
+        dialog.set_writing(true);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.stop.replace(Some(stop.clone()));
+        // As during a sync: the window cannot close, and a signal stops
+        // the write between files, the window quitting once it is done.
+        self.writing.set(true);
+        self.cancel.replace(Some(stop.clone()));
+        let (tx, rx) = async_channel::unbounded::<(usize, usize)>();
+        {
+            let d = Rc::downgrade(dialog);
+            glib::spawn_future_local(async move {
+                while let Ok((done, total)) = rx.recv().await {
+                    if let Some(d) = d.upgrade() {
+                        d.show_progress(done, total);
+                    }
+                }
+            });
+        }
+        let ids = state.ids.borrow().clone();
+        let paths = self.data.paths().clone();
+        let (ui, d, st) = (Rc::downgrade(self), Rc::downgrade(dialog), state.clone());
+        glib::spawn_future_local(async move {
+            let asked = ids.len();
+            let result = gio::spawn_blocking(move || {
+                let progress = |done, total| {
+                    let _ = tx.send_blocking((done, total));
+                };
+                tag_job::write(&paths, &ids, &changes, &progress, &stop)
+            })
+            .await;
+            let Some(ui) = ui.upgrade() else { return };
+            ui.busy.set(false);
+            ui.writing.set(false);
+            ui.cancel.replace(None);
+            ui.refresh_device();
+            st.stop.replace(None);
+            let result = result.unwrap_or_else(|_| Err(anyhow::anyhow!("the tag worker crashed")));
+            let Some(d) = d.upgrade() else { return };
+            d.set_writing(false);
+            let report = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    // Files before the error may have been written.
+                    ui.refresh();
+                    d.say(&format!("The edit stopped: {e:#}"));
+                    return;
+                }
+            };
+            let written: HashSet<i64> = report
+                .results
+                .iter()
+                .filter(|r| r.outcome == iprune_core::tag_edit::Outcome::Written)
+                .map(|r| r.track_id)
+                .collect();
+            ui.update_rows(&written);
+            let complete = report.refused().next().is_none() && !report.stopped;
+            match (complete, asked) {
+                (true, _) => {
+                    ui.status.set_text(&match written.len() {
+                        0 => "The tags were already as entered".to_string(),
+                        1 => "Tags written to 1 song".to_string(),
+                        n => format!("Tags written to {n} songs"),
+                    });
+                    ui.info_next(&d, &st, go_to);
+                }
+                // One song stays in the form, with why.
+                (false, 1) => match (&report.index_error, report.refused().next()) {
+                    (Some(e), _) => {
+                        d.say(&format!("Written, but the index could not be updated: {e}"))
+                    }
+                    (None, Some((_, why))) => d.say(&format!("Not written: {why}.")),
+                    (None, None) => d.say("Stopped before the file was written."),
+                },
+                (false, _) => d.show_report(&tag_job::describe(&report, asked)),
+            }
+        });
+    }
+
+    /// After a write that went through: closes the form, or shows the row
+    /// `go_to` in it and selects it in the grid.
+    fn info_next(
+        &self,
+        dialog: &info_dialog::InfoDialog,
+        state: &InfoState,
+        go_to: Option<(i64, Option<usize>)>,
+    ) {
+        let Some((id, position)) = go_to else {
+            dialog.window.close();
+            return;
+        };
+        let track = match self.data.track(id) {
+            Ok(Some(t)) => t,
+            Ok(None) => return,
+            Err(e) => return dialog.say(&format!("{e:#}")),
+        };
+        // The rows may have moved if the grid is sorted by a field edited.
+        let at = self.view_position(id, position);
+        if let Some(i) = at {
+            self.selection.select_item(i, true);
+            self.view
+                .scroll_to(i, None, gtk::ListScrollFlags::NONE, None);
+        }
+        state.at.set(at);
+        *state.ids.borrow_mut() = vec![id];
+        dialog.fill(std::slice::from_ref(&track));
+        self.update_neighbours(dialog, state);
     }
 
     /// Scans the library on a worker thread, as `iprune scan` does, and shows
@@ -1977,6 +2328,7 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     view.set_model(Some(&selection));
     // Opened by each cell's right-click, see `make_column`.
     let grid_menu = gio::Menu::new();
+    grid_menu.append(Some("Get Info"), Some("win.get-info"));
     grid_menu.append(Some("Add to Playlist…"), Some("win.add-to-playlist"));
     grid_menu.append(Some("Show in Playlist…"), Some("win.show-in-playlist"));
     grid_menu.append(Some("Remove from Playlist"), Some("win.remove"));
@@ -2159,6 +2511,7 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         playlist_actions: RefCell::new(Vec::new()),
         show_in_action: RefCell::new(None),
         menu_track: Cell::new(None),
+        info_action: RefCell::new(None),
         device_box: device_box.clone(),
         scan_action: RefCell::new(None),
         sync_action: RefCell::new(None),
@@ -2246,6 +2599,16 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         });
     });
     *ui.show_in_action.borrow_mut() = Some(show_in);
+    // Opened once the grid menu has closed.
+    let info = action(window, "get-info", &ui, |ui| {
+        let weak = Rc::downgrade(ui);
+        glib::idle_add_local_once(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.get_info();
+            }
+        });
+    });
+    *ui.info_action.borrow_mut() = Some(info);
     {
         let weak = Rc::downgrade(&ui);
         picker_list.set_filter_func(move |row| {
@@ -2342,6 +2705,20 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     window_keys.set_scope(gtk::ShortcutScope::Global);
     shortcut(&window_keys, "<Control>n", "win.new-playlist");
     shortcut(&window_keys, "F2", "win.rename-playlist");
+    {
+        // Not through the action, which the menu disables for rows
+        // without a file: Ctrl+I looks at the selection when pressed.
+        let weak = Rc::downgrade(&ui);
+        window_keys.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string("<Control>i"),
+            Some(gtk::CallbackAction::new(move |_, _| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.get_info();
+                }
+                glib::Propagation::Stop
+            })),
+        ));
+    }
     {
         let search = search.clone();
         // Ctrl+F focuses the search, whatever Caps Lock says.

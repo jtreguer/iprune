@@ -38,6 +38,7 @@ iprune/
         config.rs
         store/              SQLite schema and queries
         scan.rs             walk roots, read tags, detect moves
+        tag_edit.rs         write edited tags to library files (Get Info)
         playlist.rs         .m3u8 read and write
         device.rs           find mounted iPods, read identity
         adopt.rs            match iPod tracks to library tracks
@@ -354,6 +355,102 @@ existing mappings.
    entries and the command line go through `path_key`, the NFC form.
 8. Files that cannot be read are reported and left out of the index; if they
    were indexed before, their row is kept as it was.
+
+### 7.1 Tag writes
+
+Module `tag_edit`, used by `iprune tag` and the window's Get Info form. It
+is the only code that writes to files under the library roots.
+
+An edit is a set of tracks and a list of field changes, each a field of
+`tags::Tags` (title, artist, album, album artist, composer, genre, year,
+track number and total, disc number and total, compilation) with a new
+value or none to clear it. Nothing else in a file changes. A field the edit
+does not list is left alone in the file, so a multi-value tag (read joined
+with "/") or a full date stays as it is unless that field is edited. Text
+is trimmed, and an empty text clears the field. Year is 1000 to 9999 (the
+reader takes four-digit years only); track
+and disc numbers and totals are 1 to 999, and a number above its total is
+allowed, as in iTunes. A track listed twice counts once. A field given the
+value the file already has is not written, so `--year 1984` on a file
+dated 1984-05-02 keeps the full date; an edit that changes nothing leaves
+the file alone.
+
+A track is refused, and the others still written, when its file is missing
+(`missing_since`), when the file's size or modification time differ from
+the index (it changed since the last scan; scan first), when its tags could
+not be parsed (`tag_error`: rewriting them could lose what the reader
+skipped), when it is FairPlay protected (`drm`), when the file is read-only
+(the rename would replace it anyway, as it needs only the folder), or when
+its folder is not writable.
+
+Each file is written this way:
+
+1. Read the file and build the new one in memory with iprune's own tag
+   writers (submodules `id3`, `mp4` and `chunks`), which change only the
+   frames or atoms of the edited fields and copy every other byte as it is:
+   pictures, comments, lyrics, sort fields, unknown frames and the audio.
+   lofty is used only to read the result back. On copies of 729 real
+   library files, writing through lofty turned every ID3v2.2 tag (38% of
+   the MP3s) into 2.3, lost the year it wrote into 2.3 tags and the time of
+   day of untouched 2.3 dates, rewrote every AAC file's `stik` atom in a
+   form ffmpeg reads as 0, and dropped an atom it could not parse.
+   - ID3v2 (MP3 at the start of the file, WAV in the `id3 ` chunk, AIFF in
+     the `ID3 ` chunk): the tag keeps its version, 2.2, 2.3 or 2.4, and
+     each edited field's frames are replaced by one new frame where the
+     first of them was (a year replaces `TYER`, `TDAT`, `TIME` and `TDRC`
+     together). New text is UTF-8 in 2.4, Latin-1 or else UTF-16 in 2.2
+     and 2.3. A 2.4 tag written with plain frame sizes keeps them. The tag
+     keeps its size when the frames still fit in its padding, so the audio
+     does not move; otherwise it gets 1 KB of padding more. A tag with
+     header flags (unsynchronisation, extended header, footer, none in the
+     library) is refused. A WAV or AIFF chunk keeps its place; the other
+     chunks and what follows the container keep their bytes. A new chunk
+     goes at the end, after the pad byte an odd last chunk lacked.
+   - MP4: the item atoms in `moov/udta/meta/ilst` (`©nam`, `©ART`,
+     `©alb`, `aART`, `©wrt`, `©gen` with `gnre` removed, `©day`, `trkn`,
+     `disk`, `cpil`). A size change is taken up by the `free` atom iTunes
+     leaves after `ilst` when it has room (1,560 of the 1,652 m4a files);
+     otherwise `ilst`, `meta`, `udta` and `moov` change size, and when the
+     audio follows `moov` its chunk offsets (`stco`, `co64`) move with it.
+     A file without `ilst` is refused, and so is a fragmented file
+     (`moof`, `sidx` or `mfra` at the top), whose own offsets would not
+     move.
+   - A file with no tag to edit (an MP3 or WAV with no ID3v2, a WAV with
+     only RIFF INFO) gets a new ID3v2.3 tag holding every value the index
+     has, since the reader prefers it to the other tags: the next read
+     gives the same values plus the edit. The other tags stay.
+2. Write the new file to a hidden temporary file in the same folder,
+   `.iprune-XXXXXX.tmp.<ext>`: a scan skips hidden files, and the reader
+   takes the format from the extension before the content, which matters
+   for a file with junk between its tag and its audio. It gets the
+   original's permissions. A temporary file left by a crash stays hidden.
+3. `fsync` it and read it back with `tags::read`. The edited fields must
+   read as set, the other fields as before, and the kind and duration must
+   be unchanged. Otherwise it is deleted and the track reported with the
+   fields that differ (three MP3s with two stacked ID3v2 tags, where the
+   reader takes some fields from the second, are refused this way). The
+   file must also still have the size and modification time of the index.
+4. Rename it over the file and `fsync` the folder. The size and
+   modification time for the index are taken before the rename, which
+   keeps them, so nothing after it can fail: a folder that cannot be
+   synced does not make a written file look refused. The original is
+   never opened for writing, so a crash or a full disk leaves either the old
+   file or the new one, never half of each.
+5. Update the track's row as a scan would for a changed file: same id and
+   path, new size, modification time, hash, tags, `tags_hash` and
+   `tags_version`. Playlists, statistics and device mappings are untouched.
+   If that update fails, the file is reported written, the edit stops
+   there with the error, and the next scan brings the row up to date.
+
+The next plan sees the new `tags_hash` and lists a tag update; the file's
+size changed but not its duration, so it is not copied again (section 11.1).
+A cleared field removes the tag from the file and the iPod keeps its value,
+as for any empty library tag.
+
+Each file is read and written once, so 200 songs of 10 MB mean 2 GB read
+and 2 GB written on the USB disk; progress is per file and Stop takes effect between files. Tag
+writes do not touch the iPod and do not take `ipod.lock`. In the window
+they share the busy flag with Scan, Sync, Adopt and Eject.
 
 ## 8. Playlists
 
@@ -969,6 +1066,9 @@ iprune scan
 iprune adopt [--file <iTunesDB>] [--accept-proposals]
 iprune sync [--plan-only] [--verbose] [--json] [--yes] [--allow-mass-removal]
 iprune playlist list|show|new|rm|rename|add|remove|move ...
+iprune tag PATH... [--title T] [--artist A] [--album-artist A] [--album A]
+           [--composer C] [--genre G] [--year N] [--track N] [--track-total N]
+           [--disc N] [--disc-total N] [--compilation yes|no]
 iprune scope [all | only PLAYLIST... | except PLAYLIST... | default] [--guid GUID]
 iprune device info
 iprune backups
@@ -983,6 +1083,14 @@ iprune                    (no arguments: prints help; the window is iprune-gui)
 the one `--guid` names, with the number of tracks and bytes it selects
 and, when connected, the iPod's size. `default` makes it follow `[sync]`
 again. A scope that `prepare` would refuse is not saved.
+
+`tag` with no field option prints the twelve fields of each file. With
+options it writes them through `tag_edit` (section 7.1); an empty value,
+`--artist ""`, clears the field. Paths are looked up by `path_key` and must
+be indexed tracks. Each file gets one line, written or refused with the
+reason, and the exit code is 1 when any was refused. `--title` or
+`--track` with more than one path is a usage error, as the window offers
+neither for several songs.
 
 `init --force` changes an existing config: the library folders and the
 playlists folder given replace the old ones, `--path-style` when given, and
@@ -1040,6 +1148,51 @@ libadwaita's widgets.
   row has no file. Picking one empties the grid's search, selects the
   playlist in the sidebar, which shows it, and selects every entry of the
   track there, scrolled to the first (`positions_of_track`).
+- **Get Info.** The first item of the grid's menu, and Ctrl+I, open a
+  `gtk::Window` (modal, transient for the main one) on the selected rows.
+  Rows without a library file (unresolved entries, missing tracks) are
+  left out and a track selected twice counts once; the item is disabled
+  when nothing is left. A `gtk::Grid` lays out the fields as in design
+  section 8. For one track the title is the song's name, the fields hold
+  its tags (an empty title shows the file name as placeholder), and the
+  path and audio facts sit read-only below. For several the title is
+  "Multiple Item Information (N songs)", Name and track number are
+  hidden, and each field has a `gtk::CheckButton`: a value every track
+  shares is shown, others are empty with "Mixed" as placeholder, editing a
+  field ticks its box, and the compilation box is inconsistent when
+  mixed. Artist, Album Artist, Album, Composer and Genre open a list of
+  the index's distinct values under the field as you type (starting with
+  the text, case, accents and punctuation ignored, what is typed left
+  out), up to eight; the focus stays in the field, Up and Down pick one,
+  Enter takes it (a key controller in the capture phase, ahead of the
+  entry's text, which would press OK), Escape closes the list. Year and
+  the numbers take digits only: anything else, or a value out of range,
+  in a field to be written disables OK and the line under the form says
+  why. A value out of range that a song already holds, and is not edited,
+  keeps nothing from being written. When a field
+  that had a value is cleared, a line under the form reads "Cleared fields
+  stay as they are on the iPod." A track `tag_edit` would refuse
+  (FairPlay, unreadable tags) opens read-only with the reason; among
+  several, the reason is listed and the others are edited. OK sends only
+  the changes: in single mode the fields that differ from what the form
+  opened with, in multiple mode the ticked ones. A worker (`tag_job`, no
+  GTK) with its own connection to the index runs `tag_edit` and reports
+  each file; with several, the form shows a progress bar and Stop, and
+  cannot close while it writes. When it is done the edited rows are
+  replaced in one go (one splice, so the grid sorts once whatever the
+  number), keeping the selection and scroll, and for several
+  songs refused files are listed with their reasons in place of the form.
+  Previous and Next (one track only) take the row above or below in the
+  grid as sorted and filtered, write the current changes, then show that
+  row and select it, wherever an edit moved the rows; a refused write
+  keeps the form on that song with the reason. Escape cancels and Enter
+  is OK. The grid has the focus back once the form closes. While it
+  writes, the window cannot close either, and a signal stops the write
+  between files, as during a sync. A write waits
+  for nothing: when Scan, Sync, Adopt or Eject is running, OK says so and
+  writes nothing.
+  What the form shows and sends (shared and mixed values, ticks, ranges)
+  is computed in `view_model` and tested there.
 - **Drag and drop.** Rows carry library track ids (`gdk::ContentProvider`
   with an application-specific type). A drop on a sidebar playlist calls
   `playlists::add`; a drop inside a playlist grid calls `add` with the drop
@@ -1157,7 +1310,8 @@ the running one's window to the front.
 
 | Level | What | How |
 |---|---|---|
-| Unit | planner, playlist parsing, adoption scoring, tag diffing | pure functions, table-driven tests |
+| Unit | planner, playlist parsing, adoption scoring, tag diffing, Get Info values and changes | pure functions, table-driven tests |
+| Integration | tag writes | per format: MP3 with ID3v2.2, 2.3 and 2.4, AAC and ALAC m4a, WAV with ID3v2, with only RIFF INFO and with no tag, AIFF; a picture, a comment and an unknown frame keep their bytes; the audio stream is unchanged (`ffmpeg -map 0:a -c copy -f md5`); edited fields read back, others unchanged; the row keeps its id; a failed read-back leaves the original file and no copy; a file changed since the scan is refused. Then a sync on a fake iPod updates the tags without copying, and a second plan is empty. Always on temp copies of fixtures |
 | Bindings | struct layouts, strings, lists | Rust snapshot vs C `snapshot` on the backup `iTunesDB` |
 | Integration | full sync on a fake iPod | `itdb_init_ipod` into a temp dir with a `SysInfo` containing a `FirewireGuid`, small audio fixtures generated with ffmpeg. With no model in `SysInfo`, libgpod writes an unsigned database, as on the Video; tests of signing and artwork add a Classic model number |
 | Regression | playlist doubling | sync the same plan twice; the second plan must be empty and the snapshot unchanged |
@@ -1184,6 +1338,7 @@ mountpoint set too; the installed binaries are not affected.
 | M5 | track copy, remove, tag update, statistics pull, `doctor` | yes |
 | M6 | desktop UI (GTK4) | yes |
 | M7 | desktop entry, notifications, packaging | yes |
+| M8 | tag editing: `tag_edit`, `iprune tag`, the Get Info form | no (writes library files) |
 
 M4 comes before M5 on purpose. Playlist writes are the operation that failed
 with Rhythmbox, the tracks are already on the iPod, and a playlist-only sync
@@ -1199,4 +1354,5 @@ can be checked against the backup with the existing C tools.
 | libgpod does not understand some iTunes smart playlist rules ("Unknown action type 1" on write) and may rewrite them | checked in M4 on a copy of the real `iTunesDB` (2026-10-13): parsed and written back unchanged, the 12 smart playlists' header and rule records (`mhod` 50 and 51) are byte-identical and the snapshot is identical. The only bytes that change are the album and artist list ids (`mhia`, `mhii`), regenerated on every write, and a few `mhbd` header fields. Parse 33 ms, write 255 ms |
 | Artwork database corruption | iprune adds and edits no artwork, but libgpod rewrites `ArtworkDB` and the `.ithmb` files on every write; both are backed up together and restored together, and a write is refused when the artwork could not be read |
 | Losing play counts | pulled and committed before any write, exported to CSV |
+| A tag write damages a library file or drops frames | iprune's own writers change only the edited frames or atoms and copy every other byte; the new file is read back before it replaces the original; tests compare every other frame and the audio stream, and a trial on copies of 729 real files found no other change (section 7.1) |
 | FairPlay files (one in the library, "Bailemos") may not play on an iPod that is not authorised for that Apple account | the planner skips unmapped ones and leaves mapped ones in place; M5 decides whether copying them is worth offering |

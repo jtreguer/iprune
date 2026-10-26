@@ -2,7 +2,8 @@
 
 iprune is a Linux tool (GTK4 window and CLI) that manages `.m3u8` playlists
 for a local music library and syncs tracks and playlists one way, library to
-device, to an iPod Classic through libgpod. It does not play music or edit tags.
+device, to an iPod Classic through libgpod. It does not play music. It
+edits the tags synced to the iPod, in the files themselves (Get Info).
 
 Read `docs/design.md` (what and why) and `docs/technical.md` (how) before
 changing behaviour. They are the spec. If code and docs disagree, ask which one
@@ -16,8 +17,9 @@ planner and `sync --plan-only`; playlist sync with statistics pull, backups,
 checks, verification, `backups` and `restore`; track copy, removal and
 retagging with checkpoints, `doctor`; the window: library and playlist
 grid, playlist editing, sync, adoption review, eject; desktop entry,
-notifications, `packaging/install.sh`). All milestones are done. Work
-followed the milestones in `docs/technical.md` section 17:
+notifications, `packaging/install.sh`). M8, tag editing (`docs/technical.md`
+section 7.1: `tag_edit`, `iprune tag`, the Get Info form), is done too.
+Work followed the milestones in `docs/technical.md` section 17:
 
 | # | Deliverable | Writes to iPod |
 |---|---|---|
@@ -29,6 +31,7 @@ followed the milestones in `docs/technical.md` section 17:
 | M5 | track copy, remove, tag update, stats pull, `doctor` | yes |
 | M6 | desktop UI (GTK4, iTunes-style grid) | yes |
 | M7 | desktop entry, notifications, packaging | yes |
+| M8 | tag editing: `tag_edit`, `iprune tag`, Get Info form | no (library files) |
 
 Do not start work that writes to an iPod before the earlier milestones are done
 and tested.
@@ -49,6 +52,9 @@ and tested.
   playlist of their own, are exports of it and are not synced.
 - The interface is a GTK4 desktop window with an iTunes-style grid
   (sidebar, sortable columns, drag and drop), not a terminal UI.
+- Tag editing (added 2026-10-26) covers only the twelve fields synced to the
+  iPod, for one song or several, as in iTunes' Get Info. No ratings, no
+  artwork, no renaming files after an edit.
 
 ## Stack
 
@@ -70,12 +76,13 @@ crates/iprune-core/  config, store, scan, playlist (.m3u8 format), playlists (op
                      sync (planner input and plan text), transfer (track work from
                      the plan), exec (apply, restore), verify (checks around a
                      write), stats, backup, doctor, notify (notify-send
-                     after a sync)
+                     after a sync), tag_edit (Get Info writes: id3, mp4,
+                     chunks)
 crates/iprune/       binary `iprune`: CLI
 crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6); view_model
-                     (rows, columns, sort, search) is plain and tested, data loads, scan_job,
-                     sync_job and adopt_job are the workers (no GTK, tested), main and adopt_dialog
-                     are GTK
+                     (rows, columns, sort, search, Get Info values) is plain and tested, data
+                     loads, scan_job, sync_job, adopt_job and tag_job are the workers (no GTK,
+                     tested), main, adopt_dialog and info_dialog are GTK
 crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c
 packaging/           iprune.desktop and install.sh (cargo install and the desktop entry)
 ```
@@ -136,6 +143,13 @@ must pass at the end. Mention in the commit message that both steps ran.
   pre-write checks, then re-parse and compare the snapshot after writing. Any
   difference stops the sync and exits with code 3.
 - An empty library tag never overwrites a non-empty iPod value.
+- Tag writes (`tag_edit` only) are built by iprune's own ID3v2, MP4 and
+  RIFF/AIFF writers, which change only the edited frames or atoms and copy
+  every other byte (lofty only reads; its writer converts and drops data).
+  The new file goes to a hidden temp file in the same folder, is read back
+  and checked, then renamed over the original. Files that changed since the
+  scan, have unreadable tags or are FairPlay protected are refused. Tests
+  write only to temp copies of fixtures.
 - `.m3u8` writes go to a temp file in the same folder, `fsync`, then rename.
   Unresolved entries are kept verbatim.
 - Paths are stored exactly as on disk and looked up by their NFC form

@@ -8,7 +8,7 @@ use iprune_core::adopt::normalize;
 use iprune_core::playlists::Item;
 use iprune_core::stats::TrackStats;
 use iprune_core::store::TrackRow;
-use iprune_core::tags::FileKind;
+use iprune_core::tags::{FileKind, Tags};
 
 /// One line of the grid: a library track, or a playlist entry that matches
 /// no file.
@@ -716,4 +716,344 @@ pub fn nudge_before(positions: &[usize], len: usize, up: bool) -> Nudge {
         false if last < len => Nudge::Before(last + 2),
         _ => Nudge::Nothing,
     }
+}
+
+/// A text or number field of the Get Info form, in the order of the form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InfoField {
+    Title,
+    Artist,
+    AlbumArtist,
+    Album,
+    Composer,
+    Genre,
+    Year,
+    Track,
+    TrackTotal,
+    Disc,
+    DiscTotal,
+}
+
+impl InfoField {
+    pub const ALL: [InfoField; 11] = [
+        InfoField::Title,
+        InfoField::Artist,
+        InfoField::AlbumArtist,
+        InfoField::Album,
+        InfoField::Composer,
+        InfoField::Genre,
+        InfoField::Year,
+        InfoField::Track,
+        InfoField::TrackTotal,
+        InfoField::Disc,
+        InfoField::DiscTotal,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            InfoField::Title => "Name",
+            InfoField::Artist => "Artist",
+            InfoField::AlbumArtist => "Album Artist",
+            InfoField::Album => "Album",
+            InfoField::Composer => "Composer",
+            InfoField::Genre => "Genre",
+            InfoField::Year => "Year",
+            InfoField::Track => "Track",
+            InfoField::TrackTotal => "Track total",
+            InfoField::Disc => "Disc",
+            InfoField::DiscTotal => "Disc total",
+        }
+    }
+
+    pub fn numeric(self) -> bool {
+        matches!(
+            self,
+            InfoField::Year
+                | InfoField::Track
+                | InfoField::TrackTotal
+                | InfoField::Disc
+                | InfoField::DiscTotal
+        )
+    }
+
+    /// Whether the form shows it for several songs: one name or one track
+    /// number for all of them makes no sense.
+    pub fn for_several(self) -> bool {
+        !matches!(self, InfoField::Title | InfoField::Track)
+    }
+
+    /// Whether it suggests the values already in the library.
+    pub fn completes(self) -> bool {
+        matches!(
+            self,
+            InfoField::Artist
+                | InfoField::AlbumArtist
+                | InfoField::Album
+                | InfoField::Composer
+                | InfoField::Genre
+        )
+    }
+
+    fn index(self) -> usize {
+        InfoField::ALL
+            .iter()
+            .position(|&f| f == self)
+            .expect("in ALL")
+    }
+
+    /// The field's value in `t`, as the form shows it.
+    pub fn text(self, t: &Tags) -> String {
+        let s = |v: &Option<String>| v.clone().unwrap_or_default();
+        let n = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_default();
+        match self {
+            InfoField::Title => s(&t.title),
+            InfoField::Artist => s(&t.artist),
+            InfoField::AlbumArtist => s(&t.album_artist),
+            InfoField::Album => s(&t.album),
+            InfoField::Composer => s(&t.composer),
+            InfoField::Genre => s(&t.genre),
+            InfoField::Year => n(t.year),
+            InfoField::Track => n(t.track_no),
+            InfoField::TrackTotal => n(t.track_total),
+            InfoField::Disc => n(t.disc_no),
+            InfoField::DiscTotal => n(t.disc_total),
+        }
+    }
+}
+
+/// What the form opens with for the songs edited: each field's value when
+/// every song has the same, `None` when they differ ("Mixed").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Opened {
+    pub text: [Option<String>; 11],
+    pub compilation: Option<bool>,
+}
+
+impl Opened {
+    pub fn new(tags: &[&Tags]) -> Opened {
+        let shared = |f: &dyn Fn(&Tags) -> String| {
+            let mut values = tags.iter().map(|t| f(t));
+            let first = values.next().unwrap_or_default();
+            values.all(|v| v == first).then_some(first)
+        };
+        Opened {
+            text: InfoField::ALL.map(|field| shared(&|t| field.text(t))),
+            compilation: {
+                let mut values = tags.iter().map(|t| t.compilation);
+                let first = values.next().unwrap_or(false);
+                values.all(|v| v == first).then_some(first)
+            },
+        }
+    }
+
+    pub fn get(&self, f: InfoField) -> Option<&str> {
+        self.text[f.index()].as_deref()
+    }
+}
+
+/// What the form holds when OK is pressed. `ticked` matters only for
+/// several songs, where only ticked fields are written.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Entered {
+    pub text: [String; 11],
+    pub ticked: [bool; 11],
+    /// `None` while the compilation box still shows "mixed".
+    pub compilation: Option<bool>,
+    pub compilation_ticked: bool,
+}
+
+impl Entered {
+    /// The form as it opens: what `opened` shows, nothing ticked.
+    pub fn new(opened: &Opened) -> Entered {
+        Entered {
+            text: opened.text.clone().map(Option::unwrap_or_default),
+            ticked: [false; 11],
+            compilation: opened.compilation,
+            compilation_ticked: false,
+        }
+    }
+
+    pub fn get(&self, f: InfoField) -> &str {
+        &self.text[f.index()]
+    }
+
+    pub fn set(&mut self, f: InfoField, text: &str) {
+        self.text[f.index()] = text.to_owned();
+    }
+
+    pub fn ticked(&self, f: InfoField) -> bool {
+        self.ticked[f.index()]
+    }
+
+    pub fn tick(&mut self, f: InfoField, on: bool) {
+        self.ticked[f.index()] = on;
+    }
+}
+
+/// A number field's value: empty clears it. Digits only, in range.
+fn number_field(f: InfoField, text: &str) -> Result<Option<u32>, String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let (min, max) = match f {
+        InfoField::Year => (
+            iprune_core::tag_edit::MIN_YEAR,
+            iprune_core::tag_edit::MAX_YEAR,
+        ),
+        _ => (1, iprune_core::tag_edit::MAX_NUMBER),
+    };
+    match t.parse::<u32>() {
+        Ok(n) if t.bytes().all(|b| b.is_ascii_digit()) && (min..=max).contains(&n) => Ok(Some(n)),
+        _ => Err(format!("{} takes a number from {min} to {max}", f.label())),
+    }
+}
+
+/// The edit OK sends: for one song, the fields that differ from what the
+/// form opened with; for several, the ticked ones. An error names the
+/// first field whose value cannot be written, and OK stays disabled.
+pub fn info_changes(
+    several: bool,
+    opened: &Opened,
+    entered: &Entered,
+) -> Result<iprune_core::tag_edit::Changes, String> {
+    let mut c = iprune_core::tag_edit::Changes::default();
+    for f in InfoField::ALL {
+        if several && !f.for_several() {
+            continue;
+        }
+        let text = entered.get(f);
+        let wanted = if several {
+            entered.ticked(f)
+        } else {
+            opened.get(f) != Some(text)
+        };
+        if !wanted {
+            continue;
+        }
+        if f.numeric() {
+            // Only a value to write is checked: a song may hold one out of
+            // range, which must not keep its other fields from being edited.
+            let n = number_field(f, text)?;
+            let slot = match f {
+                InfoField::Year => &mut c.year,
+                InfoField::Track => &mut c.track_no,
+                InfoField::TrackTotal => &mut c.track_total,
+                InfoField::Disc => &mut c.disc_no,
+                _ => &mut c.disc_total,
+            };
+            *slot = Some(n);
+            continue;
+        }
+        let v = Some(text.trim().to_owned()).filter(|s| !s.is_empty());
+        let slot = match f {
+            InfoField::Title => &mut c.title,
+            InfoField::Artist => &mut c.artist,
+            InfoField::AlbumArtist => &mut c.album_artist,
+            InfoField::Album => &mut c.album,
+            InfoField::Composer => &mut c.composer,
+            _ => &mut c.genre,
+        };
+        *slot = Some(v);
+    }
+    let compilation_wanted = if several {
+        entered.compilation_ticked
+    } else {
+        entered.compilation != opened.compilation
+    };
+    if compilation_wanted && let Some(on) = entered.compilation {
+        c.compilation = Some(on);
+    }
+    Ok(c)
+}
+
+/// Whether OK would clear a field that has a value in a song: the form
+/// then says the iPod keeps it.
+pub fn info_clears(several: bool, opened: &Opened, entered: &Entered) -> bool {
+    InfoField::ALL.iter().any(|&f| {
+        if several && !f.for_several() {
+            return false;
+        }
+        let emptied = entered.get(f).trim().is_empty();
+        let had = opened.get(f) != Some("");
+        emptied && had && (!several || entered.ticked(f))
+    })
+}
+
+/// The values a completing field suggests, from every track in the library.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Completions {
+    pub artist: Vec<String>,
+    pub album_artist: Vec<String>,
+    pub album: Vec<String>,
+    pub composer: Vec<String>,
+    pub genre: Vec<String>,
+}
+
+impl Completions {
+    /// Each field's distinct values among the present tracks, sorted as
+    /// the grid sorts them.
+    pub fn new(tracks: &[TrackRow]) -> Completions {
+        let pool = |f: &dyn Fn(&Tags) -> &Option<String>| {
+            let mut v: Vec<(String, String)> = tracks
+                .iter()
+                .filter(|t| t.missing_since.is_none())
+                .filter_map(|t| f(&t.tags).clone())
+                .map(|s| (fold_keeping_the(&s), s))
+                .collect();
+            v.sort();
+            v.dedup_by(|a, b| a.1 == b.1);
+            v.into_iter().map(|(_, s)| s).collect()
+        };
+        Completions {
+            artist: pool(&|t| &t.artist),
+            album_artist: pool(&|t| &t.album_artist),
+            album: pool(&|t| &t.album),
+            composer: pool(&|t| &t.composer),
+            genre: pool(&|t| &t.genre),
+        }
+    }
+
+    pub fn of(&self, f: InfoField) -> &[String] {
+        match f {
+            InfoField::Artist => &self.artist,
+            InfoField::AlbumArtist => &self.album_artist,
+            InfoField::Album => &self.album,
+            InfoField::Composer => &self.composer,
+            InfoField::Genre => &self.genre,
+            _ => &[],
+        }
+    }
+}
+
+/// Up to `max` values of `pool` starting with `typed`, ignoring case,
+/// accents and punctuation, but for `typed` itself; none for an empty
+/// field.
+pub fn suggestions(pool: &[String], typed: &str, max: usize) -> Vec<String> {
+    let want = fold_keeping_the(typed);
+    if want.is_empty() {
+        return Vec::new();
+    }
+    pool.iter()
+        .filter(|v| v.as_str() != typed.trim() && fold_keeping_the(v).starts_with(&want))
+        .take(max)
+        .cloned()
+        .collect()
+}
+
+/// The read-only line under the form for one song: kind, time, bit rate,
+/// sample rate and size, those known.
+pub fn facts(t: &TrackRow) -> String {
+    let mut parts = vec![kind_name(t.info.kind).to_string()];
+    if let Some(ms) = t.info.duration_ms {
+        parts.push(duration(ms));
+    }
+    if let Some(b) = t.info.bitrate {
+        parts.push(format!("{b} kbit/s"));
+    }
+    if let Some(r) = t.info.samplerate {
+        parts.push(format!("{} kHz", r as f64 / 1000.0));
+    }
+    parts.push(megabytes(t.size));
+    parts.join(", ")
 }
