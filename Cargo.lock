@@ -986,6 +986,7 @@ dependencies = [
  "serde",
  "tempfile",
  "toml",
+ "unicode-normalization",
 ]
 
 [[package]]

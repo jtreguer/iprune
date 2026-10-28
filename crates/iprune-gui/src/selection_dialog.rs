@@ -9,11 +9,12 @@ use std::rc::Rc;
 
 use gtk::prelude::*;
 use gtk::{gio, glib};
-use iprune_core::adopt::{LibPlaylist, normalize};
+use iprune_core::adopt::LibPlaylist;
 use iprune_core::config::Scope;
 use iprune_core::store::TrackRow;
 use iprune_core::store::devices::DeviceScope;
 use iprune_core::sync;
+use unicode_normalization::UnicodeNormalization;
 
 /// What the dialog needs to show and size a selection.
 pub struct Input {
@@ -69,20 +70,20 @@ pub fn gone(current: &DeviceScope, playlists: &[LibPlaylist]) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaylistRow {
     pub name: String,
-    /// The name folded as the grid's sort keys are: case, accents and a
-    /// leading "The" removed.
-    key: String,
+    /// The name lowercased with its Latin accents removed. Punctuation and
+    /// a leading "The" stay, so the "+" and "-" groups keep together, as
+    /// in the sidebar.
+    key: Vec<char>,
     /// What its present tracks weigh, each counted once, as a selection of
     /// this playlist alone would.
     pub bytes: u64,
 }
 
 impl PlaylistRow {
-    /// By name, ignoring case and accents.
+    /// By name, ignoring case and accents, with numbers in order of value:
+    /// "Synthwave 2" before "Synthwave 10".
     pub fn by_name(&self, other: &PlaylistRow) -> Ordering {
-        self.key
-            .cmp(&other.key)
-            .then_with(|| self.name.cmp(&other.name))
+        natural(&self.key, &other.key).then_with(|| self.name.cmp(&other.name))
     }
 
     /// Smallest first, then by name.
@@ -91,6 +92,53 @@ impl PlaylistRow {
             .cmp(&other.bytes)
             .then_with(|| self.by_name(other))
     }
+}
+
+/// Lowercase, Latin accents (U+0300 to U+036F) removed.
+fn fold(name: &str) -> Vec<char> {
+    name.nfkd()
+        .filter(|c| !('\u{300}'..='\u{36f}').contains(c))
+        .collect::<String>()
+        .nfc()
+        .collect::<String>()
+        .to_lowercase()
+        .chars()
+        .collect()
+}
+
+/// Character by character, except that runs of digits compare by value.
+/// Runs of equal value but different leading zeros compare equal.
+fn natural(a: &[char], b: &[char]) -> Ordering {
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+            let ((x, next_i), (y, next_j)) = (digit_run(a, i), digit_run(b, j));
+            let o = x.len().cmp(&y.len()).then_with(|| x.cmp(y));
+            if o != Ordering::Equal {
+                return o;
+            }
+            (i, j) = (next_i, next_j);
+        } else {
+            let o = a[i].cmp(&b[j]);
+            if o != Ordering::Equal {
+                return o;
+            }
+            (i, j) = (i + 1, j + 1);
+        }
+    }
+    (a.len() - i).cmp(&(b.len() - j))
+}
+
+/// The run of digits starting at `k` without its leading zeros, and where
+/// the run ends.
+fn digit_run(s: &[char], k: usize) -> (&[char], usize) {
+    let end = s[k..]
+        .iter()
+        .position(|c| !c.is_ascii_digit())
+        .map_or(s.len(), |n| k + n);
+    let digits = &s[k..end];
+    let zeros = digits.iter().take_while(|c| **c == '0').count();
+    (&digits[zeros..], end)
 }
 
 /// One row per playlist, in the order given.
@@ -106,7 +154,7 @@ pub fn rows(library: &[TrackRow], playlists: &[LibPlaylist]) -> Vec<PlaylistRow>
             let ids: HashSet<i64> = p.members.iter().flatten().copied().collect();
             PlaylistRow {
                 name: p.name.clone(),
-                key: normalize(Some(&p.name)),
+                key: fold(&p.name),
                 bytes: ids.iter().filter_map(|id| sizes.get(id)).sum(),
             }
         })
