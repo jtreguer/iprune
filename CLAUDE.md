@@ -38,9 +38,10 @@ and tested.
 
 ## Decisions
 
-- Target devices: iPod Classic 7th generation, 160 GB, and iPod Video 5th
-  generation, 80 GB, both FAT32. No HFS+ support, no other models. Each iPod
-  has its own mappings, sync scope and backups.
+- Target devices: iPod Classic 7th generation, 160 GB, iPod Classic 6th
+  generation, 80 GB, and iPod Video 5th generation, 80 GB, all FAT32. No
+  HFS+ support, no other models. Each iPod has its own mappings, sync
+  scope and backups.
 - No integration with Rhythmbox, Strawberry or any player. iprune owns the
   `.m3u8` folder.
 - No cover art work of any kind. Leave existing iPod artwork alone.

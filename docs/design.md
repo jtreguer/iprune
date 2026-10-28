@@ -5,7 +5,7 @@ Status: draft, 2026-10-13
 ## 1. Purpose
 
 iprune is a small Linux tool that manages playlists for a local music library
-and keeps iPods (a Classic and a Video) in sync with that library. It
+and keeps iPods (Classics and a Video) in sync with that library. It
 replaces the parts of iTunes that Linux players either lack or get wrong:
 deliberate, verifiable sync of tracks and playlists to an iPod.
 
@@ -26,6 +26,7 @@ The current setup, as of this document:
 | iTunes export | `/mnt/seagate-1tb/Bibliothèque.xml`, with play counts and dates added |
 | iPod model | iPod Classic 7th generation, 160 GB, FAT32 (Windows formatted) |
 | Second iPod | iPod Video 5th generation (USB product 0x1209), 80 GB with 75 GB usable, FAT32, freshly restored and empty (2026-10-15) |
+| Third iPod | iPod Classic 6th generation (USB product 0x1261, FamilyID 11, firmware 1.1.2), 80 GB, FAT32, freshly restored (2026-10-27) |
 | iPod | 9,669 tracks, 329 regular playlists, 7 smart playlists, 6,191 tracks with play counts |
 | iPod backup | `/mnt/seagate-1tb/iPod-backup-2026-10` |
 
@@ -67,8 +68,8 @@ predictable is worse than no sync tool.**
   the media folder organised. A file keeps its name and folder.
 - Video, podcasts, audiobooks, photos.
 - Smart playlists on the iPod. Existing ones are left untouched.
-- iPods other than the Classic and the Video (5th generation), iPhones, MTP
-  players.
+- iPods other than the Classic (6th and 7th generation) and the Video (5th
+  generation), iPhones, MTP players.
 - Syncing back from the iPod to the library (except play statistics).
 - Automatic sync on plug-in. Sync always starts from a command.
 
@@ -334,8 +335,8 @@ two videos. Transcoding is planned for later (section 12).
 
 On every sync, before anything is written, iprune reads plays and skips since
 the last sync, the current rating and the last-played date for every managed
-track, and adds them to its own totals. With two iPods, the plays and
-skips of both add up. A rating is taken from an iPod only when it changed
+track, and adds them to its own totals. With several iPods, the plays
+and skips of all add up. A rating is taken from an iPod only when it changed
 there since iprune last saw it (a rating seen for the first time counts as
 a change), and the latest play date wins. Nothing is written back, so each
 iPod shows its own counts. These totals are exported to
@@ -403,6 +404,9 @@ Answers to the questions left open in the first draft (2026-10-13):
    supported. On 2026-10-16 an iPod Video 5th generation, 80 GB, also
    FAT32, was added. Each iPod has its own mappings, sync scope, backups and
    adoption. The library does not fit on the Video, so it syncs a selection.
+   On 2026-10-28 an iPod Classic 6th generation, 80 GB, FAT32, was added.
+   Its database is signed like the 160 GB one's, and it too syncs a
+   selection.
 2. Rhythmbox and Strawberry are out of scope. The `.m3u8` folder is the only
    place playlists live, and iprune is the tool that edits them.
 3. No cover art. iprune does not add or edit artwork; what libgpod rewrites

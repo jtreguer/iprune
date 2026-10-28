@@ -65,15 +65,16 @@ it, and afterwards the iPod is read again and compared with the plan.
 
 ## Supported devices
 
-iprune has been used with two iPods, both formatted FAT32 (by Windows
+iprune has been used with three iPods, all formatted FAT32 (by Windows
 iTunes):
 
 - iPod Classic 7th generation, 160 GB
+- iPod Classic 6th generation, 80 GB
 - iPod Video 5th generation (5.5G), 80 GB
 
 Other iPods that libgpod supports may work but have not been tried.
-iprune does not write to HFS+ (Mac-formatted) iPods. iPhones and MTP players are out
-of scope.
+iprune does not write to HFS+ (Mac-formatted) iPods. iPhones and MTP
+players are out of scope.
 
 An iPod freshly restored by iTunes may have an empty
 `iPod_Control/Device/SysInfo` file. libgpod then cannot tell the model,
@@ -84,6 +85,16 @@ Video:
 ```
 ModelNumStr: xA450
 FirewireGuid: 0x000A27XXXXXXXXXX
+```
+
+A restored iPod Classic has an empty `SysInfo` and no `SysInfoExtended`.
+Its database is signed, and libgpod cannot sign it without the device
+information in `SysInfoExtended`, so iprune refuses to write rather than
+leave an iPod that shows no music. libgpod's `ipod-read-sysinfo-extended` reads the device
+information over USB and writes `SysInfoExtended`, which fixes it:
+
+```
+sudo ipod-read-sysinfo-extended /dev/sdX /path/to/mountpoint
 ```
 
 ## Requirements
