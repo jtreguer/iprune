@@ -1258,10 +1258,12 @@ iPod mounted is still the one reviewed and calls `adoption::choose` and
 `adoption::save`; an iPod already adopted is refused, as without `--force`.
 An adopted iPod, connected or not, gets a Selection button: a dialog of
 three choices (the whole library, only the playlists checked, the whole
-library except them), the playlists with a filter, and the number of
-tracks and bytes selected against the iPod's size, updated as boxes are
-checked. Save stores the scope for that iPod as `iprune scope` does; the
-panel shows it in a few words.
+library except them), the playlists with a filter in a grid of two
+columns, Name and Size (what its present tracks weigh, each counted once,
+in MB, in GB from 1 GB), sortable by either and sorted by name at first,
+and the number of tracks and bytes selected against the iPod's size,
+updated as boxes are checked. Save stores the scope for that iPod as
+`iprune scope` does; the panel shows it in a few words.
 Eject runs `device::eject` on a worker: the block device mounted at the
 mountpoint, from mountinfo, is unmounted then powered off with `udisksctl`.
 The Scan button, between the header's menu and Sync, runs `scan::scan` on

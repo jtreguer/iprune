@@ -1,13 +1,15 @@
 //! The dialog that sets what an iPod syncs: the whole library, only the
-//! playlists checked, or all but them, with the size of the selection
-//! against the iPod's.
+//! playlists checked, or all but them, with the size of each playlist and
+//! of the selection against the iPod's.
 
-use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::cell::{Cell, RefCell};
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use gtk::prelude::*;
-use iprune_core::adopt::LibPlaylist;
+use gtk::{gio, glib};
+use iprune_core::adopt::{LibPlaylist, normalize};
 use iprune_core::config::Scope;
 use iprune_core::store::TrackRow;
 use iprune_core::store::devices::DeviceScope;
@@ -63,6 +65,172 @@ pub fn gone(current: &DeviceScope, playlists: &[LibPlaylist]) -> Vec<String> {
         .collect()
 }
 
+/// A playlist as the dialog lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistRow {
+    pub name: String,
+    /// The name folded as the grid's sort keys are: case, accents and a
+    /// leading "The" removed.
+    key: String,
+    /// What its present tracks weigh, each counted once, as a selection of
+    /// this playlist alone would.
+    pub bytes: u64,
+}
+
+impl PlaylistRow {
+    /// By name, ignoring case and accents.
+    pub fn by_name(&self, other: &PlaylistRow) -> Ordering {
+        self.key
+            .cmp(&other.key)
+            .then_with(|| self.name.cmp(&other.name))
+    }
+
+    /// Smallest first, then by name.
+    pub fn by_size(&self, other: &PlaylistRow) -> Ordering {
+        self.bytes
+            .cmp(&other.bytes)
+            .then_with(|| self.by_name(other))
+    }
+}
+
+/// One row per playlist, in the order given.
+pub fn rows(library: &[TrackRow], playlists: &[LibPlaylist]) -> Vec<PlaylistRow> {
+    let sizes: HashMap<i64, u64> = library
+        .iter()
+        .filter(|t| t.missing_since.is_none())
+        .map(|t| (t.id, t.size))
+        .collect();
+    playlists
+        .iter()
+        .map(|p| {
+            let ids: HashSet<i64> = p.members.iter().flatten().copied().collect();
+            PlaylistRow {
+                name: p.name.clone(),
+                key: normalize(Some(&p.name)),
+                bytes: ids.iter().filter_map(|id| sizes.get(id)).sum(),
+            }
+        })
+        .collect()
+}
+
+/// A playlist's size: in MB, in GB from what would round to 1000.0 MB.
+pub fn size_label(bytes: u64) -> String {
+    if bytes >= 999_950_000 {
+        format!("{:.1} GB", bytes as f64 / 1e9)
+    } else {
+        crate::view_model::megabytes(bytes)
+    }
+}
+
+/// The playlist a list item stands for.
+fn row_of<'a>(rows: &'a [PlaylistRow], obj: &glib::Object) -> &'a PlaylistRow {
+    let i = *obj
+        .downcast_ref::<glib::BoxedAnyObject>()
+        .expect("the list holds indexes")
+        .borrow::<usize>();
+    &rows[i]
+}
+
+/// The playlists with their boxes. `changed` runs after a box is checked
+/// or cleared.
+fn name_column(
+    rows: &Rc<Vec<PlaylistRow>>,
+    checked: &Rc<RefCell<BTreeSet<String>>>,
+    changed: Rc<dyn Fn()>,
+) -> gtk::ColumnViewColumn {
+    let factory = gtk::SignalListItemFactory::new();
+    // Set while a box is bound to its row: what binding sets is not a
+    // click. Binds run one at a time, so one flag will do.
+    let binding = Rc::new(Cell::new(false));
+    {
+        let (rows, checked, binding) = (rows.clone(), checked.clone(), binding.clone());
+        factory.connect_setup(move |_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().expect("a list item");
+            let label = gtk::Label::new(None);
+            label.set_xalign(0.0);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            let check = gtk::CheckButton::new();
+            check.set_child(Some(&label));
+            // Records the playlist this box shows now: a recycled box
+            // moves between rows.
+            let weak_item = item.downgrade();
+            let (rows, checked, binding, changed) = (
+                rows.clone(),
+                checked.clone(),
+                binding.clone(),
+                changed.clone(),
+            );
+            check.connect_toggled(move |c| {
+                if binding.get() {
+                    return;
+                }
+                let Some(obj) = weak_item.upgrade().and_then(|it| it.item()) else {
+                    return;
+                };
+                let name = &row_of(&rows, &obj).name;
+                if c.is_active() {
+                    checked.borrow_mut().insert(name.clone());
+                } else {
+                    checked.borrow_mut().remove(name);
+                }
+                changed();
+            });
+            item.set_child(Some(&check));
+        });
+    }
+    let (rows_bind, checked) = (rows.clone(), checked.clone());
+    factory.connect_bind(move |_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().expect("a list item");
+        let check = item
+            .child()
+            .and_downcast::<gtk::CheckButton>()
+            .expect("a check button");
+        let label = check.child().and_downcast::<gtk::Label>().expect("a label");
+        let row = row_of(&rows_bind, &item.item().expect("an item"));
+        label.set_text(&row.name);
+        label.set_tooltip_text(Some(&row.name));
+        binding.set(true);
+        check.set_active(checked.borrow().contains(&row.name));
+        binding.set(false);
+    });
+    let column = gtk::ColumnViewColumn::new(Some("Name"), Some(factory));
+    column.set_resizable(true);
+    column.set_expand(true);
+    let rows = rows.clone();
+    let sorter =
+        gtk::CustomSorter::new(move |a, b| row_of(&rows, a).by_name(row_of(&rows, b)).into());
+    column.set_sorter(Some(&sorter));
+    column
+}
+
+/// Each playlist's size.
+fn size_column(rows: &Rc<Vec<PlaylistRow>>) -> gtk::ColumnViewColumn {
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().expect("a list item");
+        let label = gtk::Label::new(None);
+        label.set_xalign(1.0);
+        item.set_child(Some(&label));
+    });
+    {
+        let rows = rows.clone();
+        factory.connect_bind(move |_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().expect("a list item");
+            let label = item.child().and_downcast::<gtk::Label>().expect("a label");
+            let row = row_of(&rows, &item.item().expect("an item"));
+            label.set_text(&size_label(row.bytes));
+        });
+    }
+    let column = gtk::ColumnViewColumn::new(Some("Size"), Some(factory));
+    column.set_resizable(true);
+    column.set_fixed_width(90);
+    let rows = rows.clone();
+    let sorter =
+        gtk::CustomSorter::new(move |a, b| row_of(&rows, a).by_size(row_of(&rows, b)).into());
+    column.set_sorter(Some(&sorter));
+    column
+}
+
 /// Shows the dialog; `save` gets the selection when the user saves it.
 pub fn show(parent: &gtk::ApplicationWindow, input: Input, save: impl Fn(DeviceScope) + 'static) {
     let dialog = gtk::Window::builder()
@@ -96,45 +264,33 @@ pub fn show(parent: &gtk::ApplicationWindow, input: Input, save: impl Fn(DeviceS
             .cloned()
             .collect(),
     ));
+    let rows = Rc::new(rows(&input.library, &input.playlists));
     let filter = gtk::SearchEntry::new();
     filter.set_placeholder_text(Some("Filter playlists"));
-    let list = gtk::ListBox::new();
-    list.set_selection_mode(gtk::SelectionMode::None);
-    for p in &input.playlists {
-        let check = gtk::CheckButton::with_label(&p.name);
-        check.set_active(checked.borrow().contains(&p.name));
-        check.set_margin_start(6);
-        let row = gtk::ListBoxRow::new();
-        row.set_child(Some(&check));
-        row.set_activatable(false);
-        row.set_widget_name(&p.name);
-        list.append(&row);
-        let (checked, name) = (checked.clone(), p.name.clone());
-        check.connect_toggled(move |c| {
-            if c.is_active() {
-                checked.borrow_mut().insert(name.clone());
-            } else {
-                checked.borrow_mut().remove(&name);
-            }
-        });
-    }
-    {
-        let filter = filter.clone();
-        list.set_filter_func(move |row| {
-            let text = filter.text().to_lowercase();
-            text.is_empty() || row.widget_name().to_lowercase().contains(&text)
-        });
-    }
-    {
-        let list = list.downgrade();
-        filter.connect_search_changed(move |_| {
-            if let Some(list) = list.upgrade() {
-                list.invalidate_filter();
-            }
-        });
-    }
+    let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+    let objects: Vec<glib::Object> = (0..rows.len())
+        .map(|i| glib::BoxedAnyObject::new(i).upcast())
+        .collect();
+    store.extend_from_slice(&objects);
+    let name_filter = {
+        let (rows, filter) = (rows.clone(), filter.downgrade());
+        gtk::CustomFilter::new(move |obj| {
+            let text = filter
+                .upgrade()
+                .map(|f| f.text().to_lowercase())
+                .unwrap_or_default();
+            text.is_empty() || row_of(&rows, obj).name.to_lowercase().contains(&text)
+        })
+    };
+    let filtered = gtk::FilterListModel::new(Some(store), Some(name_filter.clone()));
+    filter.connect_search_changed(move |_| name_filter.changed(gtk::FilterChange::Different));
+    let view = gtk::ColumnView::new(None::<gtk::NoSelection>);
+    view.add_css_class("data-table");
+    view.set_show_column_separators(true);
+    let sorted = gtk::SortListModel::new(Some(filtered), view.sorter());
+    view.set_model(Some(&gtk::NoSelection::new(Some(sorted))));
     let scroll = gtk::ScrolledWindow::builder()
-        .child(&list)
+        .child(&view)
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
@@ -206,23 +362,15 @@ pub fn show(parent: &gtk::ApplicationWindow, input: Input, save: impl Fn(DeviceS
             ok.set_sensitive(can_save);
         }
     };
-    let update = Rc::new(update);
+    let update: Rc<dyn Fn()> = Rc::new(update);
     for radio in [&all, &only, &except] {
         let update = update.clone();
         radio.connect_toggled(move |_| update());
     }
-    let mut child = list.first_child();
-    while let Some(row) = child {
-        if let Some(check) = row
-            .first_child()
-            .and_then(|c| c.downcast::<gtk::CheckButton>().ok())
-        {
-            let update = update.clone();
-            // Runs after the handler that records the playlist.
-            check.connect_toggled(move |_| update());
-        }
-        child = row.next_sibling();
-    }
+    let name = name_column(&rows, &checked, update.clone());
+    view.append_column(&name);
+    view.append_column(&size_column(&rows));
+    view.sort_by_column(Some(&name), gtk::SortType::Ascending);
     update();
 
     {
