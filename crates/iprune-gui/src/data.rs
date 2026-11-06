@@ -1,7 +1,7 @@
 //! Loading what the window shows from the config, the index and the
 //! playlist files. Nothing here writes to the iPod or to a playlist file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -223,6 +223,15 @@ impl Data {
     pub fn selection_inputs(&self) -> Result<(Vec<TrackRow>, Vec<LibPlaylist>)> {
         let conn = self.store.conn();
         Ok((store::all_tracks(conn)?, devices::library_playlists(conn)?))
+    }
+
+    /// The ids of the library playlists the iPod `id` holds, as its
+    /// mappings record them.
+    pub fn playlists_on_ipod(&self, id: i64) -> Result<HashSet<i64>> {
+        Ok(devices::playlist_mappings(self.store.conn(), id)?
+            .into_iter()
+            .map(|m| m.playlist_id)
+            .collect())
     }
 
     /// Sets what the iPod `id` syncs. Refuses a selection that names a

@@ -121,7 +121,7 @@ fn sized(id: i64, size: u64) -> TrackRow {
 }
 
 fn bytes_of(library: &[TrackRow], lists: &[LibPlaylist]) -> Vec<(String, u64)> {
-    rows(library, lists)
+    rows(library, lists, &HashSet::new())
         .into_iter()
         .map(|r| (r.name, r.bytes))
         .collect()
@@ -164,9 +164,12 @@ fn rows_weigh_the_distinct_present_tracks() {
 fn rows_keep_the_given_order_and_handle_no_playlists() {
     let library = [sized(1, 10)];
     let lists = [playlist(2, "Zed", &[1]), playlist(1, "Abe", &[1])];
-    let names: Vec<_> = rows(&library, &lists).into_iter().map(|r| r.name).collect();
+    let names: Vec<_> = rows(&library, &lists, &HashSet::new())
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
     assert_eq!(names, ["Zed", "Abe"]);
-    assert!(rows(&library, &[]).is_empty());
+    assert!(rows(&library, &[], &HashSet::new()).is_empty());
 }
 
 // The row size must be what a selection of that playlist alone sends.
@@ -181,7 +184,7 @@ fn rows_agree_with_the_size_of_a_selection_of_one_playlist() {
         playlist(3, "C", &[3]),
         playlist(4, "D", &[1, 2, 4]),
     ];
-    for (row, list) in rows(&library, &lists).iter().zip(&lists) {
+    for (row, list) in rows(&library, &lists, &HashSet::new()).iter().zip(&lists) {
         let (_, bytes) = scope(Scope::Playlists, &[&list.name]).size(&library, &lists);
         assert_eq!(row.bytes, bytes, "{}", list.name);
     }
@@ -193,7 +196,7 @@ fn names_sorted(names: &[&str], cmp: fn(&PlaylistRow, &PlaylistRow) -> Ordering)
         .enumerate()
         .map(|(i, n)| playlist(i as i64, n, &[]))
         .collect();
-    let mut r = rows(&[], &lists);
+    let mut r = rows(&[], &lists, &HashSet::new());
     r.sort_by(cmp);
     r.into_iter().map(|r| r.name).collect()
 }
@@ -330,6 +333,7 @@ fn by_name_breaks_ties_between_leading_zeros_by_raw_name() {
     let r = rows(
         &[],
         &[playlist(1, "Mix 007", &[]), playlist(2, "Mix 7", &[])],
+        &HashSet::new(),
     );
     assert_eq!(natural(&r[0].key, &r[1].key), Ordering::Equal);
     // A zero run is the number 0, and shorter than any other number.
@@ -410,7 +414,7 @@ fn by_name_is_a_total_order() {
         .enumerate()
         .map(|(i, n)| playlist(i as i64, n, &[]))
         .collect();
-    let r = rows(&[], &lists);
+    let r = rows(&[], &lists, &HashSet::new());
     for a in &r {
         assert_eq!(a.by_name(a), Ordering::Equal, "{}", a.name);
         for b in &r {
@@ -460,7 +464,7 @@ fn by_size_orders_by_bytes_then_name() {
         playlist(5, "Empty", &[]),
         playlist(6, "Both", &[1, 2]),
     ];
-    let mut r = rows(&library, &lists);
+    let mut r = rows(&library, &lists, &HashSet::new());
     r.sort_by(PlaylistRow::by_size);
     let order: Vec<_> = r.iter().map(|r| (r.name.as_str(), r.bytes)).collect();
     assert_eq!(
@@ -516,4 +520,53 @@ fn fold_matches_what_the_name_reads_as() {
     for (name, folded) in cases {
         assert_eq!(fold(name), folded.chars().collect::<Vec<_>>(), "{name}");
     }
+}
+
+fn on(rows: &[PlaylistRow]) -> Vec<(&str, bool)> {
+    rows.iter().map(|r| (r.name.as_str(), r.on_ipod)).collect()
+}
+
+// Prevents marking by name, or marking playlists the iPod does not hold.
+#[test]
+fn rows_mark_the_playlists_whose_id_is_on_the_ipod() {
+    // Ids 1 and 2 share a name, so only the id tells them apart; 9 is no playlist here.
+    let lists = [
+        playlist(1, "Same", &[]),
+        playlist(2, "Same", &[]),
+        playlist(3, "Other", &[]),
+    ];
+    let r = rows(&[], &lists, &HashSet::from([1, 9]));
+    assert_eq!(on(&r), [("Same", true), ("Same", false), ("Other", false)]);
+    let none = rows(&[], &lists, &HashSet::new());
+    assert!(none.iter().all(|r| !r.on_ipod));
+}
+
+#[test]
+fn by_on_ipod_puts_those_on_the_ipod_first_then_by_name() {
+    let lists = [
+        playlist(1, "zed", &[]),
+        playlist(2, "Beta", &[]),
+        playlist(3, "alpha", &[]),
+        playlist(4, "Yak", &[]),
+        playlist(5, "Chi", &[]),
+    ];
+    let mut r = rows(&[], &lists, &HashSet::from([1, 4]));
+    r.sort_by(PlaylistRow::by_on_ipod);
+    assert_eq!(
+        on(&r),
+        [
+            ("Yak", true),
+            ("zed", true),
+            ("alpha", false),
+            ("Beta", false),
+            ("Chi", false)
+        ]
+    );
+    assert_eq!(r[0].by_on_ipod(&r[2]), Ordering::Less);
+    assert_eq!(r[2].by_on_ipod(&r[0]), Ordering::Greater);
+    // Same name, different flags: only the flag separates them.
+    let mut off = r[0].clone();
+    off.on_ipod = false;
+    assert_eq!(r[0].by_on_ipod(&off), Ordering::Less);
+    assert_eq!(off.by_on_ipod(&r[0]), Ordering::Greater);
 }

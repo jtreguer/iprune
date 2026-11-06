@@ -1105,12 +1105,18 @@ impl Ui {
         let Some(id) = d.id else { return };
         let input = self.data.selection(id).and_then(|(current, _)| {
             let (library, playlists) = self.data.selection_inputs()?;
+            let on_ipod = if d.connected {
+                Some(self.data.playlists_on_ipod(id)?)
+            } else {
+                None
+            };
             Ok(selection_dialog::Input {
                 ipod_name: d.name.clone(),
                 capacity: d.capacity,
                 current,
                 library,
                 playlists,
+                on_ipod,
             })
         });
         let input = match input {

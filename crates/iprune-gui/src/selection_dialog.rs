@@ -1,6 +1,7 @@
 //! The dialog that sets what an iPod syncs: the whole library, only the
 //! playlists checked, or all but them, with the size of each playlist and
-//! of the selection against the iPod's.
+//! of the selection against the iPod's, and, for a connected iPod, which
+//! playlists are on it.
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
@@ -24,6 +25,9 @@ pub struct Input {
     pub current: DeviceScope,
     pub library: Vec<TrackRow>,
     pub playlists: Vec<LibPlaylist>,
+    /// The library playlists the connected iPod holds, from its mappings;
+    /// `None` when it is not connected.
+    pub on_ipod: Option<HashSet<i64>>,
 }
 
 /// The size line: tracks and bytes, and how they compare with `capacity`.
@@ -77,6 +81,8 @@ pub struct PlaylistRow {
     /// What its present tracks weigh, each counted once, as a selection of
     /// this playlist alone would.
     pub bytes: u64,
+    /// The connected iPod holds it.
+    pub on_ipod: bool,
 }
 
 impl PlaylistRow {
@@ -90,6 +96,14 @@ impl PlaylistRow {
     pub fn by_size(&self, other: &PlaylistRow) -> Ordering {
         self.bytes
             .cmp(&other.bytes)
+            .then_with(|| self.by_name(other))
+    }
+
+    /// Those on the iPod first, then by name.
+    pub fn by_on_ipod(&self, other: &PlaylistRow) -> Ordering {
+        other
+            .on_ipod
+            .cmp(&self.on_ipod)
             .then_with(|| self.by_name(other))
     }
 }
@@ -141,8 +155,13 @@ fn digit_run(s: &[char], k: usize) -> (&[char], usize) {
     (&digits[zeros..], end)
 }
 
-/// One row per playlist, in the order given.
-pub fn rows(library: &[TrackRow], playlists: &[LibPlaylist]) -> Vec<PlaylistRow> {
+/// One row per playlist, in the order given. `on_ipod` holds the ids of
+/// the playlists the iPod has.
+pub fn rows(
+    library: &[TrackRow],
+    playlists: &[LibPlaylist],
+    on_ipod: &HashSet<i64>,
+) -> Vec<PlaylistRow> {
     let sizes: HashMap<i64, u64> = library
         .iter()
         .filter(|t| t.missing_since.is_none())
@@ -156,6 +175,7 @@ pub fn rows(library: &[TrackRow], playlists: &[LibPlaylist]) -> Vec<PlaylistRow>
                 name: p.name.clone(),
                 key: fold(&p.name),
                 bytes: ids.iter().filter_map(|id| sizes.get(id)).sum(),
+                on_ipod: on_ipod.contains(&p.id),
             }
         })
         .collect()
@@ -279,6 +299,35 @@ fn size_column(rows: &Rc<Vec<PlaylistRow>>) -> gtk::ColumnViewColumn {
     column
 }
 
+/// A mark on the playlists the connected iPod holds.
+fn on_ipod_column(rows: &Rc<Vec<PlaylistRow>>) -> gtk::ColumnViewColumn {
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().expect("a list item");
+        let label = gtk::Label::new(None);
+        label.set_xalign(0.5);
+        item.set_child(Some(&label));
+    });
+    {
+        let rows = rows.clone();
+        factory.connect_bind(move |_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().expect("a list item");
+            let label = item.child().and_downcast::<gtk::Label>().expect("a label");
+            let row = row_of(&rows, &item.item().expect("an item"));
+            label.set_text(if row.on_ipod { "✓" } else { "" });
+            label.set_tooltip_text(row.on_ipod.then_some("On the iPod since the last sync"));
+        });
+    }
+    let column = gtk::ColumnViewColumn::new(Some("On iPod"), Some(factory));
+    column.set_resizable(true);
+    column.set_fixed_width(70);
+    let rows = rows.clone();
+    let sorter =
+        gtk::CustomSorter::new(move |a, b| row_of(&rows, a).by_on_ipod(row_of(&rows, b)).into());
+    column.set_sorter(Some(&sorter));
+    column
+}
+
 /// Shows the dialog; `save` gets the selection when the user saves it.
 pub fn show(parent: &gtk::ApplicationWindow, input: Input, save: impl Fn(DeviceScope) + 'static) {
     let dialog = gtk::Window::builder()
@@ -312,7 +361,11 @@ pub fn show(parent: &gtk::ApplicationWindow, input: Input, save: impl Fn(DeviceS
             .cloned()
             .collect(),
     ));
-    let rows = Rc::new(rows(&input.library, &input.playlists));
+    let rows = Rc::new(rows(
+        &input.library,
+        &input.playlists,
+        input.on_ipod.as_ref().unwrap_or(&HashSet::new()),
+    ));
     let filter = gtk::SearchEntry::new();
     filter.set_placeholder_text(Some("Filter playlists"));
     let store = gio::ListStore::new::<glib::BoxedAnyObject>();
@@ -418,6 +471,9 @@ pub fn show(parent: &gtk::ApplicationWindow, input: Input, save: impl Fn(DeviceS
     let name = name_column(&rows, &checked, update.clone());
     view.append_column(&name);
     view.append_column(&size_column(&rows));
+    if input.on_ipod.is_some() {
+        view.append_column(&on_ipod_column(&rows));
+    }
     view.sort_by_column(Some(&name), gtk::SortType::Ascending);
     update();
 

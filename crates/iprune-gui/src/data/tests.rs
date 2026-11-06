@@ -805,3 +805,51 @@ fn playlists_holding_follows_the_playlists_edited_through_data() {
     assert_eq!(sb.data.playlists_holding(t0).unwrap(), ["mike"]);
     assert!(sb.data.playlists_holding(t1).unwrap().is_empty());
 }
+
+fn pl_id(sb: &Sandbox, name: &str) -> i64 {
+    devices::library_playlists(sb.data.store.conn())
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name == name)
+        .unwrap()
+        .id
+}
+
+fn pmap(playlist_id: i64, name: &str) -> devices::PlaylistMapping {
+    devices::PlaylistMapping {
+        playlist_id,
+        ipod_id: Some(7),
+        ipod_name: name.into(),
+    }
+}
+
+// Prevents the "On iPod" mark taking another iPod's playlists as this one's.
+#[test]
+fn playlists_on_ipod_returns_the_mapped_ids_of_that_device_only() {
+    let sb = with_playlists();
+    let has = pl_id(&sb, "has");
+    let empty = pl_id(&sb, "empty");
+    let mine = one_device(&sb);
+    let other = devices::upsert_device(
+        sb.data.store.conn(),
+        "FFFF0000FFFF0000",
+        Some("Other"),
+        None,
+    )
+    .unwrap();
+    assert!(sb.data.playlists_on_ipod(mine).unwrap().is_empty());
+
+    devices::replace_playlist_mappings(sb.data.store.conn(), mine, &[pmap(has, "has")]).unwrap();
+    devices::replace_playlist_mappings(sb.data.store.conn(), other, &[pmap(empty, "empty")])
+        .unwrap();
+
+    assert_eq!(
+        sb.data.playlists_on_ipod(mine).unwrap(),
+        HashSet::from([has])
+    );
+    assert_eq!(
+        sb.data.playlists_on_ipod(other).unwrap(),
+        HashSet::from([empty])
+    );
+    assert!(sb.data.playlists_on_ipod(other + 100).unwrap().is_empty());
+}

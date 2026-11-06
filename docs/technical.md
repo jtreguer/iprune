@@ -1265,8 +1265,12 @@ and bytes selected against the iPod's size, updated as boxes are
 checked. Names sort with case and accents ignored, punctuation and a
 leading "The" kept, so the "+" and "-" groups stay together as in the
 sidebar, and numbers in order of value ("Synthwave 2" before "Synthwave
-10"); the grid opens sorted by name. Save stores the scope for that iPod
-as `iprune scope` does; the panel shows it in a few words.
+10"); the grid opens sorted by name. When the iPod is connected, a third
+column, On iPod, marks the playlists it holds as its mappings record them
+(`device_playlists`), so as of the last sync: a playlist deleted from the
+library since then has no row. The column sorts those on the iPod first;
+the boxes still show the saved scope. Save stores the scope for that iPod as
+`iprune scope` does; the panel shows it in a few words.
 Eject runs `device::eject` on a worker: the block device mounted at the
 mountpoint, from mountinfo, is unmounted then powered off with `udisksctl`.
 The Scan button, between the header's menu and Sync, runs `scan::scan` on
