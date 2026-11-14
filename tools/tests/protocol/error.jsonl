@@ -1,0 +1,7 @@
+{"request": {"op": "frobnicate", "id": 1}, "answer": {"error": "unknown op: 'frobnicate'", "id": 1}}
+{"request": {"op": "lookup", "file": "$INBOX/absent.mp3", "id": 2}, "answer": {"error": "no such file: $INBOX/absent.mp3", "id": 2}}
+{"request": {"op": "apply", "file": "$INBOX/x.mp3", "tags": {"year": 99}, "id": 3}, "answer": {"error": "year must be from 1000 to 9999", "id": 3}}
+{"request": {"op": "apply", "file": "$INBOX/x.mp3", "tags": {"title": "T"}, "recording": "8c0c2908-54c7-4abb-872e-86f33ff90853", "id": 4}, "answer": {"error": "recording and release go together", "id": 4}}
+{"request": {"op": "lookup", "file": "relative.mp3"}, "answer": {"error": "file must be an absolute path"}}
+{"request": {"op": "lookup", "file": "$INBOX/a-ha - Take On Me.mp3", "choices": 26, "id": "req-7"}, "answer": {"error": "choices must be from 1 to 25", "id": "req-7"}}
+{"request": {"op": "lookup", "file": "$INBOX/notes.txt", "id": 6}, "answer": {"error": "not a supported file (MP3, M4A, WAV or AIFF)", "id": 6}}

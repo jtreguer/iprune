@@ -3,3 +3,4 @@
 *.sqlite
 *.sqlite-journal
 .env
+__pycache__/

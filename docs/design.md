@@ -29,6 +29,7 @@ The current setup, as of this document:
 | Third iPod | iPod Classic 6th generation (USB product 0x1261, FamilyID 11, firmware 1.1.2), 80 GB, FAT32, freshly restored (2026-10-27) |
 | iPod | 9,669 tracks, 329 regular playlists, 7 smart playlists, 6,191 tracks with play counts |
 | iPod backup | `/mnt/seagate-1tb/iPod-backup-2026-10` |
+| New songs | copied into `~/Music`, then `autotag` (`tools/autotag` in this repository, linked from `~/Music/autotag`) tags each MP3 from MusicBrainz and moves it into the library |
 
 The iPod already holds almost the whole library. It was filled by iTunes and
 later modified by Rhythmbox, whose sync doubled every playlist on the device.
@@ -52,6 +53,9 @@ predictable is worse than no sync tool.**
    from the keyboard, with every action also available as a command.
 8. Edit the tags of one song or of several at once in a Get Info form, as
    in iTunes, written to the audio files themselves.
+9. Bring new songs into the library from the window: look them up on
+   MusicBrainz, review their tags and file them where iTunes would have,
+   with `autotag` doing the lookup and the filing (section 7.6).
 
 ## 4. Non-goals
 
@@ -65,7 +69,8 @@ predictable is worse than no sync tool.**
   those; iprune rereads tags.
 - Ratings in Get Info. Ratings come from the iPod (section 9).
 - Renaming or moving files after a tag edit, as iTunes did when it kept
-  the media folder organised. A file keeps its name and folder.
+  the media folder organised. A file keeps its name and folder. Import
+  files a new song once, when it enters the library (section 7.6).
 - Video, podcasts, audiobooks, photos.
 - Smart playlists on the iPod. Existing ones are left untouched.
 - iPods other than the Classic (6th and 7th generation) and the Video (5th
@@ -199,6 +204,57 @@ From the command line: `iprune tag <path>... --artist "a-ha" --year 1985`.
 - `iprune doctor` also checks for playlists with repeated tracks, database
   entries whose files are gone, and files on the iPod with no database entry.
 
+### 7.6 Importing songs
+
+Today a new song takes three steps: copy it into `~/Music`, run `autotag`,
+which looks it up on MusicBrainz, writes its tags and moves it into the
+library, then scan in iprune. Import does the same for a batch of files
+from the window. autotag still looks the songs up and files them (section
+13, decision 6).
+
+1. Drop files or folders on the window, or use Add files…. They are copied
+   into the inbox, a folder outside the library roots (`[import] inbox` in
+   the config, `~/Music/Inbox` by default); the originals stay where they
+   were. Files put in the inbox by other means are listed too.
+2. Each file is looked up in the background as `autotag` does it: by audio
+   fingerprint when an AcoustID key is set, otherwise by artist and title
+   taken from the file name or its tags. Nothing is written yet.
+   MusicBrainz allows one request a second, so twenty files take a minute
+   or two; the window stays usable meanwhile, a sync included.
+3. A file is ready when its first candidate was found by fingerprint, or by
+   name with a length within 10 seconds of the file's, the rule of
+   `autotag --yes`. Other files wait for the user: several candidates to
+   choose from, no match, or a song that may already be in the library.
+4. For those, the user picks a candidate, searches again with another
+   artist and title, or types the tags into the Get Info form. All of this
+   changes the proposal, not the file, and is kept in iprune's database
+   until the file is imported or removed from the inbox.
+5. Import files the ready songs. autotag writes their tags and moves each
+   into the library as iTunes laid it out (section 2); iprune then scans,
+   and adds the songs to a playlist if one was chosen. The others stay in
+   the inbox. The next sync copies the new songs to every iPod whose scope
+   takes them.
+
+A song already in the library is not filed twice without asking. Each file
+is compared with the index. One identical to a library file (same BLAKE3
+hash) is marked as already in the library and is not imported. One with the
+same audio as a library file (the scan's test for a retagged file: same
+kind, sample rate, bitrate and duration to the millisecond), or with the
+same title under the same album artist, is a possible duplicate, filed only
+once the user ticks it, as autotag asks "file it anyway?".
+
+Filing is refused when the library disk is not mounted, and waits for a
+running sync or scan to finish, as Scan does. A file already at its
+destination is never replaced. autotag handles the formats the iPods play:
+MP3, AAC and ALAC in `.m4a`, WAV and AIFF. Other files in the inbox, such as
+FLAC or Opus, are listed as not supported until transcoding exists (section
+12).
+
+From the command line: `iprune import` files the songs in the inbox that
+are ready by the rule above and lists the others with the reason;
+`--dry-run` lists them without filing. `autotag` stays the command for
+looking up a single file interactively.
+
 ## 8. Interface
 
 A desktop window in the manner of iTunes: a sidebar of sources and a grid of
@@ -280,6 +336,43 @@ theme Omarchy sets.
   with a progress bar; Eject unmounts and powers off the iPod.
 - **Adoption review.** On first connection, the proposals appear as a grid,
   one row per iPod track with its candidates, to accept or reject one by one.
+- **Importing.** Import appears under Music in the sidebar while the inbox
+  holds files, with their count (section 7.6). It is a view of the window,
+  not a modal dialog, since lookups take minutes and some files wait for a
+  decision that can come later.
+
+  ```
+  ┌──────────────┬───────────────────────────────────────────────────────────┐
+  │ LIBRARY      │ [ Search…            ]                  [ Add files… ]    │
+  │  Music       │ St File                     Name         Artist    Album  │
+  │  Import (6)  │ ?  Take On Me (Official…    Take On Me   a-ha      Hunti… │
+  │ PLAYLISTS    │ ✗  mashup final v2.mp3      —                             │
+  │  1984        │ ≡  It's a Sin.mp3           It's a Sin   Pet Shop… Actua… │
+  │ ▸80s         │ ⋯  track07.mp3              looking up…                   │
+  │  +Max Richter│ ✓  Tears for Fears - Ever…  Everybody W… Tears fo… Songs… │
+  │ DEVICE       ├───────────────────────────────────────────────────────────┤
+  │  iPod de J.  │ Take On Me (Official Video).mp3       found by name, 4:20 │
+  │  71/160 GB   │ (•) a-ha – Take On Me [3:46]  Hunting High and Low (1985) │
+  │              │ ( ) a-ha – Take On Me [3:48]  Take On Me (1985, Single)   │
+  │              │ ( ) a-ha – Take On Me [3:46]  Headlines and Deadlines (…  │
+  │              │ [ Use this match ]  [ Search again… ]  [ Type tags… ]     │
+  │              │ → a-ha/Hunting High and Low/01 Take On Me.mp3             │
+  │              ├───────────────────────────────────────────────────────────┤
+  │              │ Add to playlist [ none      ▾]   [ Import 1 ready song ]  │
+  └──────────────┴───────────────────────────────────────────────────────────┘
+  ```
+
+  The grid shows a status (✓ ready, ? to choose, ✗ no match, ≡ already in
+  the library, ≈ possible duplicate, ⋯ looking up), the file name, the
+  proposed tags, with changed values in bold and the old value in a
+  tooltip, and the destination in the library. Rows waiting for the user
+  come first. The pane below shows the selected file's candidates as
+  autotag lists them, the best one selected. Use this match makes the file
+  ready, Search again takes another artist and title, and Type tags opens
+  the Get Info form on the proposal. Library songs the file may duplicate
+  are listed there too, with Show in library. The bottom bar holds the
+  playlist to add the songs to and the Import button, with the number of
+  songs ready. Delete moves the selected files from the inbox to the trash.
 - **Keyboard.** Ctrl+F search, Ctrl+I Get Info, Delete remove, Ctrl+N new
   playlist, F2 rename,
   Ctrl+Up and Ctrl+Down move the selected rows in a playlist, plus the
@@ -418,3 +511,24 @@ Answers to the questions left open in the first draft (2026-10-13):
    had never done before, so iprune's own tag writer changes only the
    edited frames, and each new file is read back and checked before it
    replaces the original (technical document, section 7.1).
+6. Importing was proposed on 2026-11-14 and is not built yet (sections 7.6
+   and 8). iprune runs `autotag` (`tools/autotag`, a Python script using
+   mutagen) instead of looking songs up itself. The MusicBrainz ranking and
+   the folder layout then live in one place, autotag keeps working on its
+   own, and iprune has no network code. autotag gains a `serve` mode that
+   answers JSON requests: `lookup` and `tags` return the candidates and the
+   tags each would write, and write nothing; `apply` takes the final tags,
+   files a tagged copy of the song and says where it went (technical
+   document, section 7.2). iprune adds what needs the index: the
+   duplicate check, the scan and the playlist. autotag writes ID3v2.3
+   through mutagen, not through iprune's own tag writer (decision 5). That
+   is acceptable for files not yet in the library, and it is what happens
+   today. Import is the only way iprune adds files to the library; files
+   already there are still never renamed or moved (section 4).
+
+   Settled the same day: the inbox is `~/Music/Inbox`, since `~/Music`
+   also holds other files; autotag learns m4a, WAV and AIFF; the import
+   state (proposals, choices, lookups done) lives in iprune's database;
+   autotag moves from `~/Music` into this repository as `tools/autotag`,
+   so a change to its JSON output and to iprune lands in one commit, and a
+   symbolic link at `~/Music/autotag` keeps the old routine working.

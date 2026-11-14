@@ -1,0 +1,122 @@
+{
+ "created": "2026-11-14T21:08:37.851Z",
+ "count": 1,
+ "offset": 0,
+ "recordings": [
+  {
+   "id": "8c0c2908-54c7-4abb-872e-86f33ff90853",
+   "artist-credit-id": "12c7363c-2954-435a-bd67-1bd6e9c981fb",
+   "title": "Take On Me",
+   "length": 217906,
+   "video": null,
+   "artist-credit": [
+    {
+     "name": "a-ha",
+     "artist": {
+      "id": "7364dea6-ca9a-48e3-be01-b44ad0d19897",
+      "name": "a‐ha",
+      "sort-name": "a‐ha",
+      "disambiguation": "Norwegian synth‐pop band",
+      "aliases": [
+       {
+        "sort-name": "A-ha",
+        "name": "A-ha",
+        "locale": null,
+        "type": null,
+        "primary": null,
+        "begin-date": null,
+        "end-date": null
+       },
+       {
+        "sort-name": "A Ha",
+        "name": "A Ha",
+        "locale": null,
+        "type": null,
+        "primary": null,
+        "begin-date": null,
+        "end-date": null
+       },
+       {
+        "sort-name": "Aha",
+        "name": "Aha",
+        "locale": null,
+        "type": null,
+        "primary": null,
+        "begin-date": null,
+        "end-date": null
+       }
+      ]
+     }
+    }
+   ],
+   "first-release-date": "2019",
+   "releases": [
+    {
+     "id": "0d56dbfe-894e-470a-9997-b2489d53b6a7",
+     "status-id": "4e304316-386d-3409-af2e-78857eec5cfe",
+     "artist-credit-id": "949a7fd5-fe73-3e8f-922e-01ff4ca958f7",
+     "count": 2,
+     "title": "Die ultimative Chartshow: Die beliebtesten Hits aller Zeiten",
+     "status": "Official",
+     "artist-credit": [
+      {
+       "name": "Various Artists",
+       "artist": {
+        "id": "89ad4ac3-39f7-470e-963a-56509c546377",
+        "name": "Various Artists",
+        "sort-name": "Various Artists",
+        "disambiguation": "add compilations to this artist"
+       }
+      }
+     ],
+     "release-group": {
+      "id": "6cff6e50-e0a0-473e-bd3e-5d579649694b",
+      "type-id": "dd2a21e1-0c00-3729-a7a0-de60b84eb5d1",
+      "primary-type-id": "f529b476-6e62-324f-b0aa-1f3e33d313fc",
+      "title": "Die ultimative Chartshow: Die beliebtesten Hits aller Zeiten",
+      "primary-type": "Album",
+      "secondary-types": [
+       "Compilation"
+      ],
+      "secondary-type-ids": [
+       "dd2a21e1-0c00-3729-a7a0-de60b84eb5d1"
+      ]
+     },
+     "date": "2019",
+     "country": "DE",
+     "release-events": [
+      {
+       "date": "2019",
+       "area": {
+        "id": "85752fda-13c4-31a3-bee5-0e5cb1f51dad",
+        "name": "Germany",
+        "sort-name": "Germany",
+        "iso-3166-1-codes": [
+         "DE"
+        ]
+       }
+      }
+     ],
+     "track-count": 43,
+     "media": [
+      {
+       "id": "504605b8-aa17-446b-b8b9-f3b2913a04c5",
+       "position": 1,
+       "format": "CD",
+       "track": [
+        {
+         "id": "4c3d567a-fb81-4071-ac8b-ab3757777e09",
+         "number": "7",
+         "title": "Take On Me",
+         "length": 217906
+        }
+       ],
+       "track-count": 22,
+       "track-offset": 6
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

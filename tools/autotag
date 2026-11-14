@@ -1,0 +1,1075 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["mutagen>=1.47"]
+# ///
+"""Look up a song on MusicBrainz and write its tags.
+
+    autotag FILE [FILE ...]
+    autotag --artist "Guts" --title "Aimer sans amour" FILE.mp3
+
+Files are MP3, AAC or ALAC in .m4a, WAV and AIFF. The track is found by
+audio fingerprint (AcoustID) when a key is available, otherwise by
+searching "Artist - Title" taken from the file name or the existing tags.
+Candidates are listed, then the tag changes are shown and written only
+after confirmation. A field MusicBrainz has no value for keeps its current
+value. A track MusicBrainz does not know (a mashup, a YouTube remix) can
+have its tags typed in instead. Tags are written as ID3v2.3 (MP3, and the
+ID3 chunk of WAV and AIFF) or as MP4 atoms, and the junk left by yt-dlp
+(YouTube description, URL, MP4 brand) is removed. Artwork is left alone.
+
+Once tagged, the file is moved into the library (--copy keeps the original)
+the way iTunes laid it out: Artist/Album/NN Title.mp3, D-NN on albums with
+several discs, Compilations/Album for Various Artists, folder names cut at
+40 characters and file names at 36. An artist or album folder that already
+exists is reused, matched without regard to case or Unicode form; missing
+ones are created. A file already at the destination is never replaced, and a
+song of the same title already filed under the artist is reported before
+anything is copied.
+
+    autotag --export-only FILE        # file it with the tags it has
+    autotag --no-export FILE          # tag it, leave it where it is
+
+    autotag serve [--library DIR]     # JSON lines on stdin and stdout, for iprune
+
+AcoustID key (free, https://acoustid.org/new-application): set ACOUSTID_KEY
+or put it in ~/.config/autotag/acoustid.key. Fingerprinting needs fpcalc
+(pacman -S chromaprint).
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import stat
+import string
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+
+from mutagen import MutagenError
+from mutagen.aiff import AIFF
+from mutagen.id3 import TALB, TCMP, TCOM, TCON, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK, TXXX, UFID
+from mutagen.mp3 import MP3
+from mutagen.mp4 import MP4, MP4FreeForm, MP4Tags
+from mutagen.wave import WAVE
+
+USER_AGENT = "autotag/1.0 (personal tagging script)"
+MB = "https://musicbrainz.org/ws/2"
+MB_INTERVAL = 1.1  # seconds between MusicBrainz requests
+LIBRARY = Path("/mnt/seagate-1tb/Music")
+AUDIO = {".mp3", ".m4a", ".aac", ".wav", ".aif", ".aiff", ".flac", ".ogg", ".opus"}
+# The files autotag tags: the formats the iPod plays.
+SUPPORTED = {".mp3": MP3, ".m4a": MP4, ".wav": WAVE, ".aif": AIFF, ".aiff": AIFF}
+FORMATS = ["mp3", "m4a", "wav", "aiff"]
+NOT_SUPPORTED = "not a supported file (MP3, M4A, WAV or AIFF)"
+# The answers of `autotag serve` change shape only with this number.
+PROTOCOL = 1
+
+# Bracketed parts of YouTube titles that are not part of the song title.
+JUNK = re.compile(
+    r"\s*[\(\[][^\)\]]*\b(official|audio|video|lyrics?|visuali[sz]er|clip|hd|hq|4k)\b[^\)\]]*[\)\]]",
+    re.IGNORECASE,
+)
+# Frames yt-dlp and ffmpeg copy from YouTube and MP4 metadata.
+JUNK_TXXX = {"description", "synopsis", "comment", "purl", "major_brand",
+             "minor_version", "compatible_brands"}
+# The same in MP4 atoms: description, long description, podcast URL.
+JUNK_ATOMS = ("desc", "ldes", "purl")
+YOUTUBE = re.compile(r"youtu\.?be")
+# Release group types, best first, when choosing the album to tag with.
+TYPE_RANK = {"Album": 0, "EP": 1, "Single": 2}
+BAD_SECONDARY = {"Compilation", "Live", "Remix", "DJ-mix", "Mixtape/Street", "Demo"}
+
+# The fields iprune syncs to the iPod, named as in iprune.
+TEXT_FIELDS = ("title", "artist", "album", "album_artist", "composer", "genre")
+NUMBER_FIELDS = ("year", "track_no", "track_total", "disc_no", "disc_total")
+FIELDS = TEXT_FIELDS + NUMBER_FIELDS + ("compilation",)
+
+
+class Fail(Exception):
+    pass
+
+
+class Taken(Fail):
+    """The destination already holds a file."""
+
+
+# -- HTTP --------------------------------------------------------------------
+
+def get_json(url, data=None, retries=5):
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT})
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 503) and attempt + 1 < retries:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise Fail(f"{url.split('?')[0]}: HTTP {e.code}") from None
+        except urllib.error.URLError as e:
+            raise Fail(f"{url.split('?')[0]}: {e.reason}") from None
+        except (TimeoutError, ConnectionError) as e:  # while reading the answer
+            raise Fail(f"{url.split('?')[0]}: {e}") from None
+        except ValueError:  # not JSON, or not UTF-8: an error page from a proxy
+            raise Fail(f"{url.split('?')[0]}: the answer is not JSON") from None
+    raise AssertionError("unreachable")
+
+
+_last_mb = 0.0
+
+
+def mb(path, **params):
+    """MusicBrainz asks for at most one request per second."""
+    global _last_mb
+    wait = _last_mb + MB_INTERVAL - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    try:
+        return get_json(f"{MB}/{path}?" + urllib.parse.urlencode({"fmt": "json", **params}))
+    finally:
+        _last_mb = time.monotonic()
+
+
+# -- Finding the recording ---------------------------------------------------
+
+def acoustid_key():
+    key = os.environ.get("ACOUSTID_KEY", "").strip()
+    if key:
+        return key
+    f = Path.home() / ".config/autotag/acoustid.key"
+    return f.read_text().strip() if f.is_file() else ""
+
+
+def fingerprint_ids(path, key):
+    """MusicBrainz recording ids AcoustID matches to the audio, best first."""
+    if not shutil.which("fpcalc"):
+        print("  fpcalc not found, skipping the fingerprint")
+        return []
+    out = subprocess.run(["fpcalc", "-json", str(path)], capture_output=True, text=True)
+    if out.returncode != 0:
+        print(f"  fpcalc failed: {out.stderr.strip()}")
+        return []
+    try:
+        fp = json.loads(out.stdout)
+        duration, fingerprint = int(fp["duration"]), fp["fingerprint"]
+    except (ValueError, KeyError, TypeError):  # JSONDecodeError is a ValueError
+        print("  fpcalc gave no fingerprint")
+        return []
+    body = urllib.parse.urlencode({
+        "client": key, "meta": "recordingids", "format": "json",
+        "duration": duration, "fingerprint": fingerprint,
+    }).encode()
+    res = get_json("https://api.acoustid.org/v2/lookup", data=body)
+    if res.get("status") != "ok":
+        raise Fail(f"AcoustID: {res.get('error', {}).get('message', res)}")
+    ids = []
+    for r in sorted(res.get("results", []), key=lambda r: -r.get("score", 0)):
+        if r.get("score", 0) < 0.5:
+            continue
+        for rec in r.get("recordings", []):
+            if rec["id"] not in ids:
+                ids.append(rec["id"])
+    return ids[:10]
+
+
+def phrase(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def search(artist, title, ids=()):
+    if ids:
+        q = "rid:(" + " OR ".join(ids) + ")"
+    else:
+        q = f"recording:{phrase(title)}"
+        if artist:
+            q += f" AND artist:{phrase(artist)}"
+    return mb("recording", query=q, limit=25).get("recordings", [])
+
+
+def guess(path, tags, artist=None, title=None):
+    """Artist and title to search for: those given, then the file name,
+    then the tags."""
+    name = JUNK.sub("", path.stem).strip()
+    g_artist, g_title = "", name
+    if " - " in name:
+        g_artist, g_title = (s.strip() for s in name.split(" - ", 1))
+    elif tags.get("title"):
+        g_title = tags["title"]
+        g_artist = tags.get("artist") or ""
+    return artist or g_artist, title or g_title
+
+
+# -- Choosing a candidate ----------------------------------------------------
+
+@dataclass
+class Candidate:
+    rec: dict
+    rel: dict
+    by_fingerprint: bool
+    length_diff: float  # seconds, inf when MusicBrainz has no length
+
+    def label(self):
+        rg = self.rel.get("release-group", {})
+        kind = rg.get("primary-type") or "?"
+        if rg.get("secondary-types"):
+            kind += " + " + ", ".join(rg["secondary-types"])
+        year = (self.rel.get("date") or "")[:4] or "----"
+        length = self.rec.get("length")
+        dur = f"{length // 60000}:{length // 1000 % 60:02d}" if length else "?:??"
+        return (f"{credit(self.rec)} – {self.rec['title']} [{dur}]\n"
+                f"       {self.rel['title']} ({year}, {kind})")
+
+
+def credit(obj):
+    return "".join(a.get("name", a.get("artist", {}).get("name", "")) + a.get("joinphrase", "")
+                   for a in obj.get("artist-credit", []))
+
+
+def release_rank(rel):
+    rg = rel.get("release-group", {})
+    secondary = set(rg.get("secondary-types") or [])
+    return (
+        rel.get("status") != "Official",
+        bool(secondary & BAD_SECONDARY),
+        TYPE_RANK.get(rg.get("primary-type"), 3),
+        rel.get("date") or "9999",
+    )
+
+
+def candidates(recs, duration, by_fingerprint):
+    out = []
+    for rec in recs:
+        if not by_fingerprint and rec.get("score", 0) < 70:
+            continue
+        rels = [r for r in rec.get("releases", []) if r.get("media")]
+        if not rels:
+            continue
+        diff = abs(rec["length"] / 1000 - duration) if rec.get("length") else float("inf")
+        out.append(Candidate(rec, min(rels, key=release_rank), by_fingerprint, diff))
+    # A length far from the file's means another version of the song.
+    out.sort(key=lambda c: (c.length_diff > 10, release_rank(c.rel), c.length_diff))
+    return out
+
+
+def certain(c):
+    """Whether `autotag --yes` takes this first candidate."""
+    return c.by_fingerprint or c.length_diff <= 10
+
+
+# -- Tags --------------------------------------------------------------------
+#
+# Tags are dicts keyed by the names in FIELDS: text fields are str, number
+# fields int, compilation bool. A field that is absent, or None in tags to
+# write, is left alone in the file.
+
+def genre_name(g):
+    special = {"r&b": "R&B", "edm": "EDM", "uk": "UK", "idm": "IDM", "dj": "DJ"}
+    return " ".join(special.get(w, string.capwords(w, "-")) for w in g.split())
+
+
+def top_genre(kind, mbid):
+    genres = mb(f"{kind}/{mbid}", inc="genres").get("genres", [])
+    return genre_name(max(genres, key=lambda g: g["count"])["name"]) if genres else ""
+
+
+def year_of(text):
+    """1985 from "1985", "1985-05-02" or "1985-05-02T07:00:00Z"."""
+    m = re.match(r"\s*(\d{4})", text or "")
+    return int(m.group(1)) if m else None
+
+
+def proposed(c, genre=True):
+    """The tags of a candidate. Without `genre`, the genre is not looked up
+    (it costs up to three requests)."""
+    rel, rg = c.rel, c.rel.get("release-group", {})
+    medium = rel["media"][0]
+    track_no = medium.get("track", [{}])[0].get("number", "")
+    tags = {
+        "title": c.rec["title"],
+        "artist": credit(c.rec),
+        "album": rel["title"],
+        "album_artist": credit(rel) or credit(c.rec),
+        "disc_no": medium["position"],
+        "disc_total": rel.get("count") or medium["position"],
+        # The release's year, so all tracks of an album share one.
+        "year": year_of(rel.get("date") or rg.get("first-release-date")),
+    }
+    if track_no.isdigit():
+        tags["track_no"] = int(track_no)
+        tags["track_total"] = medium["track-count"]
+    if genre:
+        g = top_genre("recording", c.rec["id"])
+        if not g and rg.get("id"):
+            g = top_genre("release-group", rg["id"])
+        if not g and c.rec.get("artist-credit"):
+            g = top_genre("artist", c.rec["artist-credit"][0]["artist"]["id"])
+        tags["genre"] = g
+    return {k: v for k, v in tags.items() if v}
+
+
+def number(value):
+    """12 and 14 from "12/14"; 0 for a missing part."""
+    parts = [int(p) if p.strip().isdigit() else 0 for p in value.split("/")[:2]]
+    return (parts + [0, 0])[:2]
+
+
+ID3_TEXT = {"title": TIT2, "artist": TPE1, "album": TALB, "album_artist": TPE2,
+            "composer": TCOM, "genre": TCON}
+MP4_TEXT = {"title": "©nam", "artist": "©ART", "album": "©alb", "album_artist": "aART",
+            "composer": "©wrt", "genre": "©gen"}
+MB_TRACK_ATOM = "----:com.apple.iTunes:MusicBrainz Track Id"
+MB_ALBUM_ATOM = "----:com.apple.iTunes:MusicBrainz Album Id"
+
+
+def open_audio(path):
+    """The mutagen object for a supported file."""
+    kind = SUPPORTED.get(path.suffix.lower())
+    if kind is None:
+        raise Fail(NOT_SUPPORTED)
+    try:
+        return kind(path)
+    except (MutagenError, OSError) as e:
+        raise Fail(f"cannot read {path.name}: {e}") from None
+
+
+def read_tags(audio):
+    """The fields that have a value in the file."""
+    t = audio.tags
+    out = {}
+    if t is None:
+        return out
+    if isinstance(t, MP4Tags):
+        for field, atom in MP4_TEXT.items():
+            values = [str(v).strip() for v in t.get(atom, []) if str(v).strip()]
+            if values:
+                out[field] = "/".join(values)
+        # mutagen turns a numeric `gnre` into `©gen` when it reads the file.
+        year = year_of(t["©day"][0]) if t.get("©day") else None
+        pairs = [("trkn", "track_no", "track_total"), ("disk", "disc_no", "disc_total")]
+        for atom, n_field, t_field in pairs:
+            if t.get(atom):
+                n, total = (tuple(t[atom][0]) + (0, 0))[:2]
+                out[n_field], out[t_field] = n or None, total or None
+        if t.get("cpil"):
+            out["compilation"] = True
+    else:
+        for field, frame in ID3_TEXT.items():
+            f = t.get(frame.__name__)
+            if f is None:
+                continue
+            values = f.genres if frame is TCON else f.text
+            values = [str(v).strip() for v in values if str(v).strip()]
+            if values:
+                out[field] = "/".join(values)
+        year = year_of(str(t["TDRC"])) if t.get("TDRC") else None
+        for frame, n_field, t_field in [("TRCK", "track_no", "track_total"),
+                                        ("TPOS", "disc_no", "disc_total")]:
+            if t.get(frame):
+                n, total = number(str(t[frame]))
+                out[n_field], out[t_field] = n or None, total or None
+        if t.get("TCMP") and str(t["TCMP"]).strip() not in ("", "0"):
+            out["compilation"] = True
+    out["year"] = year
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def junk_keys(tags):
+    """The frames or atoms of yt-dlp and ffmpeg junk in a file's tags."""
+    if tags is None:
+        return []
+    if isinstance(tags, MP4Tags):
+        out = [k for k in JUNK_ATOMS if k in tags]
+        if any(YOUTUBE.search(str(v)) for v in tags.get("©cmt", [])):
+            out.append("©cmt")
+        return out
+    out = []
+    for key, frame in tags.items():
+        if key.startswith("TXXX:") and frame.desc.lower() in JUNK_TXXX:
+            out.append(key)
+        elif key.startswith("COMM") and YOUTUBE.search(str(frame)):
+            out.append(key)
+    return out
+
+
+def junk_names(keys):
+    return [k.split(":", 1)[-1] for k in keys]
+
+
+def pair_to_write(new, current, n_field, t_field):
+    """The number and total to write when the tags to write give either,
+    the other taken from the file."""
+    if new.get(n_field) is None and new.get(t_field) is None:
+        return None
+    n = new[n_field] if new.get(n_field) is not None else current.get(n_field)
+    total = new[t_field] if new.get(t_field) is not None else current.get(t_field)
+    return n or 0, total or 0
+
+
+def write_tags(path, new, ids=None):
+    """Write the fields of `new` to the file at `path` in place, remove the
+    junk, and record the MusicBrainz ids (recording, release) when given."""
+    audio = open_audio(path)
+    current = read_tags(audio)
+    if audio.tags is None:
+        audio.add_tags()
+    t = audio.tags
+    for key in junk_keys(t):
+        del t[key]
+    track = pair_to_write(new, current, "track_no", "track_total")
+    disc = pair_to_write(new, current, "disc_no", "disc_total")
+    if isinstance(t, MP4Tags):
+        for field, atom in MP4_TEXT.items():
+            if new.get(field) is not None:
+                t[atom] = [new[field]]
+        if new.get("genre") is not None:
+            t.pop("gnre", None)
+        if new.get("year") is not None:
+            t["©day"] = [str(new["year"])]
+        if track:
+            t["trkn"] = [track]
+        if disc:
+            t["disk"] = [disc]
+        if new.get("compilation") is True:
+            t["cpil"] = True
+        elif new.get("compilation") is False:
+            t.pop("cpil", None)
+        if ids:
+            t[MB_TRACK_ATOM] = [MP4FreeForm(ids[0].encode())]
+            t[MB_ALBUM_ATOM] = [MP4FreeForm(ids[1].encode())]
+        audio.save()
+        return
+    for field, frame in ID3_TEXT.items():
+        if new.get(field) is not None:
+            t.setall(frame.__name__, [frame(encoding=3, text=new[field])])
+    if new.get("year") is not None:
+        t.setall("TDRC", [TDRC(encoding=3, text=str(new["year"]))])
+    for frame, value in [(TRCK, track), (TPOS, disc)]:
+        if value:
+            n, total = value
+            t.setall(frame.__name__, [frame(encoding=3, text=f"{n}/{total}" if total else f"{n}")])
+    if new.get("compilation") is True:
+        t.setall("TCMP", [TCMP(encoding=3, text="1")])
+    elif new.get("compilation") is False:
+        t.delall("TCMP")
+    if ids:
+        t.setall("UFID:http://musicbrainz.org",
+                 [UFID(owner="http://musicbrainz.org", data=ids[0].encode())])
+        t.setall("TXXX:MusicBrainz Album Id",
+                 [TXXX(encoding=3, desc="MusicBrainz Album Id", text=ids[1])])
+    audio.save(v2_version=3)
+
+
+def fsync_file(path):
+    with open(path, "rb") as f:
+        os.fsync(f.fileno())
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def retag(path, new, ids=None):
+    """Tag a copy next to the file, then replace the file with it. The file
+    keeps its mode, read-only included."""
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".autotag-", suffix=path.suffix)
+    os.close(fd)
+    try:
+        writable_copy(path, tmp)
+        write_tags(Path(tmp), new, ids)
+        fsync_file(tmp)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+# What the command line shows, in this order.
+LABELS = ("Title", "Artist", "Album", "Album artist", "Track", "Disc", "Year", "Genre",
+          "Composer", "Compilation")
+
+
+def pair_text(n, total):
+    if not n and not total:
+        return ""
+    return f"{n or 0}/{total}" if total else str(n)
+
+
+def shown(tags):
+    """Each label's value as the command line shows it."""
+    return {
+        "Title": tags.get("title") or "",
+        "Artist": tags.get("artist") or "",
+        "Album": tags.get("album") or "",
+        "Album artist": tags.get("album_artist") or "",
+        "Track": pair_text(tags.get("track_no"), tags.get("track_total")),
+        "Disc": pair_text(tags.get("disc_no"), tags.get("disc_total")),
+        "Year": str(tags["year"]) if tags.get("year") else "",
+        "Genre": tags.get("genre") or "",
+        "Composer": tags.get("composer") or "",
+        "Compilation": "yes" if tags.get("compilation") else "",
+    }
+
+
+# -- Filing into the library -------------------------------------------------
+
+def clean(name, limit):
+    """A path component as iTunes wrote it on Windows."""
+    name = re.sub(r'[\\/:*?"<>|]', "_", unicodedata.normalize("NFC", name)).strip()
+    name = name[:limit].rstrip()
+    if name.startswith("."):
+        name = "_" + name[1:]
+    if name.endswith("."):
+        name = name[:-1] + "_"
+    return name or "_"
+
+
+def fold(name):
+    return unicodedata.normalize("NFC", name).casefold().rstrip()
+
+
+def find_or_new(parent, name):
+    """The existing folder for `name` under `parent`, or the one to create."""
+    want = clean(name, 40)
+    if parent.is_dir():
+        for d in sorted(parent.iterdir()):
+            if d.is_dir() and fold(d.name) == fold(want):
+                return d, True
+    return parent / want, False
+
+
+def file_name(tags, suffix):
+    track = tags.get("track_no") or 0
+    disc = tags.get("disc_no") or 0
+    discs = tags.get("disc_total") or 0
+    prefix = ""
+    if track:
+        prefix = f"{disc}-{track:02d} " if discs > 1 and disc else f"{track:02d} "
+    return clean(prefix + tags["title"], 36) + suffix
+
+
+def same_song(folder, title):
+    """Files under `folder` whose name, without its track number, is `title`.
+    A name cut at 36 characters matches the start of the title."""
+    want = fold(title)
+    found = []
+    for f in folder.rglob("*"):
+        if f.suffix.lower() not in AUDIO or not f.is_file():
+            continue
+        stem = fold(re.sub(r"^\d+(-\d+)?\.?\s*(-\s*)?", "", f.stem))
+        # The whole name too, for a title starting with a number filed
+        # without a track number ("99 Luftballons").
+        if want in (stem, fold(f.stem)) or (
+                len(f.stem) >= 35 and len(stem) >= 10 and want.startswith(stem)):
+            found.append(f)
+    return sorted(found)
+
+
+@dataclass
+class Place:
+    """Where a song goes in the library."""
+    root: Path
+    artist_dir: Path
+    artist_exists: bool
+    album_dir: Path
+    album_exists: bool
+    dest: Path
+    dups: list  # files of the same title already under the artist
+
+
+def place(root, tags, suffix):
+    if not root.is_dir() or not any(root.iterdir()):
+        raise Fail(f"{root} is missing or empty: is the disk mounted?")
+    if not tags.get("title"):
+        raise Fail("no title tag, not exported")
+    album_artist = tags.get("album_artist") or tags.get("artist") or "Unknown Artist"
+    if fold(album_artist) == "various artists":
+        album_artist = "Compilations"
+    artist_dir, artist_exists = find_or_new(root, album_artist)
+    album_dir, album_exists = find_or_new(artist_dir, tags.get("album") or "Unknown Album")
+    name = file_name(tags, suffix)
+    dest = album_dir / name
+    if album_exists:
+        # A file of that name in another case or Unicode form is the same
+        # song for iprune, which looks paths up by their NFC form.
+        for f in sorted(album_dir.iterdir()):
+            if fold(f.name) == fold(name):
+                dest = f
+                break
+    dups = same_song(artist_dir, tags["title"]) if artist_exists else []
+    return Place(root, artist_dir, artist_exists, album_dir, album_exists, dest, dups)
+
+
+def link_into(tmp, dest):
+    """Give `tmp` the name `dest`, never replacing a file there."""
+    try:
+        os.link(tmp, dest)
+    except FileExistsError:
+        raise Taken(f"already in the library: {dest}") from None
+    except OSError:
+        # A filesystem without hard links: a check, then a rename, which
+        # would replace only a file created in between.
+        if os.path.lexists(dest):
+            raise Taken(f"already in the library: {dest}") from None
+        os.rename(tmp, dest)
+        return
+    os.unlink(tmp)
+
+
+def writable_copy(src, tmp):
+    """Copy `src` to `tmp` with its times, writable by its owner even when
+    `src` is read-only, so its tags can be written."""
+    shutil.copy2(src, tmp)
+    os.chmod(tmp, stat.S_IMODE(os.stat(tmp).st_mode) | stat.S_IWUSR)
+
+
+def file_into(src, where, keep=False, tags=None, ids=None):
+    """Copy `src` to its place through a hidden temporary file in the album
+    folder, tagged with `tags` when given, then delete `src` unless `keep`.
+    `src` is never written; it is deleted only once the copy is in place.
+    On a failure, the folders it created are removed again."""
+    created = [d for d in (where.artist_dir, where.album_dir) if not d.is_dir()]
+    tmp = None
+    try:
+        where.album_dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=where.album_dir, prefix=".autotag-", suffix=src.suffix)
+        os.close(fd)
+        writable_copy(src, tmp)
+        if tags is not None:
+            write_tags(Path(tmp), tags, ids)
+        fsync_file(tmp)
+        link_into(tmp, where.dest)
+    except BaseException:
+        if tmp is not None:
+            Path(tmp).unlink(missing_ok=True)
+        for d in reversed(created):  # the album folder, then the artist's
+            try:
+                d.rmdir()
+            except OSError:
+                pass  # not empty: something else was filed there meanwhile
+        raise
+    fsync_dir(where.album_dir)
+    for d in created:  # its entry in the folder above, before src goes
+        fsync_dir(d.parent)
+    if not keep:
+        src.unlink()
+
+
+def export(path, tags, args):
+    """Move (or copy) the tagged file to its place in the library."""
+    where = place(args.library, tags, path.suffix.lower())
+    print(f"  artist folder {where.artist_dir.name}" + ("" if where.artist_exists else " (new)"))
+    print(f"  album folder  {where.album_dir.name}" + ("" if where.album_exists else " (new)"))
+    if os.path.lexists(where.dest):
+        print(f"  already in the library: {where.dest}")
+        return False
+    for f in where.dups:
+        print(f"  same title already filed: {f.relative_to(where.root)}")
+    verb = "copy" if args.copy else "move"
+    if args.dry_run:
+        print(f"  would {verb} to {where.dest}")
+        return True
+    if where.dups:
+        if args.yes:
+            print("  not exported (run without --yes to file it anyway)")
+            return False
+        if ask(f"  {verb} it anyway? [y/N] ", "n").lower() not in ("y", "yes"):
+            print("  not exported")
+            return False
+    file_into(path, where, keep=args.copy)
+    print(f"  {'copied' if args.copy else 'moved'} to {where.dest}")
+    return True
+
+
+# -- Command line ------------------------------------------------------------
+
+def ask(prompt, default):
+    try:
+        return input(prompt).strip() or default
+    except EOFError:
+        print()
+        return "q"
+
+
+def by_hand(path, tags, artist, title):
+    """Tags typed in, for a track MusicBrainz does not know (a mashup, a
+    bootleg). Each field offers the current tag or a guess from the name."""
+    print("  enter the tags; Enter keeps the value in brackets")
+    year = re.search(r"\b(19|20)\d\d\b", path.stem)
+    current = shown(tags)
+    guesses = {"Title": title, "Artist": artist, "Year": year.group() if year else ""}
+    typed = {}
+    for label in ("Title", "Artist", "Album", "Album artist", "Track", "Year", "Genre"):
+        default = current[label] or guesses.get(label, "")
+        try:
+            value = input(f"  {label:<13}[{default}] ").strip() or default
+        except EOFError:
+            print()
+            raise Fail("input closed, nothing written") from None
+        typed[label] = value
+    new = {"title": typed["Title"], "artist": typed["Artist"], "album": typed["Album"],
+           "album_artist": typed["Album artist"], "genre": typed["Genre"],
+           "year": year_of(typed["Year"])}
+    if typed["Track"]:
+        n, total = number(typed["Track"])
+        new["track_no"], new["track_total"] = n or None, total or None
+    new = {k: v for k, v in new.items() if v}
+    if "title" not in new:
+        raise Fail("a title is needed, nothing written")
+    return new
+
+
+def tag_file(path, args, key):
+    """Tag the file; returns its tags as written (or as they would be, in a
+    dry run), or None when it was skipped."""
+    audio = open_audio(path)
+    old = read_tags(audio)
+    artist, title = guess(path, old, args.artist, args.title)
+
+    cands = []
+    if key and not (args.artist or args.title):
+        ids = fingerprint_ids(path, key)
+        if ids:
+            cands = candidates(search("", "", ids), audio.info.length, True)
+    if not cands:
+        print(f"  searching for: {artist or '?'} – {title}")
+        cands = candidates(search(artist, title), audio.info.length, False)
+    choices = cands[:args.choices]
+    for i, c in enumerate(choices, 1):
+        print(f"  {i}. {c.label()}")
+    pick = None
+    if not choices:
+        if args.yes:
+            print("  no match; try --artist and --title, or run without --yes")
+            return None
+        print("  no match on MusicBrainz")
+        if ask("  enter the tags by hand? [Y/n] ", "y").lower() not in ("y", "yes"):
+            print("  skipped")
+            return None
+    elif args.yes:
+        pick = choices[0]
+        if not certain(pick):
+            print("  first match is not certain (length differs), skipped; run without --yes")
+            return None
+    else:
+        answer = ask(f"  choose 1-{len(choices)}, m to type the tags, q to skip [1]: ", "1")
+        if answer.isdigit() and 1 <= int(answer) <= len(choices):
+            pick = choices[int(answer) - 1]
+        elif answer.lower() != "m":
+            print("  skipped")
+            return None
+
+    new = proposed(pick) if pick else by_hand(path, old, artist, title)
+    changed = any(old.get(k) != v for k, v in new.items())
+    junk = junk_keys(audio.tags)
+    before, after = shown(old), shown({**old, **new})
+    for label in LABELS:
+        if before[label] != after[label]:
+            print(f"  {label:<13}{before[label] or '—'}  →  {after[label]}")
+        elif before[label]:
+            print(f"  {label:<13}{before[label]}")
+    if junk:
+        print(f"  removing     {', '.join(junk_names(junk))}")
+    if not changed and not junk:
+        print("  tags already match")
+        return {**old, **new}
+    if args.dry_run:
+        return {**old, **new}
+    if not args.yes and ask("  write? [Y/n] ", "y").lower() not in ("y", "yes"):
+        print("  not written")
+        return None
+    retag(path, new, (pick.rec["id"], pick.rel["id"]) if pick else None)
+    print("  written")
+    return {**old, **new}
+
+
+# -- serve: JSON lines for iprune --------------------------------------------
+#
+# `autotag serve` writes a first line, {"protocol": 1, "formats": [...],
+# "acoustid": bool, "fpcalc": bool}, then reads one JSON request per line on
+# stdin and writes one JSON answer per line on stdout, until stdin closes.
+# Everything else it prints goes to stderr. An answer carries the request's
+# "id" when it had one. A failed request answers {"error": "..."} and the
+# next one is read as usual.
+#
+#   {"op": "lookup", "file", "artist"?, "title"?, "choices"?}
+#     -> {"by": "fingerprint" | "name", "query": {"artist", "title"},
+#         "duration_ms", "candidates": [{"recording", "release", "label",
+#         "length_ms", "certain", "tags", "destination", "same_title"}]}
+#     "choices" is 1 to 25, 5 by default. "query" is the artist and title
+#     guessed from the file, also when the fingerprint found the song.
+#     Only the first candidate's genre is looked up: absent when
+#     MusicBrainz has none, null on the others (not looked up).
+#     "destination" (relative to the library) is null when the library is
+#     not mounted.
+#   {"op": "tags", "recording", "release"} -> {"tags"}, genre included.
+#   {"op": "apply", "file", "tags", "recording"?, "release"?, "dry_run"?,
+#    "allow_duplicate"?}  (both flags false by default)
+#     -> {"destination", "same_title", "filed"}
+#     or {"refused": "...", "destination", "same_title"}
+#     Files a tagged copy of the file and deletes the file; the file itself
+#     is never written. A field absent, null or empty in "tags" is left as
+#     the file has it: apply cannot clear a field. "refused" is for a
+#     destination already taken, or files of the same title without
+#     "allow_duplicate"; anything else is an error. With "dry_run" nothing
+#     is written ("filed": false), and only a taken destination refuses.
+
+def check_tags(obj):
+    """Tags of a request, with None fields left out."""
+    if not isinstance(obj, dict):
+        raise Fail("tags must be a JSON object")
+    out = {}
+    for k, v in obj.items():
+        if k not in FIELDS:
+            raise Fail(f"unknown tag field: {k}")
+        if v is None:
+            continue
+        if k in TEXT_FIELDS:
+            if not isinstance(v, str):
+                raise Fail(f"{k} must be a string")
+            v = v.strip()
+            if not v:
+                continue
+        elif k == "compilation":
+            if not isinstance(v, bool):
+                raise Fail("compilation must be true or false")
+        else:
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise Fail(f"{k} must be a whole number")
+            low, high = (1000, 9999) if k == "year" else (1, 999)
+            if not low <= v <= high:
+                raise Fail(f"{k} must be from {low} to {high}")
+        out[k] = v
+    return out
+
+
+def check_str(req, name, required=True):
+    v = req.get(name)
+    if v is None and not required:
+        return None
+    if not isinstance(v, str) or not v.strip():
+        raise Fail(f"{name} must be a non-empty string")
+    return v
+
+
+def check_file(req):
+    path = Path(check_str(req, "file"))
+    if not path.is_absolute():
+        raise Fail("file must be an absolute path")
+    if not path.is_file():
+        raise Fail(f"no such file: {path}")
+    return path
+
+
+class Server:
+    def __init__(self, library, key):
+        self.library = library
+        self.key = key
+        # Candidates of past lookups, by (recording, release), for "tags".
+        self.seen = {}
+
+    def handle(self, req):
+        op = req.get("op")
+        if op == "lookup":
+            return self.lookup(req)
+        if op == "tags":
+            return self.tags(req)
+        if op == "apply":
+            return self.apply(req)
+        raise Fail(f"unknown op: {op!r}")
+
+    def where(self, tags, suffix):
+        """(destination, same-title files), relative to the library; no
+        destination when the library is not mounted or there is no title."""
+        try:
+            w = place(self.library, tags, suffix)
+        except Fail:
+            return None, []
+        return str(w.dest.relative_to(w.root)), [str(f.relative_to(w.root)) for f in w.dups]
+
+    def lookup(self, req):
+        path = check_file(req)
+        artist = check_str(req, "artist", required=False)
+        title = check_str(req, "title", required=False)
+        limit = req.get("choices", 5)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 25:
+            raise Fail("choices must be from 1 to 25")
+        audio = open_audio(path)
+        current = read_tags(audio)
+        duration = audio.info.length
+        q_artist, q_title = guess(path, current, artist, title)
+        cands, by = [], "name"
+        if self.key and not (artist or title):
+            ids = fingerprint_ids(path, self.key)
+            if ids:
+                cands = candidates(search("", "", ids), duration, True)
+                if cands:
+                    by = "fingerprint"
+        if not cands:
+            cands = candidates(search(q_artist, q_title), duration, False)
+        out = []
+        for i, c in enumerate(cands[:limit]):
+            self.seen[(c.rec["id"], c.rel["id"])] = c
+            tags = proposed(c, genre=i == 0)
+            if i > 0:
+                tags["genre"] = None
+            dest, same = self.where({**current, **{k: v for k, v in tags.items() if v}},
+                                    path.suffix.lower())
+            out.append({
+                "recording": c.rec["id"],
+                "release": c.rel["id"],
+                "label": c.label().replace("\n       ", "\n"),
+                "length_ms": c.rec.get("length"),
+                "certain": certain(c),
+                "tags": tags,
+                "destination": dest,
+                "same_title": same,
+            })
+        return {"by": by, "query": {"artist": q_artist, "title": q_title},
+                "duration_ms": round(duration * 1000), "candidates": out}
+
+    def tags(self, req):
+        rec_id, rel_id = check_str(req, "recording"), check_str(req, "release")
+        c = self.seen.get((rec_id, rel_id))
+        if c is None:
+            for rec in search("", "", [rec_id]):
+                for rel in rec.get("releases", []):
+                    if rel["id"] == rel_id and rel.get("media") and rec["id"] == rec_id:
+                        c = Candidate(rec, rel, True, float("inf"))
+            if c is None:
+                raise Fail(f"recording {rec_id} with release {rel_id} not found on MusicBrainz")
+            self.seen[(rec_id, rel_id)] = c
+        return {"tags": proposed(c)}
+
+    def apply(self, req):
+        path = check_file(req)
+        tags = check_tags(req.get("tags"))
+        rec_id = check_str(req, "recording", required=False)
+        rel_id = check_str(req, "release", required=False)
+        if (rec_id is None) != (rel_id is None):
+            raise Fail("recording and release go together")
+        dry_run = req.get("dry_run", False)
+        allow = req.get("allow_duplicate", False)
+        if not isinstance(dry_run, bool) or not isinstance(allow, bool):
+            raise Fail("dry_run and allow_duplicate must be true or false")
+        audio = open_audio(path)
+        w = place(self.library, {**read_tags(audio), **tags}, path.suffix.lower())
+        dest = str(w.dest.relative_to(w.root))
+        same = [str(f.relative_to(w.root)) for f in w.dups]
+        answer = {"destination": dest, "same_title": same}
+        if os.path.lexists(w.dest):
+            return {"refused": f"already in the library: {dest}", **answer}
+        if dry_run:
+            return {**answer, "filed": False}
+        if same and not allow:
+            return {"refused": "same title already filed: " + ", ".join(same), **answer}
+        try:
+            file_into(path, w, tags=tags, ids=(rec_id, rel_id) if rec_id else None)
+        except Taken:  # filed by something else meanwhile
+            return {"refused": f"already in the library: {dest}", **answer}
+        # Any other failure is an error answer, not a refusal.
+        return {**answer, "filed": True}
+
+
+def serve(library):
+    out = sys.stdout
+    sys.stdout = sys.stderr  # stdout carries the answers only
+    # A line that is not UTF-8 gets a "not JSON" answer instead of ending
+    # the process.
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    key = acoustid_key()
+
+    def send(obj):
+        out.write(json.dumps(obj) + "\n")
+        out.flush()
+
+    send({"protocol": PROTOCOL, "formats": FORMATS, "acoustid": bool(key),
+          "fpcalc": shutil.which("fpcalc") is not None})
+    server = Server(library, key)
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        req = None
+        try:
+            req = json.loads(line)
+            if not isinstance(req, dict):
+                raise Fail("a request must be a JSON object")
+            answer = server.handle(req)
+        except json.JSONDecodeError as e:
+            answer = {"error": f"not JSON: {e}"}
+        except Fail as e:
+            answer = {"error": str(e)}
+        except Exception as e:  # keep serving; the trace goes to stderr
+            traceback.print_exc()
+            answer = {"error": f"internal error: {e!r}"}
+        if isinstance(req, dict) and "id" in req:
+            answer["id"] = req["id"]
+        send(answer)
+    return 0
+
+
+def main():
+    if sys.argv[1:2] == ["serve"]:
+        p = argparse.ArgumentParser(prog="autotag serve",
+                                    description="Answer iprune's requests in JSON lines.")
+        p.add_argument("--library", type=Path, default=LIBRARY,
+                       help=f"library to file into (default {LIBRARY})")
+        return serve(p.parse_args(sys.argv[2:]).library)
+
+    p = argparse.ArgumentParser(description="Tag songs from MusicBrainz.")
+    p.add_argument("files", nargs="+", type=Path)
+    p.add_argument("--artist", help="artist to search for, instead of the file name")
+    p.add_argument("--title", help="title to search for, instead of the file name")
+    p.add_argument("-y", "--yes", action="store_true", help="take the first match, do not ask")
+    p.add_argument("-n", "--dry-run", action="store_true", help="show the changes only")
+    p.add_argument("--choices", type=int, default=5, help="matches to list (default 5)")
+    p.add_argument("--library", type=Path, default=LIBRARY,
+                   help=f"library to file into (default {LIBRARY})")
+    p.add_argument("--copy", action="store_true", help="copy into the library, keep the file")
+    p.add_argument("--no-export", action="store_true", help="tag only, do not file")
+    p.add_argument("--export-only", action="store_true",
+                   help="file with the current tags, no MusicBrainz lookup")
+    args = p.parse_args()
+    if args.no_export and args.export_only:
+        p.error("--no-export and --export-only exclude each other")
+
+    key = "" if args.export_only else acoustid_key()
+    if not key and not args.export_only:
+        print("no AcoustID key: matching by name only (see autotag --help)")
+    ok = True
+    for path in args.files:
+        print(path.name)
+        if path.suffix.lower() not in SUPPORTED or not path.is_file():
+            print(f"  {NOT_SUPPORTED}")
+            ok = False
+            continue
+        try:
+            tags = read_tags(open_audio(path)) if args.export_only else tag_file(path, args, key)
+            if tags is None:
+                ok = False
+            elif not args.no_export:
+                ok &= export(path, tags, args)
+        except Fail as e:
+            print(f"  {e}")
+            ok = False
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

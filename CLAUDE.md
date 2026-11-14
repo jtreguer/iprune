@@ -19,6 +19,8 @@ retagging with checkpoints, `doctor`; the window: library and playlist
 grid, playlist editing, sync, adoption review, eject; desktop entry,
 notifications, `packaging/install.sh`). M8, tag editing (`docs/technical.md`
 section 7.1: `tag_edit`, `iprune tag`, the Get Info form), is done too.
+M9, import (`docs/design.md` section 7.6, `docs/technical.md` section 7.2,
+four steps in section 17), is planned and not started.
 Work followed the milestones in `docs/technical.md` section 17:
 
 | # | Deliverable | Writes to iPod |
@@ -32,6 +34,7 @@ Work followed the milestones in `docs/technical.md` section 17:
 | M6 | desktop UI (GTK4, iTunes-style grid) | yes |
 | M7 | desktop entry, notifications, packaging | yes |
 | M8 | tag editing: `tag_edit`, `iprune tag`, Get Info form | no (library files) |
+| M9 | import: autotag `serve` and formats, `import`, `iprune import`, Import view | no (library files) |
 
 Do not start work that writes to an iPod before the earlier milestones are done
 and tested.
@@ -86,6 +89,9 @@ crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6); v
                      tested), main, adopt_dialog and info_dialog are GTK
 crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c
 packaging/           iprune.desktop and install.sh (cargo install and the desktop entry)
+tools/autotag        Python script (uv, mutagen): tags new songs from MusicBrainz and files
+                     them into the library; ~/Music/autotag links to it. Import is to drive
+                     it (design 7.6 and decision 6, not built)
 ```
 
 ## Commands
@@ -97,6 +103,8 @@ cargo test                                  # needs gcc (C snapshot tool) and ff
 cargo test -p gpod -- --include-ignored     # also compares against the real backup, read only
 cargo clippy --all-targets -- -D warnings
 cargo fmt
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with 'mutagen>=1.47' pytest tools/tests
+                                            # autotag: no network, ffmpeg and ffprobe needed
 # cargo sets IPRUNE_NO_DETECT (.cargo/config.toml): nothing it runs finds the
 # real iPod by itself, `cargo run` included; set device.mountpoint for that
 packaging/install.sh                        # install both binaries and the desktop entry
@@ -118,7 +126,7 @@ change, however small:
    her check the fixes.
 
 `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`
-must pass at the end. Mention in the commit message that both steps ran.
+must pass at the end, and the autotag suite too when `tools/` changed. Mention in the commit message that both steps ran.
 
 ## Rules that must hold
 
@@ -151,6 +159,12 @@ must pass at the end. Mention in the commit message that both steps ran.
   and checked, then renamed over the original. Files that changed since the
   scan, have unreadable tags or are FairPlay protected are refused. Tests
   write only to temp copies of fixtures.
+- Import (M9) adds files to the library only through autotag's `apply`,
+  which tags a copy, hard-links it into place without replacing anything,
+  syncs the folders, and deletes the inbox file last. The inbox lies outside the library
+  roots. iprune itself has no network code; autotag does the lookups, one
+  process at a time (`import.lock`). Tests use a fake autotag and recorded
+  MusicBrainz answers, never the network.
 - `.m3u8` writes go to a temp file in the same folder, `fsync`, then rename.
   Unresolved entries are kept verbatim.
 - Paths are stored exactly as on disk and looked up by their NFC form

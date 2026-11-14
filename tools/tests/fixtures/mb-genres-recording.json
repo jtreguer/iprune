@@ -1,0 +1,23 @@
+{
+ "id": "8c0c2908-54c7-4abb-872e-86f33ff90853",
+ "genres": [
+  {
+   "id": "g1",
+   "name": "pop",
+   "count": 2,
+   "disambiguation": ""
+  },
+  {
+   "id": "g2",
+   "name": "synth-pop",
+   "count": 7,
+   "disambiguation": ""
+  },
+  {
+   "id": "g3",
+   "name": "new wave",
+   "count": 1,
+   "disambiguation": ""
+  }
+ ]
+}

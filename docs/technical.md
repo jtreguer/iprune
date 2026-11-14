@@ -39,6 +39,7 @@ iprune/
         store/              SQLite schema and queries
         scan.rs             walk roots, read tags, detect moves
         tag_edit.rs         write edited tags to library files (Get Info)
+        import.rs           inbox, import state, autotag client, filing (M9)
         playlist.rs         .m3u8 read and write
         device.rs           find mounted iPods, read identity
         adopt.rs            match iPod tracks to library tracks
@@ -52,6 +53,10 @@ iprune/
     iprune-gui/             binary `iprune-gui`: the GTK4 window
       src/{main,view_model,...}.rs
   packaging/                iprune.desktop, install.sh
+  tools/
+    autotag                 Python script run with uv: MusicBrainz lookup, tag
+                            writes and filing of new songs (section 7.2)
+    tests/                  its tests, and protocol/ shared with iprune's
   docs/
   tests/
     fixtures/
@@ -177,7 +182,17 @@ keep_backups = 20
 mountpoint = ""                  # empty means detect; absolute otherwise,
                                  # and neither inside a root nor holding one
 # allow_folder = true            # tests only: write to a plain folder
+
+[import]
+inbox = "/home/julien/Music/Inbox"  # absolute, neither inside a root nor holding one
+root = ""                        # root new songs are filed into; empty means
+                                 # the first of [library] roots
+autotag = ""                     # empty means autotag next to the iprune
+                                 # binary, else on PATH
 ```
+
+`init` writes `[import]` with the inbox in the XDG music folder
+(`~/Music/Inbox`). A config without `[import]` gets these defaults.
 
 ## 5. State and files
 
@@ -189,6 +204,8 @@ mountpoint = ""                  # empty means detect; absolute otherwise,
 | `~/.local/share/iprune/backups/<guid>/.ithmb/<blake3>` | the iPod's `.ithmb` cover art files, one copy per content, shared by the backups that list them |
 | `<ipod>/iPod_Control/iprune/manifest.json` | copy of the device mapping, written after each sync |
 | `/mnt/seagate-1tb/Playlists/*.m3u8` | playlists, the source of truth |
+| `~/Music/Inbox/` | songs waiting to be imported (section 7.2) |
+| `~/.local/share/iprune/import.lock` | held while an autotag process runs, so the window and the CLI never look songs up at the same time |
 
 The manifest on the iPod is a copy of the mapping for recovery by hand if the
 local database is lost; iprune does not read it yet, and a lost index is
@@ -359,7 +376,8 @@ existing mappings.
 ### 7.1 Tag writes
 
 Module `tag_edit`, used by `iprune tag` and the window's Get Info form. It
-is the only code that writes to files under the library roots.
+is the only iprune code that changes files under the library roots. The
+import (section 7.2) adds new files there through autotag.
 
 An edit is a set of tracks and a list of field changes, each a field of
 `tags::Tags` (title, artist, album, album artist, composer, genre, year,
@@ -451,6 +469,183 @@ Each file is read and written once, so 200 songs of 10 MB mean 2 GB read
 and 2 GB written on the USB disk; progress is per file and Stop takes effect between files. Tag
 writes do not touch the iPod and do not take `ipod.lock`. In the window
 they share the busy flag with Scan, Sync, Adopt and Eject.
+
+### 7.2 Import
+
+Module `import`, used by `iprune import` and the window's Import view
+(design, sections 7.6 and 8). iprune reads the inbox, keeps each file's
+state in the index, checks for duplicates, and after filing scans and adds
+the new songs to a playlist. `tools/autotag` does the rest: it looks songs
+up on MusicBrainz and AcoustID, writes their tags and moves them into the
+library. iprune has no network code.
+
+**The inbox.** `[import] inbox` (section 4) is created when missing. Its
+audio files, subfolders included, are the import's items. Hidden files are
+skipped, which also leaves out autotag's temporary files (`.autotag-*`). A
+file whose extension is not `mp3`, `m4a`, `wav`, `aif` or `aiff` is listed
+as not supported; a supported one that `tags::read` cannot read is listed
+with the error. Files dropped on the window or given to `iprune import` are
+copied in through a hidden temporary file and a rename; a dropped folder
+keeps its name, and a name already taken gets " (2)", " (3)" before the
+extension. The originals are not touched. The inbox is read when the
+Import view opens, after each import, and on changes (`gio::FileMonitor`)
+while the window is open.
+
+**State.** Migration 0009 adds one table:
+
+```sql
+CREATE TABLE import_items (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  path      TEXT NOT NULL UNIQUE,        -- exact on-disk path in the inbox
+  size      INTEGER NOT NULL,
+  mtime_ns  INTEGER NOT NULL,
+  hash      BLOB NOT NULL,               -- blake3 of the whole file
+  lookup    TEXT,                        -- autotag's answer, JSON; NULL until looked up
+  search    TEXT,                        -- artist and title typed in Search again, JSON
+  choice    INTEGER,                     -- candidate chosen; NULL takes the first
+  tags      TEXT,                        -- tags typed in Type tags, JSON
+  confirmed INTEGER NOT NULL DEFAULT 0,  -- a possible duplicate the user accepted
+  error     TEXT,                        -- the last lookup or filing error
+  added_at  INTEGER NOT NULL
+);
+```
+
+A row is made for each file found in the inbox and dropped when the file
+leaves it: filed, deleted, or moved away by hand. A file whose size or
+modification time changed loses its lookup, choice and typed tags, and is
+looked up again. No other table refers to this one.
+
+**Status.** `import::status` is pure: from a row, the inbox file's audio
+properties and the index's present and missing tracks, it gives the status
+the window and the CLI show, the tags the file would get and its
+destination. In order:
+
+1. Not supported, Error (unreadable file, or a lookup that failed), and
+   Looking up (no lookup yet), as above.
+2. Already in library: the file's hash equals a present track's. It is
+   never filed; Delete removes it from the inbox. A hash equal to a
+   missing track's is no duplicate: once filed, the scan's move detection
+   gives that track its file back, with its statistics and playlists.
+3. The tags the file would get: the typed tags, else the chosen candidate's,
+   else the first candidate's. No candidate and no typed tags is No match.
+4. Possible duplicate, unless the user accepted it: a present track with the
+   same audio (the scan's `audio_key`: kind, sample rate, bitrate and
+   duration to the millisecond); or one with the same title
+   (`adopt::normalize`) under the same album artist (album artist, else
+   artist, as autotag files it); or files autotag found with the same title
+   in the artist's folder.
+5. Ready: typed tags, a candidate the user chose, or a first candidate found
+   by fingerprint or with a length within 10 seconds of the file's (the rule
+   of `autotag --yes`). Otherwise Choose.
+
+**autotag protocol.** iprune runs `autotag serve --library <root>` and
+talks to it in JSON lines: one request per line on its stdin, one answer
+per line on its stdout. Its stderr goes to the log (`tracing`). The first
+line autotag writes is `{"protocol": 1, "formats": [...], "acoustid":
+bool, "fpcalc": bool}`; any other protocol version is refused, with a
+message to install autotag again. A request may carry an `"id"` (any JSON
+value), which its answer repeats; iprune numbers its requests and checks
+each answer's id. One process is one MusicBrainz client, so autotag's pacing
+(one request a second) holds across a batch, and `uv` starts once. The
+process runs while there is work and holds `import.lock`, so the window and
+the CLI never run two. The program is `[import] autotag`, else `autotag`
+in the folder of the running `iprune` or `iprune-gui` binary (where
+`install.sh` puts it), else `autotag` on `PATH`.
+
+Tags in requests and answers are the twelve fields of `tags::Tags`, with
+the same names (`title`, `artist`, `album`, `album_artist`, `composer`,
+`genre`, `year`, `track_no`, `track_total`, `disc_no`, `disc_total`,
+`compilation`). In `apply`, a field absent, null or empty is left as the
+file has it, so an import cannot clear a field; Get Info can, once the song
+is in the library. `tools/tests/protocol/` holds requests and answers both
+sides are tested against.
+
+- `{"op": "lookup", "file", "artist"?, "title"?, "choices"?}` answers
+  `{"by": "fingerprint" | "name", "query": {"artist", "title"},
+  "duration_ms", "candidates": [{"recording", "release", "label",
+  "length_ms", "certain", "tags", "destination", "same_title"}]}`.
+  `artist` and `title` come from Search again and skip the fingerprint, as
+  `--artist` and `--title` do; `query` is the artist and title guessed from
+  the file, filled in Search again, and given even when the fingerprint
+  found the song. `choices` is 1 to 25, 5 by default. `certain` is the
+  10-second rule for that candidate. Only the first candidate's genre is
+  looked up, since each costs up to three requests: it is absent when
+  MusicBrainz has none, and the others have `"genre": null` until chosen.
+  `destination` is relative to the root, null when the root is not
+  mounted, and `same_title` lists the files autotag's same-title check
+  finds there, sorted.
+- `{"op": "tags", "recording", "release"}` answers `{"tags"}`, genre
+  included, for a candidate the user chose whose genre is not known yet.
+- `{"op": "apply", "file", "tags", "recording"?, "release"?, "dry_run"?,
+  "allow_duplicate"?}`, both flags false by default, answers
+  `{"destination", "same_title", "filed"}` or `{"refused": "<reason>",
+  "destination", "same_title"}`. A refusal means the destination is taken
+  (a file of that name in any case or Unicode form), or files of the same
+  title exist and `allow_duplicate` is false; any other failure is an
+  error. With `dry_run` nothing is written, `filed` is false, and only a
+  taken destination refuses; the window uses it for the destination of
+  typed tags. `recording` and `release`, absent for typed tags, are
+  written as the MusicBrainz ids, as autotag does now.
+
+An answer `{"error": "<message>"}` fails that request only. A process that
+exits or writes a line that is not JSON fails the remaining requests of the
+batch with its stderr; those files are tried again at the next start. Stop
+during lookups closes autotag's stdin and kills it after 2 seconds, which
+can only interrupt a lookup; during filing, Stop waits for the file being
+filed, and iprune never closes stdin or kills autotag while an `apply` is
+unanswered. Network errors are lookup errors: kept in `error` and retried by
+Look up again.
+
+autotag's changes for this, in `tools/autotag`: the `serve` mode; m4a
+(`©nam`, `©ART`, `©alb`, `aART`, `©wrt`, `©gen`, `©day`, `trkn`, `disk`,
+`cpil`, and the MusicBrainz ids as `----:com.apple.iTunes` items), WAV and
+AIFF (ID3v2.3 in their `ID3 ` chunk, as for MP3); composer and the
+compilation flag, which Type tags can set; the destination and the
+same-title check returned as data instead of printed; and `apply`, which
+writes the tags on the copy it files instead of on the original. Its
+command line stays as it is. As before, every write to an ID3 tag saves the
+whole tag again as ID3v2.3, which joins a multi-valued frame with "/"; the
+fields iprune reads back in step 3 of the filing are unaffected.
+
+**Filing.** Import files the Ready items in inbox order:
+
+1. It is refused when the root to file into (`[import] root`, else the
+   first of `[library] roots`) is absent or empty, which a scan would also
+   count as unreadable. In the window it takes the busy flag, so it is
+   refused while Scan, Sync, Adopt, Eject or a tag write runs, as Get Info
+   is.
+2. For each item, the file must still have its row's size and modification
+   time. `apply` gets the item's tags, its candidate's ids, and
+   `allow_duplicate` when the user accepted a possible duplicate. autotag
+   copies the inbox file to a hidden temporary file in the album folder
+   (writable, even when the original is read-only), writes the tags there,
+   `fsync`s it, hard-links it to the destination, which never replaces a
+   file (on a filesystem without hard links, a check and a rename), and
+   `fsync`s the album folder and the folder above each folder it created.
+   Only then does it delete the inbox file, which is never written. A
+   refusal, an error or a crash leaves the inbox file as it was, so the
+   item keeps its lookup; the reason is kept in `error`. Folders created
+   for a file that failed are removed again. Stop takes effect between
+   files.
+3. Each filed file is read with `tags::read`. The twelve fields must read
+   as sent, and the kind and duration as the inbox file's. A difference is
+   reported with the fields; the file stays filed, to be put right with
+   Get Info.
+4. `scan::scan`, as Scan does; only the new files are hashed. Each
+   destination must now be an indexed track (looked up by `path_key`); one
+   that is not is reported.
+5. When a playlist was chosen, `playlists::add` appends the new tracks to
+   it, in inbox order, in one write.
+6. The rows of filed items are dropped.
+
+The report lists the filed songs with their destinations, the items left in
+the inbox with the reason, and the scan's report. The next sync copies the
+new tracks to each iPod whose scope takes them.
+
+Tags written during an import are written by autotag through mutagen, on
+files that are not in the library yet. This is the exception to section
+7.1 that design decision 6 accepts; the read-back in step 3 checks the
+result with iprune's own reader.
 
 ## 8. Playlists
 
@@ -1072,6 +1267,7 @@ iprune tag PATH... [--title T] [--artist A] [--album-artist A] [--album A]
 iprune scope [all | only PLAYLIST... | except PLAYLIST... | default] [--guid GUID]
 iprune device info
 iprune backups
+iprune import [FILE...] [--playlist NAME] [--dry-run]
 iprune restore <stamp> [--guid GUID] [--mountpoint DIR] [--discard-play-counts] [--yes]
 iprune doctor [--fix]
 iprune snapshot <mountpoint|iTunesDB>
@@ -1091,6 +1287,16 @@ be indexed tracks. Each file gets one line, written or refused with the
 reason, and the exit code is 1 when any was refused. `--title` or
 `--track` with more than one path is a usage error, as the window offers
 neither for several songs.
+
+`import` copies the files given into the inbox, looks up every item not
+looked up yet (a line per file as it goes), files the Ready ones and scans
+(section 7.2), then prints a line per item: filed, with its destination, or
+left, with its status and reason. It makes no choice where one is needed;
+those files wait for the window or for `autotag`. `--playlist` adds the
+filed songs to that playlist, which must exist. `--dry-run` looks up and
+prints what would be filed, and files nothing. The exit code is 1 when any
+item is left in the inbox, and the command is refused while the window is
+looking songs up (`import.lock`).
 
 `init --force` changes an existing config: the library folders and the
 playlists folder given replace the old ones, `--path-style` when given, and
@@ -1213,6 +1419,38 @@ libadwaita's widgets.
   functions with unit tests. Widget code stays thin.
 - **Playlists folder.** A `gio::FileMonitor` reloads files changed by other
   programs.
+- **Import view** (M9, section 7.2). `import_job` is the worker, without
+  GTK and tested: it owns the autotag process and its own SQLite
+  connection, and looks the items up one at a time in inbox order. Lookups
+  write only `import_items` and do not take the busy flag, so Scan, Sync
+  and Get Info work meanwhile. Filing runs on the same worker and takes it.
+  `view_model` gets the import rows (status, the tags the file would get
+  with the fields that change, destination, candidate labels) and their
+  order (status, then inbox order), and `import_view` stays thin. The
+  sidebar's Import row, under Music, shows the number of items and is
+  hidden while the inbox is empty. A vertical `gtk::Paned` holds the grid,
+  a `ColumnView` like the library's with its own layout in `ui.toml`, and
+  the pane for the selected item:
+  - the candidates as grouped `gtk::CheckButton`s, the one the status
+    takes selected; Use this match stores the selection in `choice`, and
+    asks autotag for the genre when it is not known;
+  - Search again, a popover with artist and title fields, where Enter
+    stores them in `search` and looks the file up again;
+  - Type tags, the Get Info form (`info_dialog`) in a mode where OK checks
+    the values as usual and stores them in `tags` instead of writing files;
+  - the songs it may duplicate, with Show in library, and an Import anyway
+    box that sets `confirmed`;
+  - the destination.
+
+  Changed values are bold in the grid, with the file's value in a
+  tooltip. The bottom bar has a playlist drop-down (none, then the
+  playlists, filtered as in the sidebar) and the Import button with the
+  number of Ready items, disabled at none or while busy. The window takes
+  `gdk::FileList` drops anywhere; Add files… opens `gtk::FileDialog`
+  (`open_multiple`, `select_multiple_folders`). Delete moves the selected
+  items' files to the trash (`gio::File::trash`). The status line shows
+  "Looking up 3 of 12…", and Stop ends the lookups. The report after
+  filing is a dialog like the scan's.
 
 Built in steps: (1) the read-only window: sidebar, grid over the library or a
 playlist (in file order, unresolved entries dimmed), every column sortable
@@ -1323,6 +1561,10 @@ the running one's window to the front.
 | Integration | tag writes | per format: MP3 with ID3v2.2, 2.3 and 2.4, AAC and ALAC m4a, WAV with ID3v2, with only RIFF INFO and with no tag, AIFF; a picture, a comment and an unknown frame keep their bytes; the audio stream is unchanged (`ffmpeg -map 0:a -c copy -f md5`); edited fields read back, others unchanged; the row keeps its id; a failed read-back leaves the original file and no copy; a file changed since the scan is refused. Then a sync on a fake iPod updates the tags without copying, and a second plan is empty. Always on temp copies of fixtures |
 | Bindings | struct layouts, strings, lists | Rust snapshot vs C `snapshot` on the backup `iTunesDB` |
 | Integration | full sync on a fake iPod | `itdb_init_ipod` into a temp dir with a `SysInfo` containing a `FirewireGuid`, small audio fixtures generated with ffmpeg. With no model in `SysInfo`, libgpod writes an unsigned database, as on the Video; tests of signing and artwork add a Classic model number |
+| Unit | import status | table-driven over rows, candidates and index tracks: every status, the 10-second rule, typed tags over a choice over the first candidate, a hash equal to a missing track's is no duplicate, an accepted duplicate is Ready |
+| Integration | import | a fake autotag (a Python script using only the standard library, answering canned JSON lines, named in `[import] autotag`) with ffmpeg fixtures in a temp inbox and library: lookups stored and kept across a reopen; a changed file looked up again; Ready items filed, scanned, added to a playlist, their rows dropped; a refusal, a read-back difference and an absent root reported; Stop between files; another protocol version refused; `import.lock` refuses a second process |
+| autotag | `tools/tests`, pytest run through `uv` | MusicBrainz and AcoustID answers recorded as JSON, no network: candidate ranking, the 10-second rule, the destination layout (cuts at 40 and 36 characters, Compilations, folders reused across case and Unicode form), refusals, the original never written by `apply`. Per format (MP3, AAC and ALAC m4a, WAV, AIFF): tags read back with mutagen and `ffprobe`, the audio stream unchanged (`ffmpeg -map 0:a -c copy -f md5`), other frames and atoms kept |
+| Contract | autotag protocol | `tools/tests/protocol/*.jsonl`, requests and answers: autotag's tests check its answers against them and iprune's tests parse them, so a change on one side fails the other's tests |
 | Regression | playlist doubling | sync the same plan twice; the second plan must be empty and the snapshot unchanged |
 | Real data, read only | adoption on 9,669 tracks | `adopt --file` on the backup, compare match counts between versions |
 | Device | first write | playlists-only sync on the real iPod after a manual backup, then `snapshot` diff |
@@ -1348,6 +1590,23 @@ mountpoint set too; the installed binaries are not affected.
 | M6 | desktop UI (GTK4) | yes |
 | M7 | desktop entry, notifications, packaging | yes |
 | M8 | tag editing: `tag_edit`, `iprune tag`, the Get Info form | no (writes library files) |
+| M9 | import: autotag's `serve` mode and formats, `import`, `iprune import`, the Import view | no (adds library files) |
+
+M9 is built in four steps, each with Aldo's tests and Vera's review before
+its commit:
+
+1. autotag alone: m4a, WAV and AIFF, composer and compilation, `apply`
+   writing on the copy it files, the `serve` mode, its tests and the
+   protocol files. Its command line keeps working as before.
+2. `iprune-core` and the CLI: `[import]` in the config, migration 0009,
+   `import` (inbox, state, `status`, autotag client, filing, `import.lock`),
+   `iprune import`. Tested with the fake autotag.
+3. The window, in three parts: the Import view with its lookups and
+   statuses, read-only; then the choices (candidates, Search again, Type
+   tags, accepting a duplicate); then filing, the report, drops, Add files
+   and Delete.
+4. `install.sh` copies `tools/autotag` next to the binaries, and
+   `--uninstall` removes it. The link at `~/Music/autotag` stays.
 
 M4 comes before M5 on purpose. Playlist writes are the operation that failed
 with Rhythmbox, the tracks are already on the iPod, and a playlist-only sync
@@ -1364,4 +1623,8 @@ can be checked against the backup with the existing C tools.
 | Artwork database corruption | iprune adds and edits no artwork, but libgpod rewrites `ArtworkDB` and the `.ithmb` files on every write; both are backed up together and restored together, and a write is refused when the artwork could not be read |
 | Losing play counts | pulled and committed before any write, exported to CSV |
 | A tag write damages a library file or drops frames | iprune's own writers change only the edited frames or atoms and copy every other byte; the new file is read back before it replaces the original; tests compare every other frame and the audio stream, and a trial on copies of 729 real files found no other change (section 7.1) |
+| MusicBrainz or AcoustID down, slow, or rate-limiting | one autotag process paces the requests; a failure is kept per file and retried by Look up again; nothing is written before Import |
+| autotag and iprune disagree on the protocol | the protocol version in autotag's first line; protocol files tested on both sides; both in one repository |
+| mutagen damages a file or drops frames during an import | it writes only a copy, before it enters the library, and the inbox file is deleted only after the rename; autotag's tests check the audio stream and the other frames per format; iprune reads the twelve fields back after filing |
+| `uv` missing, or unable to fetch mutagen on first use | autotag does not start: its stderr is shown, the items stay Looking up, and nothing is written |
 | FairPlay files (one in the library, "Bailemos") may not play on an iPod that is not authorised for that Apple account | the planner skips unmapped ones and leaves mapped ones in place; M5 decides whether copying them is worth offering |
