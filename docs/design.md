@@ -41,7 +41,7 @@ predictable is worse than no sync tool.**
 ## 3. Goals
 
 1. Point at one or more local music folders and index them.
-2. Create, edit, reorder, rename and delete playlists.
+2. Create, edit, reorder, rename, duplicate and delete playlists.
 3. Sync tracks and playlists to each iPod, one way, library to device. Each
    iPod has its own selection of the library.
 4. Show exactly what a sync will do before it does it, and verify afterwards
@@ -143,13 +143,17 @@ library files, so the first sync updates the device instead of refilling it.
 ### 7.2 Editing playlists
 
 In the window: pick a playlist, search the library, add tracks, reorder
-them, remove them, rename or delete the playlist. Each change is written to
-the `.m3u8` file straight away. Changes made to those files by another program
+them, remove them, rename, duplicate or delete the playlist. A duplicate
+is a copy of the file named after the playlist with `-COPY-1` added, then
+`-COPY-2` and so on: the number is one more than the highest copy of that
+playlist, and duplicating a copy numbers it with the others. Each change is
+written to the `.m3u8` file straight away. Changes made to those files by another program
 are picked up on the next scan, or at once while the window is open (it
 watches the playlists folder).
 
 From the command line, for scripts:
-`iprune playlist add "80s" <path>...`, `iprune playlist new`, `rm`, `rename`.
+`iprune playlist add "80s" <path>...`, `iprune playlist new`, `rm`, `rename`,
+`duplicate`.
 
 ### 7.3 Syncing
 
@@ -299,7 +303,7 @@ theme Omarchy sets.
   (a list of the playlists with a filter field), Show in playlist (the same list, of the other playlists
   holding the song clicked; picking one shows it with the song selected,
   as in iTunes), Remove from playlist and Show in folder. Playlists are
-  created, renamed and deleted from the sidebar, and a filter field above
+  created, renamed, duplicated and deleted from the sidebar, and a filter field above
   it narrows the playlists shown as you type. Each
   change is written to the `.m3u8` file at once. Sorting a playlist by
   another column changes only the view, never the file, until Save Order

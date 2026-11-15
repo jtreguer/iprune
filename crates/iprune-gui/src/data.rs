@@ -232,6 +232,12 @@ impl Data {
         )?)
     }
 
+    /// Copies the playlist to a new one named `<name>-COPY-<n>`, see
+    /// `playlists::duplicate`. Returns the new name.
+    pub fn duplicate(&self, name: &str) -> Result<String> {
+        Ok(playlists::duplicate(self.store.conn(), &self.config, name)?)
+    }
+
     /// Deletes the playlist file. One mapped to the iPod stays as a
     /// tombstone until the next sync deletes it there.
     pub fn delete(&self, name: &str) -> Result<()> {

@@ -784,6 +784,14 @@ impl Layouts {
         }
     }
 
+    /// A duplicate is shown sorted as the playlist it copies.
+    pub fn copy_playlist_sort(&mut self, from: &str, to: &str) {
+        match self.sorts.get(from).cloned() {
+            Some(s) => self.sorts.insert(to.to_owned(), s),
+            None => self.sorts.remove(to),
+        };
+    }
+
     /// A deleted or new playlist has no sort of its own.
     pub fn forget_playlist_sort(&mut self, name: &str) {
         self.sorts.remove(name);

@@ -1280,7 +1280,7 @@ iprune init --library DIR... --playlists DIR [--path-style S] [--force]
 iprune scan
 iprune adopt [--file <iTunesDB>] [--accept-proposals]
 iprune sync [--plan-only] [--verbose] [--json] [--yes] [--allow-mass-removal]
-iprune playlist list|show|new|rm|rename|add|remove|move ...
+iprune playlist list|show|new|rm|rename|duplicate|add|remove|move ...
 iprune tag PATH... [--title T] [--artist A] [--album-artist A] [--album A]
            [--composer C] [--genre G] [--year N] [--track N] [--track-total N]
            [--disc N] [--disc-total N] [--compilation yes|no]
@@ -1524,8 +1524,12 @@ confirmation (`playlists::set_order`, a whole rearrangement checked to name
 each position once, one write), Delete removes the selected entries, a
 context menu offers Remove from Playlist and Show
 in Folder, and playlists are created (Ctrl+N or the + button), renamed (F2
-or the sidebar's context menu) and deleted (context menu, with
-confirmation). A `gio::FileMonitor` on the playlists folder reloads changes
+or the sidebar's context menu), duplicated (context menu) and deleted
+(context menu, with confirmation). Duplicate (`playlists::duplicate`)
+copies the file byte for byte to a new one, created without replacing
+anything, named by `duplicate_name` from the playlist files in the folder
+(a name taken meanwhile moves on to the next number), indexes it, shows it
+and gives it the original's sort. A `gio::FileMonitor` on the playlists folder reloads changes
 made by other programs, the CLI included, by comparing the file on screen
 with its modification time when it was read. The column order, widths and
 visibility are saved in `~/.local/state/iprune/ui.toml`, one layout for the

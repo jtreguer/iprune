@@ -886,3 +886,33 @@ fn scan_output_is_byte_for_byte_the_report_format() {
         "report on stderr"
     );
 }
+
+#[test]
+fn playlist_duplicate_prints_the_new_name_and_copies_the_file() {
+    let sb = Sandbox::new();
+    sb.init();
+    let a = sb.add_track("a.mp3", Kind::Mp3, 1);
+    assert_ok(&sb.run(&["scan"]));
+    assert_ok(&sb.run(&["playlist", "new", "mix"]));
+    assert_ok(&sb.run(&["playlist", "add", "mix", s(&a)]));
+    let bytes = fs::read(sb.playlist_file("mix")).unwrap();
+
+    let o = sb.run(&["playlist", "duplicate", "mix"]);
+    assert_ok(&o);
+    assert_eq!(out(&o), "mix-COPY-1\n");
+    assert_eq!(fs::read(sb.playlist_file("mix-COPY-1")).unwrap(), bytes);
+
+    let o = sb.run(&["playlist", "duplicate", "mix-COPY-1"]);
+    assert_ok(&o);
+    assert_eq!(out(&o), "mix-COPY-2\n");
+    assert_eq!(sb.locations("mix-COPY-2"), [s(&a)]);
+    let list = out(&sb.run(&["playlist", "list"]));
+    assert!(list.contains("mix-COPY-2"), "{list}");
+
+    // unknown playlist: exit 1, nothing on stdout, nothing written
+    let o = sb.run(&["playlist", "duplicate", "nosuch"]);
+    assert_fails(&o, 1);
+    assert!(out(&o).is_empty(), "{}", out(&o));
+    assert!(!err(&o).is_empty());
+    assert_eq!(fs::read_dir(&sb.lists).unwrap().count(), 3);
+}

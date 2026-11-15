@@ -2417,6 +2417,42 @@ fn rename_playlist_sort_moves_the_entry_and_drops_a_stale_target() {
 }
 
 #[test]
+fn copy_playlist_sort_gives_the_copy_the_sort_and_keeps_the_original() {
+    let mut l = sorted(&[("orig", Column::Name, true), ("keep", Column::Genre, true)]);
+    l.copy_playlist_sort("orig", "copy");
+    assert_eq!(l.playlist_sort("copy"), (Column::Name, true));
+    assert_eq!(l.playlist_sort("orig"), (Column::Name, true), "kept");
+    assert_eq!(l.playlist_sort("keep"), (Column::Genre, true));
+
+    // it replaces a stale sort under the new name
+    let mut l = sorted(&[("orig", Column::Name, true), ("copy", Column::Year, false)]);
+    l.copy_playlist_sort("orig", "copy");
+    assert_eq!(l.playlist_sort("copy"), (Column::Name, true));
+}
+
+#[test]
+fn copy_playlist_sort_without_an_original_sort_drops_a_stale_target() {
+    let mut l = sorted(&[
+        ("stale", Column::Year, false),
+        ("keep", Column::Genre, true),
+    ]);
+    l.copy_playlist_sort("unsorted", "stale");
+    assert_eq!(l.sorts.keys().collect::<Vec<_>>(), ["keep"]);
+    assert_eq!(l.playlist_sort("stale"), (Column::Position, false));
+}
+
+#[test]
+fn copy_playlist_sort_onto_itself_does_nothing() {
+    let mut l = sorted(&[("same", Column::Name, true)]);
+    let before = l.clone();
+    l.copy_playlist_sort("same", "same");
+    assert_eq!(l, before);
+    let mut l = Layouts::default();
+    l.copy_playlist_sort("none", "none");
+    assert_eq!(l, Layouts::default());
+}
+
+#[test]
 fn forget_playlist_sort_removes_only_that_entry() {
     let mut l = sorted(&[("a", Column::Name, true), ("b", Column::Year, false)]);
     l.forget_playlist_sort("a");

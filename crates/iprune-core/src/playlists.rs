@@ -348,6 +348,76 @@ pub fn delete(conn: &Connection, cfg: &Config, name: &str) -> Result<()> {
     store::delete_playlist(conn, name)
 }
 
+/// What a duplicate's name ends with, before its number.
+const COPY: &str = "-COPY-";
+
+/// `name` split into its base and the number of a `-COPY-<n>` ending, if it
+/// has one. Pure.
+fn copy_number(name: &str) -> (&str, Option<u64>) {
+    if let Some(i) = name.rfind(COPY) {
+        let digits = &name[i + COPY.len()..];
+        // `parse` alone would take a leading '+'.
+        if !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(n) = digits.parse()
+        {
+            return (&name[..i], Some(n));
+        }
+    }
+    (name, None)
+}
+
+/// The name of the next copy of playlist `name`: its base (the name without
+/// a `-COPY-<n>` ending) followed by `-COPY-<n>`, with n one more than the
+/// highest among the `existing` copies of that base, or 1. Copying a copy
+/// numbers it with the others. Pure.
+pub fn duplicate_name<'a>(name: &str, existing: impl IntoIterator<Item = &'a str>) -> String {
+    let base = copy_number(name).0;
+    let last = existing
+        .into_iter()
+        .filter_map(|e| match copy_number(e) {
+            (b, Some(n)) if b == base => Some(n),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    // At u64::MAX the name repeats, and `duplicate` refuses it as taken.
+    format!("{base}{COPY}{}", last.saturating_add(1))
+}
+
+/// Copies playlist `name`, byte for byte, to a new playlist named by
+/// [`duplicate_name`] after the playlist files in the folder, and indexes
+/// it. Returns the new name. Never replaces a file: a name taken meanwhile
+/// (or differing only in case, on a folder that ignores case) moves on to
+/// the next number.
+pub fn duplicate(conn: &Connection, cfg: &Config, name: &str) -> Result<String> {
+    let from = existing_file(cfg, name)?;
+    let bytes = std::fs::read(&from).at(&from)?;
+    let text = String::from_utf8(bytes).map_err(|_| Error::NotUtf8(from.clone()))?;
+    let mut taken: Vec<String> = playlist_files(&cfg.playlists.dir)?
+        .files
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let mut new = String::new();
+    for _ in 0..100 {
+        new = duplicate_name(name, taken.iter().map(String::as_str));
+        let to = file_for(cfg, &new)?;
+        match playlist::write_atomic(&to, &text, WriteMode::CreateNew) {
+            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                taken.push(new.clone());
+            }
+            Err(e) => return Err(e),
+            Ok(()) => {
+                let items = resolve(conn, cfg, playlist::read(&to)?)?;
+                store_items(conn, &new, &to, &items)?;
+                return Ok(new);
+            }
+        }
+    }
+    Err(Error::PlaylistExists(new))
+}
+
 pub fn rename(conn: &Connection, cfg: &Config, old: &str, new: &str) -> Result<()> {
     let from = existing_file(cfg, old)?;
     let to = file_for(cfg, new)?;

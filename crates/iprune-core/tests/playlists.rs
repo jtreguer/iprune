@@ -1483,3 +1483,208 @@ fn set_order_leaves_the_other_lines_where_they_are() {
     ];
     assert_eq!(without_extinf(&env.read_playlist("so")), want);
 }
+
+// Prevents: a wrong copy number or base: reusing a number, refilling gaps,
+// taking "-COPY-+3" or "-COPY-1a" for copies, or counting another base.
+#[test]
+fn duplicate_name_table() {
+    let cases: &[(&str, &[&str], &str)] = &[
+        ("Foo", &[], "Foo-COPY-1"),
+        ("Foo", &["Foo"], "Foo-COPY-1"),
+        ("Foo", &["Foo", "Foo-COPY-1"], "Foo-COPY-2"),
+        // a copy is numbered with the others
+        (
+            "Foo-COPY-1",
+            &["Foo", "Foo-COPY-1", "Foo-COPY-2"],
+            "Foo-COPY-3",
+        ),
+        // gaps are not refilled: max + 1
+        ("Foo", &["Foo-COPY-1", "Foo-COPY-5"], "Foo-COPY-6"),
+        ("Foo", &["Foo-COPY-9", "Foo-COPY-10"], "Foo-COPY-11"),
+        ("Foo", &["Foo-COPY-007"], "Foo-COPY-8"),
+        // other bases do not count
+        (
+            "Foo",
+            &["Bar-COPY-9", "Foobar-COPY-4", "FooBar-COPY-2"],
+            "Foo-COPY-1",
+        ),
+        ("Foo", &["Foo-COPY-1-COPY-4"], "Foo-COPY-1"),
+        // not copies
+        (
+            "Foo",
+            &[
+                "Foo-COPY-",
+                "Foo-COPY-+3",
+                "Foo-COPY-1a",
+                "Foo-copy-7",
+                "Foo-COPY--2",
+            ],
+            "Foo-COPY-1",
+        ),
+        // a name that merely looks like a copy is not stripped
+        ("Foo-COPY-", &["Foo-COPY--COPY-3"], "Foo-COPY--COPY-4"),
+        ("Foo-COPY-+3", &[], "Foo-COPY-+3-COPY-1"),
+        ("Foo-COPY-1a", &["Foo-COPY-1a-COPY-1"], "Foo-COPY-1a-COPY-2"),
+        ("Foo-copy-1", &[], "Foo-copy-1-COPY-1"),
+        // only the last suffix is taken off
+        (
+            "Foo-COPY-1-COPY-1",
+            &["Foo-COPY-1-COPY-2"],
+            "Foo-COPY-1-COPY-3",
+        ),
+        ("Foo-COPY-1-COPY-1", &["Foo-COPY-3"], "Foo-COPY-1-COPY-1"),
+        // a number too large for u64 is not a copy number
+        ("Foo", &["Foo-COPY-99999999999999999999"], "Foo-COPY-1"),
+        ("Foo", &["Foo-COPY-4294967296"], "Foo-COPY-4294967297"),
+        // the largest one: the next name is the same, refused as taken
+        (
+            "Foo",
+            &["Foo-COPY-18446744073709551615"],
+            "Foo-COPY-18446744073709551615",
+        ),
+    ];
+    for (name, existing, want) in cases {
+        let got = playlists::duplicate_name(name, existing.iter().copied());
+        assert_eq!(&got, want, "{name:?} with {existing:?}");
+    }
+}
+
+#[test]
+fn duplicate_copies_the_bytes_and_indexes_a_new_playlist() {
+    let (env, t) = env3();
+    let conn = env.store.conn();
+    // BOM, CRLF, a comment, a blank line and an unresolved entry, all kept.
+    let text = format!(
+        "\u{feff}#EXTM3U\r\n# my note\r\n\r\n{}\r\n/gone/missing.mp3\r\n{}\r\n",
+        s(&t[1]),
+        s(&t[0])
+    );
+    env.write_playlist("Mix", &text);
+    playlists::sync_from_disk(conn, &env.cfg, true).unwrap();
+    let before = fs::read(env.playlist_file("Mix")).unwrap();
+    let id = env.playlist_id("Mix").unwrap();
+
+    let new = playlists::duplicate(conn, &env.cfg, "Mix").unwrap();
+
+    assert_eq!(new, "Mix-COPY-1");
+    assert_eq!(fs::read(env.playlist_file(&new)).unwrap(), before);
+    assert_eq!(fs::read(env.playlist_file("Mix")).unwrap(), before);
+    let new_id = env.playlist_id(&new).expect("copy is indexed");
+    assert_ne!(new_id, id);
+    assert_eq!(env.playlist_id("Mix"), Some(id));
+    let items = env.indexed_items(&new);
+    assert_eq!(items.len(), 3, "{items:?}");
+    assert_eq!(items[0].2, s(&t[1]));
+    assert_eq!(items[1].1, None, "the unresolved entry stays unresolved");
+    assert_eq!(items[2].2, s(&t[0]));
+}
+
+#[test]
+fn duplicating_repeatedly_numbers_up_and_copying_a_copy_joins_the_series() {
+    let (env, _) = env3();
+    let conn = env.store.conn();
+    playlists::create(conn, &env.cfg, "Foo").unwrap();
+    assert_eq!(
+        playlists::duplicate(conn, &env.cfg, "Foo").unwrap(),
+        "Foo-COPY-1"
+    );
+    assert_eq!(
+        playlists::duplicate(conn, &env.cfg, "Foo").unwrap(),
+        "Foo-COPY-2"
+    );
+    assert_eq!(
+        playlists::duplicate(conn, &env.cfg, "Foo-COPY-1").unwrap(),
+        "Foo-COPY-3"
+    );
+    // a gap is not refilled
+    fs::remove_file(env.playlist_file("Foo-COPY-2")).unwrap();
+    assert_eq!(
+        playlists::duplicate(conn, &env.cfg, "Foo").unwrap(),
+        "Foo-COPY-4"
+    );
+    for n in ["Foo", "Foo-COPY-1", "Foo-COPY-3", "Foo-COPY-4"] {
+        assert!(env.playlist_file(n).is_file(), "{n}");
+    }
+}
+
+// Prevents: numbering from the index instead of the folder: a file that was
+// never indexed (no scan yet) would be overwritten or collide.
+#[test]
+fn duplicate_numbers_from_the_files_on_disk_not_the_index() {
+    let (env, _) = env3();
+    let conn = env.store.conn();
+    playlists::create(conn, &env.cfg, "Foo").unwrap();
+    env.write_playlist("Foo-COPY-1", "#EXTM3U\nkeep me\n");
+    assert!(env.playlist_id("Foo-COPY-1").is_none());
+
+    let new = playlists::duplicate(conn, &env.cfg, "Foo").unwrap();
+
+    assert_eq!(new, "Foo-COPY-2");
+    assert_eq!(env.read_playlist("Foo-COPY-1"), "#EXTM3U\nkeep me\n");
+}
+
+// Prevents: replacing a file that appeared where the copy goes. A dangling
+// link is not listed, so the first name tried is taken.
+#[test]
+fn duplicate_moves_on_when_the_name_is_taken_and_never_replaces_it() {
+    let (env, _) = env3();
+    let conn = env.store.conn();
+    playlists::create(conn, &env.cfg, "Foo").unwrap();
+    let blocker = env.playlist_file("Foo-COPY-1");
+    std::os::unix::fs::symlink(env.lists.join("nowhere"), &blocker).unwrap();
+
+    let new = playlists::duplicate(conn, &env.cfg, "Foo").unwrap();
+
+    assert_eq!(new, "Foo-COPY-2");
+    assert!(
+        fs::symlink_metadata(&blocker).unwrap().is_symlink(),
+        "the blocking entry is untouched"
+    );
+    assert!(env.playlist_file("Foo-COPY-2").is_file());
+    assert!(env.playlist_id("Foo-COPY-1").is_none());
+}
+
+#[test]
+fn duplicate_gives_up_after_a_hundred_taken_names_and_replaces_nothing() {
+    let (env, _) = env3();
+    let conn = env.store.conn();
+    playlists::create(conn, &env.cfg, "Foo").unwrap();
+    for n in 1..=100 {
+        std::os::unix::fs::symlink(
+            env.lists.join("nowhere"),
+            env.playlist_file(&format!("Foo-COPY-{n}")),
+        )
+        .unwrap();
+    }
+    let err = playlists::duplicate(conn, &env.cfg, "Foo").unwrap_err();
+    assert!(matches!(err, Error::PlaylistExists(_)), "{err:?}");
+    assert!(!env.playlist_file("Foo-COPY-101").exists());
+    assert_eq!(fs::read_dir(&env.lists).unwrap().count(), 101);
+    assert_eq!(env.playlist_id("Foo-COPY-1"), None);
+}
+
+#[test]
+fn duplicating_an_unknown_playlist_fails_and_writes_nothing() {
+    let (env, _) = env3();
+    let conn = env.store.conn();
+    playlists::create(conn, &env.cfg, "Foo").unwrap();
+    let err = playlists::duplicate(conn, &env.cfg, "nope").unwrap_err();
+    assert!(
+        matches!(err, Error::NoSuchPlaylist(ref n) if n == "nope"),
+        "{err:?}"
+    );
+    let err = playlists::duplicate(conn, &env.cfg, "bad/name").unwrap_err();
+    assert!(matches!(err, Error::InvalidName(..)), "{err:?}");
+    assert_eq!(fs::read_dir(&env.lists).unwrap().count(), 1);
+}
+
+#[test]
+fn duplicating_a_non_utf8_playlist_fails_and_writes_nothing() {
+    let (env, _) = env3();
+    let conn = env.store.conn();
+    fs::write(env.playlist_file("Latin"), b"#EXTM3U\n/music/caf\xe9.mp3\n").unwrap();
+    let err = playlists::duplicate(conn, &env.cfg, "Latin").unwrap_err();
+    assert!(matches!(err, Error::NotUtf8(_)), "{err:?}");
+    assert_eq!(fs::read_dir(&env.lists).unwrap().count(), 1);
+    assert_eq!(env.playlist_id("Latin-COPY-1"), None);
+}

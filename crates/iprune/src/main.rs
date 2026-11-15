@@ -241,6 +241,8 @@ enum PlaylistCommand {
     },
     /// Rename a playlist.
     Rename { old: String, new: String },
+    /// Copy a playlist to NAME-COPY-N, the next free N; prints the new name.
+    Duplicate { name: String },
     /// Add library files to a playlist.
     Add {
         name: String,
@@ -1078,6 +1080,10 @@ fn playlist(cmd: &PlaylistCommand) -> Result<Outcome> {
             playlists::delete(conn, &config, name)?;
         }
         PlaylistCommand::Rename { old, new } => playlists::rename(conn, &config, old, new)?,
+        PlaylistCommand::Duplicate { name } => {
+            let new = playlists::duplicate(conn, &config, name)?;
+            writeln!(out, "{new}")?;
+        }
         PlaylistCommand::Add { name, files, at } => {
             playlists::add(conn, &config, name, files, *at)?
         }

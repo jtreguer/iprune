@@ -478,6 +478,26 @@ fn rename_moves_the_file_and_keeps_the_entries() {
 }
 
 #[test]
+fn duplicate_copies_the_playlist_and_shows_it_next_to_the_original() {
+    let sb = sandbox(3);
+    sb.data.create("mix").unwrap();
+    sb.data.add("mix", &sb.pick(&[2, 0]), None).unwrap();
+    let text = sb.text("mix");
+
+    let new = sb.data.duplicate("mix").unwrap();
+    assert_eq!(new, "mix-COPY-1");
+    assert_eq!(sb.text(&new), text);
+    assert_eq!(sb.text("mix"), text);
+    assert_eq!(sb.shown(&new), sb.pick(&[2, 0]));
+    assert_eq!(sb.data.playlist_names().unwrap(), ["mix", "mix-COPY-1"]);
+    assert_eq!(sb.data.duplicate(&new).unwrap(), "mix-COPY-2");
+
+    let before = sb.data.playlist_names().unwrap();
+    assert!(sb.data.duplicate("ghost").is_err());
+    assert_eq!(sb.data.playlist_names().unwrap(), before);
+}
+
+#[test]
 fn delete_removes_the_file_and_the_listing_but_not_the_tracks() {
     let sb = sandbox(2);
     sb.data.create("keep").unwrap();

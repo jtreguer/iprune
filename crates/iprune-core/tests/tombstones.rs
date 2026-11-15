@@ -487,3 +487,43 @@ fn mappings_round_trip_through_json_with_full_range_dbids() {
     let back: PlaylistMapping = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
     assert_eq!(back, p);
 }
+
+// Prevents: a copy landing on a deleted, iPod-mapped playlist's name failing
+// on the unique name, or dropping its mapping instead of reviving it.
+#[test]
+fn duplicating_onto_a_tombstone_revives_it_with_the_copied_members() {
+    let (env, id, dev) = mapped_mix();
+    let conn = env.store.conn();
+    let other = env.playlist_id("other").unwrap();
+    playlists::duplicate(conn, &env.cfg, "mix").unwrap();
+    playlists::delete(conn, &env.cfg, "mix-COPY-1").unwrap();
+    // "mix-COPY-1" was never mapped: nothing is kept for it
+    assert!(store::removed_playlists(conn).unwrap().is_empty());
+
+    // Map the copy, delete it (tombstone), then duplicate "mix" again.
+    let again = playlists::duplicate(conn, &env.cfg, "mix").unwrap();
+    assert_eq!(again, "mix-COPY-1");
+    let copy_id = env.playlist_id(&again).unwrap();
+    devices::replace_mappings(
+        conn,
+        dev,
+        &[],
+        &[pm(id, 0x77, "Mix"), pm(copy_id, 0x78, "Copy")],
+    )
+    .unwrap();
+    playlists::delete(conn, &env.cfg, &again).unwrap();
+    assert_eq!(
+        store::removed_playlists(conn).unwrap(),
+        vec![(copy_id, again.clone())]
+    );
+
+    let revived = playlists::duplicate(conn, &env.cfg, "mix").unwrap();
+
+    assert_eq!(revived, again);
+    assert_eq!(env.playlist_id(&revived), Some(copy_id));
+    assert_ne!(copy_id, id);
+    assert_ne!(copy_id, other);
+    assert!(store::removed_playlists(conn).unwrap().is_empty());
+    assert_eq!(devices::playlist_mappings(conn, dev).unwrap().len(), 2);
+    assert_eq!(env.indexed_items(&revived).len(), 1);
+}

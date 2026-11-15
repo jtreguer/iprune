@@ -2265,6 +2265,19 @@ impl Ui {
         );
     }
 
+    /// Copies the playlist and shows the copy, sorted as the original.
+    fn duplicate_playlist(self: &Rc<Self>, name: String) {
+        match self.data.duplicate(&name) {
+            Ok(new) => {
+                self.layouts.borrow_mut().copy_playlist_sort(&name, &new);
+                self.save_layouts();
+                *self.current.borrow_mut() = Source::Playlist(new);
+                self.fill_sidebar();
+            }
+            Err(e) => self.show_error("The playlist was not duplicated", &e),
+        }
+    }
+
     fn delete_playlist(self: &Rc<Self>, name: String) {
         let dialog = gtk::AlertDialog::builder()
             .message(format!("Delete the playlist {name:?}?"))
@@ -2874,6 +2887,11 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
             ui.rename_playlist(name);
         }
     });
+    action(window, "duplicate-clicked", &ui, |ui| {
+        if let Some(name) = ui.context_playlist.take() {
+            ui.duplicate_playlist(name);
+        }
+    });
     action(window, "delete-clicked", &ui, |ui| {
         if let Some(name) = ui.context_playlist.take() {
             ui.delete_playlist(name);
@@ -3056,9 +3074,10 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     }
     window.add_controller(window_keys);
 
-    // Sidebar context menu on a playlist: rename or delete it.
+    // Sidebar context menu on a playlist: rename, duplicate or delete it.
     let side_menu = gio::Menu::new();
     side_menu.append(Some("Rename…"), Some("win.rename-clicked"));
+    side_menu.append(Some("Duplicate"), Some("win.duplicate-clicked"));
     side_menu.append(Some("Delete…"), Some("win.delete-clicked"));
     {
         let weak = Rc::downgrade(&ui);
