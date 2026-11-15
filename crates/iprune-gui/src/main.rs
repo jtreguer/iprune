@@ -671,6 +671,26 @@ impl Ui {
         }
     }
 
+    /// Before an edit by positions chosen in the file read at `seen`
+    /// (`shown_mtime` then): true when playlist `name` is still on screen,
+    /// its file unchanged since shown (see `ensure_fresh`), and that is
+    /// still the file read at `seen`. A reload while a dialog was open
+    /// shows the new file, and positions chosen before would land on other
+    /// entries.
+    fn still_as_seen(&self, name: &str, seen: Option<i64>) -> bool {
+        if self.playlist_name().as_deref() != Some(name) || !self.ensure_fresh(name) {
+            return false;
+        }
+        if self.shown_mtime.get() != seen {
+            self.status.set_text(
+                "The playlist changed on disk while you were asked and is shown again; \
+                 nothing was changed",
+            );
+            return false;
+        }
+        true
+    }
+
     /// Every playlist position, those a search hides included, in the order
     /// the grid's sort gives them. None outside a playlist.
     fn shown_order(&self) -> Option<Vec<usize>> {
@@ -789,16 +809,7 @@ impl Ui {
     /// entries selected. `seen` is the modification time of the file the
     /// move was made on.
     fn write_move(&self, name: &str, order: &[usize], moved: &[usize], seen: Option<i64>) {
-        // Another playlist may be on screen by the time a dialog closed, or
-        // the file changed: the positions would land on other entries.
-        if self.playlist_name().as_deref() != Some(name) || !self.ensure_fresh(name) {
-            return;
-        }
-        if self.shown_mtime.get() != seen {
-            self.status.set_text(
-                "The playlist changed on disk while you were asked and is shown again; \
-                 nothing was changed",
-            );
+        if !self.still_as_seen(name, seen) {
             return;
         }
         let sorted_otherwise = !self.sorted_by_position();
@@ -849,9 +860,11 @@ impl Ui {
             return;
         };
         let positions = self.selected_positions();
+        // The file the rows were chosen in, see `still_as_seen`.
+        let seen = self.shown_mtime.get();
         match positions.len() {
             0 => {}
-            1 => self.remove_entries(&name, &positions),
+            1 => self.remove_entries(&name, &positions, seen),
             n => {
                 let dialog = gtk::AlertDialog::builder()
                     .message(format!("Remove {n} entries from {name:?}?"))
@@ -864,15 +877,17 @@ impl Ui {
                 let ui = Rc::downgrade(self);
                 dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |answer| {
                     if let (Some(ui), Ok(1)) = (ui.upgrade(), answer) {
-                        ui.remove_entries(&name, &positions);
+                        ui.remove_entries(&name, &positions, seen);
                     }
                 });
             }
         }
     }
 
-    fn remove_entries(&self, name: &str, positions: &[usize]) {
-        if !self.ensure_fresh(name) {
+    /// Removes the entries at `positions`, chosen in the file read at
+    /// `seen`.
+    fn remove_entries(&self, name: &str, positions: &[usize], seen: Option<i64>) {
+        if !self.still_as_seen(name, seen) {
             return;
         }
         let first = *positions.iter().min().expect("not empty");
