@@ -277,7 +277,30 @@ pub struct Autotag {
     stderr: Arc<Mutex<VecDeque<String>>>,
     next_id: u64,
     pub hello: Hello,
+    /// autotag's process group, until the process is reaped: shared with
+    /// every [`Killer`], and taken under its lock both to kill and to reap,
+    /// so a killer never signals an id that may name another process.
+    group: Arc<Mutex<Option<rustix::process::Pid>>>,
     _lock: ImportLock,
+}
+
+/// Kills an autotag process from another thread: what Stop does in the
+/// window when a lookup does not end by itself. Once the process is
+/// reaped, it does nothing, so one kept too long is harmless.
+#[derive(Debug, Clone)]
+pub struct Killer {
+    group: Arc<Mutex<Option<rustix::process::Pid>>>,
+}
+
+impl Killer {
+    /// Kills autotag's process group (`uv run` keeps python as its child).
+    /// The request it was on then fails with an [`Error::Autotag`].
+    pub fn kill(&self) {
+        let group = self.group.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(group) = *group {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+    }
 }
 
 /// A program just written can still be open for writing in a child another
@@ -342,8 +365,13 @@ impl Autotag {
             stderr: tail,
             next_id: 1,
             hello: Hello::default(),
+            group: Arc::new(Mutex::new(None)),
             _lock: lock,
         };
+        *autotag.group.lock().unwrap_or_else(|e| e.into_inner()) =
+            i32::try_from(autotag.child.id())
+                .ok()
+                .and_then(rustix::process::Pid::from_raw);
         let first = autotag.read_answer()?;
         let hello: Hello = serde_json::from_value(first.clone())
             .map_err(|_| Error::Autotag(format!("unexpected first line: {first}")))?;
@@ -359,6 +387,26 @@ impl Autotag {
         Ok(autotag)
     }
 
+    /// A handle that kills this process from another thread.
+    pub fn killer(&self) -> Killer {
+        Killer {
+            group: Arc::clone(&self.group),
+        }
+    }
+
+    /// Reaps the process if it has ended, under the killers' lock: once
+    /// reaped, its id is forgotten, before anyone can signal it.
+    fn try_reap(&mut self) -> Option<std::process::ExitStatus> {
+        let mut group = self.group.lock().unwrap_or_else(|e| e.into_inner());
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                *group = None;
+                Some(status)
+            }
+            _ => None,
+        }
+    }
+
     /// What autotag wrote to stderr lately, for an error message.
     fn stderr_tail(&self) -> String {
         // Its last lines may still be on their way.
@@ -369,9 +417,9 @@ impl Autotag {
 
     /// autotag is gone or broke the protocol: the error, with its stderr.
     fn failed(&mut self, what: String) -> Error {
-        let status = match self.child.try_wait() {
-            Ok(Some(s)) => format!(" ({s})"),
-            _ => String::new(),
+        let status = match self.try_reap() {
+            Some(s) => format!(" ({s})"),
+            None => String::new(),
         };
         let tail = self.stderr_tail();
         let tail = if tail.is_empty() {
@@ -388,7 +436,7 @@ impl Autotag {
             Ok(0) => {
                 // Gone: wait for its status, briefly.
                 let deadline = Instant::now() + GRACE;
-                while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+                while self.try_reap().is_none() && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(self.failed("stopped".into()))
@@ -506,28 +554,21 @@ impl Drop for Autotag {
         // End of input: autotag finishes the request it is on, then exits.
         self.stdin.take();
         let deadline = Instant::now() + GRACE;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20))
-                }
-                _ => {
-                    // The whole group: `uv run` keeps python as its child.
-                    // autotag leads its own group (`process_group(0)`).
-                    if let Some(pid) = i32::try_from(self.child.id())
-                        .ok()
-                        .and_then(rustix::process::Pid::from_raw)
-                    {
-                        let _ =
-                            rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-                    }
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
-                    return;
-                }
+        while Instant::now() < deadline {
+            if self.try_reap().is_some() {
+                return;
             }
+            std::thread::sleep(Duration::from_millis(20));
         }
+        // Still running: the whole group (`uv run` keeps python as its
+        // child; autotag leads its own group, `process_group(0)`), killed
+        // and reaped under the killers' lock.
+        let mut group = self.group.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pid) = group.take() {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

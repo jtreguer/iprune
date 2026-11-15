@@ -9,7 +9,7 @@ use iprune_core::adopt::LibPlaylist;
 use iprune_core::config::{Config, Paths, Scope};
 use iprune_core::stats::{self, TrackStats};
 use iprune_core::store::{self, Store, TrackRow, devices};
-use iprune_core::{device, playlists, sync};
+use iprune_core::{device, import, playlists, sync};
 
 use crate::view_model::{self, Row};
 
@@ -137,6 +137,32 @@ impl Data {
     pub fn reload_stats(&self) -> Result<()> {
         *self.stats.borrow_mut() = stats::all(self.store.conn())?;
         Ok(())
+    }
+
+    /// Use This Match: the candidate chosen, typed tags dropped.
+    pub fn import_choose(&self, item: i64, choice: usize) -> Result<()> {
+        let conn = self.store.conn();
+        store::savepoint(conn, || {
+            import::set_tags(conn, item, None)?;
+            import::set_choice(conn, item, Some(choice))
+        })?;
+        Ok(())
+    }
+
+    /// Type Tags…: the tags the file gets in place of its match's.
+    pub fn import_typed(&self, item: i64, fields: &import::Fields) -> Result<()> {
+        Ok(import::set_tags(self.store.conn(), item, Some(fields))?)
+    }
+
+    /// Import anyway, for a possible duplicate.
+    pub fn import_confirm(&self, item: i64, on: bool) -> Result<()> {
+        Ok(import::set_confirmed(self.store.conn(), item, on)?)
+    }
+
+    /// Search Again, or Look Up Again without a search: the file starts
+    /// over and waits for a lookup.
+    pub fn import_search(&self, item: i64, search: Option<&import::Query>) -> Result<()> {
+        Ok(import::look_up_again(self.store.conn(), item, search)?)
     }
 
     /// For the sync worker, which opens its own connection to the index.

@@ -10,6 +10,8 @@ use iprune_core::stats::TrackStats;
 use iprune_core::store::TrackRow;
 use iprune_core::tags::{FileKind, Tags};
 
+pub mod import;
+
 /// One line of the grid: a library track, or a playlist entry that matches
 /// no file.
 #[derive(Debug, Clone, PartialEq)]

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
-pub use autotag::{Applied, Autotag, By, Candidate, Fields, Hello, Lookup, Query};
+pub use autotag::{Applied, Autotag, By, Candidate, Fields, Hello, Killer, Lookup, Query};
 
 use crate::adopt::normalize;
 use crate::config::Config;
@@ -322,13 +322,19 @@ pub fn read_inbox(conn: &Connection, cfg: &Config) -> Result<Inbox> {
                         )?;
                         i.id
                     }
+                    // Another reader (the window's worker, or iprune
+                    // import) may have just made the row: keep theirs.
                     None => {
                         conn.execute(
                             "INSERT INTO import_items (path, size, mtime_ns, hash, added_at) \
-                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                             VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(path) DO NOTHING",
                             params![text, size as i64, mtime, &hash[..], now_unix()],
                         )?;
-                        conn.last_insert_rowid()
+                        conn.query_row(
+                            "SELECT id FROM import_items WHERE path = ?1",
+                            [text],
+                            |r| r.get(0),
+                        )?
                     }
                 };
                 item(conn, id)?.expect("just written")
@@ -687,10 +693,91 @@ pub fn look_up(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        let Some(item) = &entry.item else { continue };
+        let Some(listed) = &entry.item else { continue };
+        // As it is now: the user may have searched again, or another
+        // lookup may have answered, since the inbox was read.
+        let Some(item) = item(conn, listed.id)? else {
+            continue;
+        };
+        let answered = item
+            .lookup
+            .as_deref()
+            .is_some_and(|t| Lookup::parse(t).is_ok());
+        if answered {
+            continue;
+        }
         progress(n, entries.len(), &entry.path);
-        match autotag.lookup(&entry.path, item.search.as_ref())? {
-            Ok((_, text)) => set_lookup(conn, item.id, &text)?,
+        let answer = autotag.lookup(&entry.path, item.search.as_ref())?;
+        // Stored only if the row still waits for this very lookup: a
+        // Search again during the request leaves it waiting for the next.
+        let (column, value) = match &answer {
+            Ok((_, text)) => ("lookup = ?2, error = NULL", text.as_str()),
+            Err(e) => ("error = ?2", e.as_str()),
+        };
+        conn.execute(
+            &format!(
+                "UPDATE import_items SET {column} WHERE id = ?1 AND lookup IS ?3 AND search IS ?4"
+            ),
+            params![item.id, value, item.lookup, to_json(item.search.as_ref())],
+        )?;
+        done += 1;
+    }
+    Ok(done)
+}
+
+/// The entries whose chosen candidate's genre was not looked up yet (only
+/// the first candidate's is): Use this match on another one.
+pub fn genres_wanted(inbox: &Inbox) -> Vec<(&Entry, usize)> {
+    inbox
+        .entries
+        .iter()
+        .filter_map(|e| {
+            let item = e.item.as_ref()?;
+            let choice = item.choice?;
+            if item.tags.is_some() {
+                return None;
+            }
+            let lookup = Lookup::parse(item.lookup.as_deref()?).ok()?;
+            lookup
+                .candidates
+                .get(choice)
+                .is_some_and(|c| c.genre_unknown)
+                .then_some((e, choice))
+        })
+        .collect()
+}
+
+/// Asks autotag for the full tags of each chosen candidate whose genre is
+/// not known, and stores them in its lookup. Stops between files when
+/// `stop` is set; an error is autotag failing. A candidate autotag cannot
+/// give tags for keeps its unknown genre, with the error stored.
+pub fn fill_genres(
+    conn: &Connection,
+    wanted: &[(&Entry, usize)],
+    autotag: &mut Autotag,
+    stop: &AtomicBool,
+) -> Result<usize> {
+    let mut done = 0;
+    for (entry, choice) in wanted {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let Some(item) = &entry.item else { continue };
+        let Some(lookup) = item.lookup.as_deref().and_then(|t| Lookup::parse(t).ok()) else {
+            continue;
+        };
+        let Some(c) = lookup.candidates.get(*choice) else {
+            continue;
+        };
+        let answer = autotag.tags(&c.recording, &c.release)?;
+        // Only into the lookup it was asked for: a Search again during the
+        // request replaced it.
+        let now = self::item(conn, item.id)?;
+        if now.as_ref().and_then(|i| i.lookup.as_deref()) != item.lookup.as_deref() {
+            continue;
+        }
+        match answer {
+            Ok(tags) => set_candidate_tags(conn, item.id, *choice, &tags)?,
             Err(e) => set_error(conn, item.id, Some(&e))?,
         }
         done += 1;

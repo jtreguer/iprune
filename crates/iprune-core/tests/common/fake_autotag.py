@@ -26,7 +26,9 @@ Scenario keys, all optional:
   corrupt        [file basenames] filed as bytes that are not audio
   quirks         {"start": "exit" before the hello, or "<n>" or "<op>:<basename>": quirk}, n counting requests
                  from 1. Quirks: exit (no answer), garbage (a line that is
-                 not JSON), wrong_id, no_id
+                 not JSON), wrong_id, no_id, hang (never answers: sleeps 5 s, then
+                 exits, for a Stop that has to kill it first), slow (answers
+                 normally, half a second late)
   hang_on_eof    when stdin closes, sleep instead of exiting
   wrapper        start as `uv run` does: this process only runs a second
                  copy of itself as its child (not exec) and waits for it;
@@ -236,6 +238,11 @@ for line in sys.stdin:
         sys.stdout.write("this is not json\n")
         sys.stdout.flush()
         continue
+    if quirk == "hang":
+        time.sleep(5)
+        sys.exit(3)
+    if quirk == "slow":
+        time.sleep(0.5)
     if quirk == "wrong_id":
         out({"error": "wrong id", "id": req.get("id", 0) + 100})
         continue

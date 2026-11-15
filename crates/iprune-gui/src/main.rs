@@ -7,6 +7,8 @@ mod adopt_job;
 #[cfg(test)]
 mod close_tests;
 mod data;
+mod import_job;
+mod import_view;
 mod info_dialog;
 mod scan_job;
 mod selection_dialog;
@@ -58,6 +60,8 @@ fn drop_target() -> gtk::DropTarget {
 enum Source {
     Library,
     Playlist(String),
+    /// The inbox: songs waiting to be imported.
+    Import,
 }
 
 /// What a playlist picked in the picker is for.
@@ -161,6 +165,9 @@ struct Ui {
     volumes: RefCell<Option<gio::VolumeMonitor>>,
     /// Set when the playlists folder cannot be watched; kept in the status.
     unwatched: Cell<bool>,
+    /// The track grid, or the Import view.
+    stack: gtk::Stack,
+    import: import_view::ImportView,
 }
 
 fn main() -> glib::ExitCode {
@@ -479,7 +486,7 @@ impl Ui {
     fn playlist_name(&self) -> Option<String> {
         match &*self.current.borrow() {
             Source::Playlist(name) => Some(name.clone()),
-            Source::Library => None,
+            Source::Library | Source::Import => None,
         }
     }
 
@@ -955,14 +962,42 @@ impl Ui {
     /// Switches the grid to `source`: its layout, its default sort (`#` for
     /// a playlist, artist for the library), then its rows.
     fn show(&self, source: &Source) {
-        *self.current.borrow_mut() = source.clone();
+        let before = self.current.replace(source.clone());
+        if *source == Source::Import {
+            self.title.set_text("Import");
+            self.stack.set_visible_child_name("import");
+            // Opening the view starts lookups again, after a Stop too; the
+            // sidebar selecting it again as it is rebuilt does not.
+            if before != Source::Import {
+                self.import.clear_hold();
+            }
+            if let Some(ui) = self.import.ui() {
+                ui.import_fill_playlists();
+                ui.import_reload();
+            }
+            self.update_status();
+            return;
+        }
+        self.stack.set_visible_child_name("tracks");
+        // Leaving an empty inbox: its row goes, once the sidebar is done
+        // with this selection.
+        if before == Source::Import
+            && let Some(ui) = self.import.ui()
+        {
+            let ui = Rc::downgrade(&ui);
+            glib::idle_add_local_once(move || {
+                if let Some(ui) = ui.upgrade() {
+                    ui.import_count_changed(import_job::count(ui.data.config()));
+                }
+            });
+        }
         self.title.set_text(match source {
-            Source::Library => "Music",
+            Source::Library | Source::Import => "Music",
             Source::Playlist(name) => name,
         });
         let in_playlist = matches!(source, Source::Playlist(_));
         let sort_by = match source {
-            Source::Library => Column::Artist,
+            Source::Library | Source::Import => Column::Artist,
             Source::Playlist(_) => Column::Position,
         };
         // Sort order first, then the rows, so they are sorted once.
@@ -985,12 +1020,18 @@ impl Ui {
 
     fn load_rows(&self) {
         let source = self.current.borrow().clone();
+        if source == Source::Import {
+            if let Some(ui) = self.import.ui() {
+                ui.import_reload();
+            }
+            return;
+        }
         self.shown_mtime.set(match &source {
             Source::Playlist(name) => self.data.playlist_mtime(name),
-            Source::Library => None,
+            Source::Library | Source::Import => None,
         });
         let rows = match &source {
-            Source::Library => self.data.library(),
+            Source::Library | Source::Import => self.data.library(),
             Source::Playlist(name) => self.data.playlist(name),
         };
         self.store.remove_all();
@@ -1009,6 +1050,10 @@ impl Ui {
     }
 
     fn update_status(&self) {
+        if *self.current.borrow() == Source::Import {
+            self.status.set_text(&self.import_summary());
+            return;
+        }
         let n = self.filtered.n_items();
         let objects: Vec<glib::Object> = (0..n).filter_map(|i| self.filtered.item(i)).collect();
         let borrowed: Vec<std::cell::Ref<'_, Row>> = objects.iter().map(row_of).collect();
@@ -1035,6 +1080,7 @@ impl Ui {
         let device = self.data.device().ok().flatten();
         *self.device.borrow_mut() = device.clone();
         let free = !self.busy.get();
+        self.import_update_controls();
         let connected = device.as_ref().is_some_and(|d| d.connected);
         let adopted = device.as_ref().is_some_and(|d| d.adopted);
         for (action, on) in [
@@ -1292,6 +1338,10 @@ impl Ui {
     /// Opens Get Info on the selected rows that have a file: their tags, to
     /// edit as in iTunes.
     fn get_info(self: &Rc<Self>) {
+        if *self.current.borrow() == Source::Import {
+            self.import_type_tags();
+            return;
+        }
         let ids = self.info_ids();
         if ids.is_empty() {
             return;
@@ -1568,7 +1618,9 @@ impl Ui {
             let result = result.unwrap_or_else(|_| Err(anyhow::anyhow!("the scan worker crashed")));
             let dialog = dialog_weak.upgrade().filter(|_| !gone.get());
             match (result, dialog) {
-                (Ok(report), Some(dialog)) => report_page(&dialog, &stack, &report),
+                (Ok(report), Some(dialog)) => {
+                    report_page(&dialog, &stack, "Library scanned", &report)
+                }
                 (Ok(report), None) => ui
                     .status
                     .set_text(report.lines().next().unwrap_or_default()),
@@ -1896,6 +1948,17 @@ impl Ui {
         sources.push(None);
         self.sidebar.append(&sidebar_item("Music"));
         sources.push(Some(Source::Library));
+        // Under Music while the inbox holds files, or while it is shown.
+        let files = import_job::count(self.data.config());
+        let shown = *self.current.borrow() == Source::Import;
+        let row = view_model::import::import_row_wanted(files, shown).then(|| {
+            let row = sidebar_item(&view_model::import::sidebar_label(files));
+            self.sidebar.append(&row);
+            sources.push(Some(Source::Import));
+            row
+        });
+        *self.import.sidebar_row.borrow_mut() = row;
+        self.import_fill_playlists();
         self.sidebar.append(&sidebar_header("Playlists"));
         sources.push(None);
         for name in self.data.playlist_names().unwrap_or_default() {
@@ -2029,7 +2092,7 @@ impl Ui {
         // the file, so the file on screen is checked directly.
         let shown_changed = match &*self.current.borrow() {
             Source::Playlist(name) => self.data.playlist_mtime(name) != self.shown_mtime.get(),
-            Source::Library => false,
+            Source::Library | Source::Import => false,
         };
         if self.sidebar_stale() {
             // The sidebar falls back to the library if the playlist shown
@@ -2057,7 +2120,7 @@ impl Ui {
 
 /// A worker's result, with a panic turned into an error.
 fn joined<T>(r: Result<anyhow::Result<T>, Box<dyn std::any::Any + Send>>) -> anyhow::Result<T> {
-    r.unwrap_or_else(|_| Err(anyhow::anyhow!("the sync worker crashed")))
+    r.unwrap_or_else(|_| Err(anyhow::anyhow!("the worker crashed")))
 }
 
 fn working_page(stack: &gtk::Stack, text: &str) {
@@ -2075,13 +2138,13 @@ fn working_page(stack: &gtk::Stack, text: &str) {
 
 /// A scan's report, which can run to thousands of lines (every missing
 /// file), so it scrolls.
-fn report_page(dialog: &gtk::Window, stack: &gtk::Stack, report: &str) {
+fn report_page(dialog: &gtk::Window, stack: &gtk::Stack, title: &str, report: &str) {
     let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
     page.set_margin_top(16);
     page.set_margin_bottom(16);
     page.set_margin_start(16);
     page.set_margin_end(16);
-    let heading = gtk::Label::new(Some("Library scanned"));
+    let heading = gtk::Label::new(Some(title));
     heading.add_css_class("title-2");
     heading.set_xalign(0.0);
     let text = gtk::TextView::new();
@@ -2477,8 +2540,13 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         .hexpand(true)
         .child(&view)
         .build();
+    let import = import_view::ImportView::new(slot.clone());
+    let stack = gtk::Stack::new();
+    stack.add_named(&grid_scroll, Some("tracks"));
+    stack.add_named(&import.page, Some("import"));
+    stack.set_vexpand(true);
     let main = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    main.append(&grid_scroll);
+    main.append(&stack);
     main.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     main.append(&status);
 
@@ -2540,6 +2608,8 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         planning: Cell::new(false),
         volumes: RefCell::new(None),
         unwatched: Cell::new(false),
+        stack,
+        import,
     });
     slot.set(Rc::downgrade(&ui)).expect("set once");
     let library_layout = ui.layouts.borrow().library.complete(false);
@@ -2841,6 +2911,7 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
             let Some(ui) = weak.upgrade() else { return };
             *ui.query.borrow_mut() = view_model::Query::new(&s.text());
             ui.filter.changed(gtk::FilterChange::Different);
+            ui.import.filter.changed(gtk::FilterChange::Different);
             ui.update_status();
         });
     }
@@ -2903,6 +2974,10 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
             glib::ControlFlow::Continue
         });
     }
+    // Songs dropped anywhere on the window go to the inbox; a file put
+    // there by another program shows at once.
+    window.add_controller(ui.import_drop_target());
+    ui.import_watch();
     // The window owns the state from here.
     keep_alive(window, ui.clone());
     ui.fill_sidebar();

@@ -853,3 +853,162 @@ fn playlists_on_ipod_returns_the_mapped_ids_of_that_device_only() {
     );
     assert!(sb.data.playlists_on_ipod(other + 100).unwrap().is_empty());
 }
+
+// ---------------------------------------------------------- import methods
+//
+// The rows of `import_items` are made by SQL here: reading an inbox is the
+// core's, tested there. The store is in memory.
+
+fn import_data() -> Data {
+    data_with_mount(Path::new("/nonexistent/iprune-test/mount"))
+}
+
+fn import_item(d: &Data, name: &str) -> i64 {
+    d.store
+        .conn()
+        .execute(
+            "INSERT INTO import_items (path, size, mtime_ns, hash, added_at) \
+             VALUES (?1, 1, 0, ?2, 0)",
+            (format!("/inbox/{name}"), vec![name.len() as u8; 32]),
+        )
+        .unwrap();
+    d.store.conn().last_insert_rowid()
+}
+
+fn typed(title: &str) -> import::Fields {
+    import::Fields {
+        title: Some(title.into()),
+        year: Some(1999),
+        compilation: Some(false),
+        ..import::Fields::default()
+    }
+}
+
+fn row_of(d: &Data, id: i64) -> import::Item {
+    import::item(d.store.conn(), id).unwrap().unwrap()
+}
+
+// Use This Match: the choice replaces typed tags, which would otherwise
+// still win over it.
+#[test]
+fn import_choose_sets_the_choice_and_drops_the_typed_tags_of_that_file_only() {
+    let d = import_data();
+    let a = import_item(&d, "a");
+    let b = import_item(&d, "b");
+    for id in [a, b] {
+        import::set_tags(d.store.conn(), id, Some(&typed("Typed"))).unwrap();
+    }
+    import::set_confirmed(d.store.conn(), a, true).unwrap();
+    import::set_lookup(d.store.conn(), a, "{\"kept\":true}").unwrap();
+
+    d.import_choose(a, 2).unwrap();
+
+    let item = row_of(&d, a);
+    assert_eq!((item.choice, item.tags), (Some(2), None));
+    // Only the tags and the choice change.
+    assert!(item.confirmed);
+    assert_eq!(item.lookup.as_deref(), Some("{\"kept\":true}"));
+    let other = row_of(&d, b);
+    assert_eq!((other.choice, other.tags), (None, Some(typed("Typed"))));
+}
+
+#[test]
+fn import_choose_changes_the_choice_of_a_file_that_had_one() {
+    let d = import_data();
+    let a = import_item(&d, "a");
+    d.import_choose(a, 1).unwrap();
+    d.import_choose(a, 0).unwrap();
+    assert_eq!(row_of(&d, a).choice, Some(0), "zero is a choice, not none");
+}
+
+// The two writes are one: if the second fails the first is undone, so a
+// file never has its typed tags dropped and its old choice kept.
+#[test]
+fn import_choose_that_fails_halfway_leaves_the_typed_tags_alone() {
+    let d = import_data();
+    let a = import_item(&d, "a");
+    import::set_tags(d.store.conn(), a, Some(&typed("Typed"))).unwrap();
+    d.store
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER no_choice BEFORE UPDATE OF choice ON import_items \
+             BEGIN SELECT RAISE(ABORT, 'no choosing today'); END;",
+        )
+        .unwrap();
+
+    let err = d.import_choose(a, 1).unwrap_err();
+    assert!(format!("{err:#}").contains("no choosing today"), "{err:#}");
+    let item = row_of(&d, a);
+    assert_eq!(
+        item.tags,
+        Some(typed("Typed")),
+        "the first write was undone"
+    );
+    assert_eq!(item.choice, None);
+}
+
+#[test]
+fn import_typed_stores_the_fields_and_keeps_the_choice() {
+    let d = import_data();
+    let a = import_item(&d, "a");
+    d.import_choose(a, 1).unwrap();
+    d.import_typed(a, &typed("By Hand")).unwrap();
+    let item = row_of(&d, a);
+    assert_eq!(item.tags, Some(typed("By Hand")));
+    assert_eq!(item.choice, Some(1));
+    // Fields that were not typed stay out, and compilation off is stored as off.
+    assert_eq!(item.tags.as_ref().unwrap().compilation, Some(false));
+    assert_eq!(item.tags.as_ref().unwrap().artist, None);
+}
+
+#[test]
+fn import_confirm_accepts_and_withdraws_a_possible_duplicate() {
+    let d = import_data();
+    let a = import_item(&d, "a");
+    let b = import_item(&d, "b");
+    d.import_confirm(a, true).unwrap();
+    assert!(row_of(&d, a).confirmed && !row_of(&d, b).confirmed);
+    d.import_confirm(a, false).unwrap();
+    assert!(!row_of(&d, a).confirmed);
+}
+
+// Search Again: the file starts over, as if it had just arrived, with only
+// the new search kept.
+#[test]
+fn import_search_starts_the_file_over_with_the_new_search() {
+    let d = import_data();
+    let a = import_item(&d, "a");
+    let b = import_item(&d, "b");
+    for id in [a, b] {
+        import::set_lookup(d.store.conn(), id, "{\"old\":1}").unwrap();
+        import::set_choice(d.store.conn(), id, Some(1)).unwrap();
+        import::set_tags(d.store.conn(), id, Some(&typed("T"))).unwrap();
+        import::set_confirmed(d.store.conn(), id, true).unwrap();
+        import::set_error(d.store.conn(), id, Some("old error")).unwrap();
+    }
+    let before_b = row_of(&d, b);
+    let q = import::Query {
+        artist: "a-ha".into(),
+        title: "Take On Me".into(),
+    };
+
+    d.import_search(a, Some(&q)).unwrap();
+
+    let item = row_of(&d, a);
+    assert_eq!(item.search, Some(q.clone()));
+    assert_eq!(
+        (
+            item.lookup,
+            item.choice,
+            item.tags,
+            item.confirmed,
+            item.error
+        ),
+        (None, None, None, false, None)
+    );
+    assert_eq!(row_of(&d, b), before_b, "another file is not touched");
+
+    // Look Up Again without a search goes back to the file's own tags.
+    d.import_search(a, None).unwrap();
+    assert_eq!(row_of(&d, a).search, None);
+}

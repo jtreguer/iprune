@@ -20,8 +20,8 @@ grid, playlist editing, sync, adoption review, eject; desktop entry,
 notifications, `packaging/install.sh`). M8, tag editing (`docs/technical.md`
 section 7.1: `tag_edit`, `iprune tag`, the Get Info form), is done too.
 M9, import (`docs/design.md` section 7.6, `docs/technical.md` section 7.2,
-four steps in section 17), is under way: steps 1 (autotag) and 2 (`import`,
-`iprune import`) are done; the Import view and packaging remain.
+four steps in section 17), is under way: steps 1 (autotag), 2 (`import`,
+`iprune import`) and 3 (the Import view) are done; packaging remains.
 Work followed the milestones in `docs/technical.md` section 17:
 
 | # | Deliverable | Writes to iPod |
@@ -87,8 +87,9 @@ crates/iprune-core/  config, store, scan, playlist (.m3u8 format), playlists (op
 crates/iprune/       binary `iprune`: CLI
 crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6); view_model
                      (rows, columns, sort, search, Get Info values) is plain and tested, data
-                     loads, scan_job, sync_job, adopt_job and tag_job are the workers (no GTK,
-                     tested), main, adopt_dialog and info_dialog are GTK
+                     loads, scan_job, sync_job, adopt_job, tag_job and import_job are the
+                     workers (no GTK, tested), main, adopt_dialog, info_dialog and
+                     import_view are GTK; view_model::import has the Import view's rows
 crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c
 packaging/           iprune.desktop and install.sh (cargo install and the desktop entry)
 tools/autotag        Python script (uv, mutagen): tags new songs from MusicBrainz and files

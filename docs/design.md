@@ -343,7 +343,7 @@ theme Omarchy sets.
 
   ```
   ┌──────────────┬───────────────────────────────────────────────────────────┐
-  │ LIBRARY      │ [ Search…            ]                  [ Add files… ]    │
+  │ LIBRARY      │ [ Search…                ]                                │
   │  Music       │ St File                     Name         Artist    Album  │
   │  Import (6)  │ ?  Take On Me (Official…    Take On Me   a-ha      Hunti… │
   │ PLAYLISTS    │ ✗  mashup final v2.mp3      —                             │
@@ -358,21 +358,23 @@ theme Omarchy sets.
   │              │ [ Use this match ]  [ Search again… ]  [ Type tags… ]     │
   │              │ → a-ha/Hunting High and Low/01 Take On Me.mp3             │
   │              ├───────────────────────────────────────────────────────────┤
-  │              │ Add to playlist [ none      ▾]   [ Import 1 ready song ]  │
+  │              │ [Add Files…] [Add Folders…]  Add to [none ▾] [Import 1 ✓] │
   └──────────────┴───────────────────────────────────────────────────────────┘
   ```
 
   The grid shows a status (✓ ready, ? to choose, ✗ no match, ≡ already in
-  the library, ≈ possible duplicate, ⋯ looking up), the file name, the
+  the library, ≈ possible duplicate, ⋯ looking up, ! error, – not
+  supported), the file name, the
   proposed tags, with changed values in bold and the old value in a
   tooltip, and the destination in the library. Rows waiting for the user
   come first. The pane below shows the selected file's candidates as
   autotag lists them, the best one selected. Use this match makes the file
   ready, Search again takes another artist and title, and Type tags opens
   the Get Info form on the proposal. Library songs the file may duplicate
-  are listed there too, with Show in library. The bottom bar holds the
-  playlist to add the songs to and the Import button, with the number of
-  songs ready. Delete moves the selected files from the inbox to the trash.
+  are listed there too, with Show in library. The bottom bar holds Add
+  Files… and Add Folders…, the playlist to add the songs to, and the
+  Import button, with the number of songs ready. Delete moves the selected
+  files from the inbox to the trash.
 - **Keyboard.** Ctrl+F search, Ctrl+I Get Info, Delete remove, Ctrl+N new
   playlist, F2 rename,
   Ctrl+Up and Ctrl+Down move the selected rows in a playlist, plus the

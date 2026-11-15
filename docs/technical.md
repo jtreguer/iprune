@@ -597,8 +597,8 @@ sides are tested against.
   (a file of that name in any case or Unicode form), or files of the same
   title exist and `allow_duplicate` is false; any other failure is an
   error. With `dry_run` nothing is written, `filed` is false, and only a
-  taken destination refuses; the window uses it for the destination of
-  typed tags. `recording` and `release`, absent for typed tags, are
+  taken destination refuses. Neither the CLI nor the window uses it
+  yet: a file with typed tags shows no destination until it is filed. `recording` and `release`, absent for typed tags, are
   written as the MusicBrainz ids, as autotag does now.
 
 An answer `{"error": "<message>"}` fails that request only. A process that
@@ -1444,39 +1444,61 @@ libadwaita's widgets.
   functions with unit tests. Widget code stays thin.
 - **Playlists folder.** A `gio::FileMonitor` reloads files changed by other
   programs.
-- **Import view** (M9, section 7.2). `import_job` is the worker, without
-  GTK and tested: it owns the autotag process and its own SQLite
-  connection, and looks the items up one at a time in inbox order. Lookups
-  write only `import_items` and do not take the busy flag, so Scan, Sync
-  and Get Info work meanwhile. Filing runs on the same worker and takes it.
-  `view_model` gets the import rows (status, the tags the file would get
-  with the fields that change, destination, candidate labels) and their
-  order (status, then inbox order), and `import_view` stays thin. The
-  sidebar's Import row, under Music, shows the number of items and is
-  hidden while the inbox is empty. A vertical `gtk::Paned` holds the grid,
-  a `ColumnView` like the library's with its own layout in `ui.toml`, and
-  the pane for the selected item:
-  - the candidates as grouped `gtk::CheckButton`s, the one the status
-    takes selected; Use this match stores the selection in `choice`, and
-    asks autotag for the genre when it is not known;
-  - Search again, a popover with artist and title fields, where Enter
-    stores them in `search` and looks the file up again;
-  - Type tags, the Get Info form (`info_dialog`) in a mode where OK checks
-    the values as usual and stores them in `tags` instead of writing files;
-  - the songs it may duplicate, with Show in library, and an Import anyway
-    box that sets `confirmed`;
-  - the destination.
-
-  Changed values are bold in the grid, with the file's value in a
-  tooltip. The bottom bar has a playlist drop-down (none, then the
-  playlists, filtered as in the sidebar) and the Import button with the
-  number of Ready items, disabled at none or while busy. The window takes
-  `gdk::FileList` drops anywhere; Add files… opens `gtk::FileDialog`
-  (`open_multiple`, `select_multiple_folders`). Delete moves the selected
-  items' files to the trash (`gio::File::trash`). The status line shows
-  "Looking up 3 of 12…", and Stop ends the lookups. The report after
-  filing is a dialog like the scan's.
-
+- **Import view** (M9, section 7.2). `Source::Import`: the sidebar's
+  Import row, under Music, shows the number of files in the inbox and is
+  there while it holds any, or while the view is shown. The main area is a
+  `gtk::Stack` of the track grid and the view (`import_view`, GTK only).
+  `view_model::import` works out the rows (status, the tags the file would
+  get against those it has, destination, candidates, duplicates, the
+  pane's sentences) and `import_job` is the worker side (no GTK, tested):
+  reading the inbox, copying into it, a lookup pass (`import::look_up`,
+  then `import::fill_genres` for matches chosen since), and filing. Each
+  runs with its own connection to the index; two inbox reads at once are
+  safe, a row made by one being kept by the other.
+  - The grid is a `ColumnView` with fixed columns (status symbol, file,
+    the tags, time, destination), resizable but not saved in `ui.toml`;
+    the window's search filters it. Rows waiting for the user come first;
+    a value the file would get changed is bold, the file's in a tooltip.
+  - The pane, for the first row selected: the file, how it was found and
+    its length; what its status means; the destination; Use This Match
+    (`set_choice`, typed tags dropped), Search Again… (a popover with
+    artist and title, `look_up_again` with them), Type Tags… (the Get Info
+    form on the tags it would get, its OK storing them with `set_tags`
+    instead of writing the file; also Ctrl+I), Look Up Again for an
+    error; Import anyway for a possible duplicate (`set_confirmed`); the
+    library songs it may be, with Show in Library; then the candidates as
+    radio buttons. The actions come before the candidates, which can be
+    many, so they stay in sight.
+  - The bar: Add Files… and Add Folders… (`gtk::FileDialog`), the line of
+    progress or why lookups are held, Stop, a playlist drop-down with a
+    search, and the Import button with the number of songs ready,
+    disabled at none or while busy. Files dropped anywhere on the window
+    (`gdk::FileList`) are copied into the inbox and the view opens. Delete
+    moves the selected files to the trash (`gio::File::trash`, which some
+    filesystems, such as a tmpfs, refuse: the file then stays, with the
+    error shown).
+  - Lookups start when the view opens with files waiting, and after
+    anything the user does there; they do not take the busy flag, so
+    Scan, Sync and Get Info work meanwhile. Each file's row shows as soon
+    as it is answered. A lookup stores its answer only if the row still
+    waits for it, with the same search: a Search Again during the request
+    leaves the row waiting for the next pass, which runs it. Stop ends
+    lookups after the one in progress, and kills autotag's process group
+    if it has not ended 2 seconds later (`Killer`: autotag and its killers
+    share one lock, taken to kill and to reap, so a killer never signals
+    an id that was reaped). They then stay held, as when autotag fails,
+    until the user acts in the view or opens it from another one; the
+    sidebar selecting it again as it is rebuilt does not count. Import
+    during lookups stops them the same way, then files, and the lookups go
+    on after it. A path in the inbox that cannot be read is said under the
+    grid but holds nothing. While songs are filed, the pane's actions are
+    off. Filing takes the busy flag and, as a sync does, keeps the window
+    from closing; a signal stops it between files. The report is a dialog
+    like the scan's. A `gio::FileMonitor` on the inbox's top level,
+    started as soon as the inbox exists, reloads the view, or the
+    sidebar's count when another view is shown; files another program
+    puts in a subfolder show at the next reload. The rows selected stay
+    selected across reloads, and what is typed in Search Again is kept.
 Built in steps: (1) the read-only window: sidebar, grid over the library or a
 playlist (in file order, unresolved entries dimmed), every column sortable
 with iTunes-style ties (artist, album, disc, track, name), a column menu,

@@ -851,3 +851,53 @@ fn a_folder_that_holds_the_inbox_does_not_bring_the_inbox_into_itself() {
         ]
     );
 }
+
+// The window's worker and `iprune import` read the inbox at the same time:
+// both see no row for a new file, and both insert it. The second must keep
+// the first's row, not fail on the duplicate path.
+#[test]
+fn two_readers_of_the_same_new_inbox_both_succeed_and_share_one_row_per_file() {
+    use std::sync::Barrier;
+
+    let imp = Imp::new();
+    for n in 1..=6 {
+        imp.put(&format!("f{n}.mp3"), n);
+    }
+    let db = imp.env.music.parent().unwrap().join("db/iprune.sqlite");
+    for round in 0..10 {
+        imp.env
+            .store
+            .conn()
+            .execute("DELETE FROM import_items", [])
+            .unwrap();
+        let barrier = Barrier::new(2);
+        let read = || {
+            let store = iprune_core::store::Store::open(&db).unwrap();
+            barrier.wait();
+            import::read_inbox(store.conn(), &imp.env.cfg).map(|inbox| {
+                inbox
+                    .entries
+                    .iter()
+                    .map(|e| (e.path.clone(), e.item.as_ref().unwrap().id))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let (a, b) = std::thread::scope(|s| {
+            let a = s.spawn(read);
+            let b = s.spawn(read);
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        let (a, b) = (
+            a.unwrap_or_else(|e| panic!("round {round}, first reader: {e}")),
+            b.unwrap_or_else(|e| panic!("round {round}, second reader: {e}")),
+        );
+        assert_eq!(a, b, "round {round}: both readers name the same rows");
+        assert_eq!(a.len(), 6);
+        let items = import::items(imp.env.store.conn()).unwrap();
+        assert_eq!(items.len(), 6, "round {round}: one row per file");
+        assert_eq!(
+            items.iter().map(|i| i.path.clone()).collect::<Vec<_>>(),
+            a.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>()
+        );
+    }
+}
