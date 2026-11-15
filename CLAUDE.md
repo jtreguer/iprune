@@ -60,6 +60,10 @@ and tested.
 - Tag editing (added 2026-10-26) covers only the twelve fields synced to the
   iPod, for one song or several, as in iTunes' Get Info. No ratings, no
   artwork, no renaming files after an edit.
+- Each sync sets the iPod clock (added 2026-11-15), the one that wrote and
+  the one with nothing to apply, through the root helper `iprune-clock`
+  run by `pkexec` (`docs/technical.md` section 11.6). A failure is a
+  warning.
 
 ## Stack
 
@@ -83,7 +87,10 @@ crates/iprune-core/  config, store, scan, playlist (.m3u8 format), playlists (op
                      write), stats, backup, doctor, notify (notify-send
                      after a sync), tag_edit (Get Info writes: id3, mp4,
                      chunks), import (inbox, state, pure status, filing;
-                     autotag: the client and its protocol)
+                     autotag: the client and its protocol), clock (runs
+                     iprune-clock through pkexec at each sync)
+crates/iprune-clock/ binary `iprune-clock`: sets the iPod clock (SCSI WRITE BUFFER
+                     through sg_raw) as root; installed root-owned, run via pkexec
 crates/iprune/       binary `iprune`: CLI
 crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6); view_model
                      (rows, columns, sort, search, Get Info values) is plain and tested, data
@@ -91,7 +98,8 @@ crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6); v
                      workers (no GTK, tested), main, adopt_dialog, info_dialog and
                      import_view are GTK; view_model::import has the Import view's rows
 crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c
-packaging/           iprune.desktop and install.sh (cargo install, autotag, the desktop entry)
+packaging/           iprune.desktop, install.sh (cargo install, autotag, the desktop entry,
+                     then with sudo the clock helper and dev.iprune.clock.policy)
 tools/autotag        Python script (uv, mutagen): tags new songs from MusicBrainz and files
                      them into the library; ~/Music/autotag links to it. `autotag serve` is
                      what iprune's import drives (design 7.6 and decision 6)
@@ -168,6 +176,10 @@ must pass at the end, and the autotag suite too when `tools/` changed. Mention i
   roots. iprune itself has no network code; autotag does the lookups, one
   process at a time (`import.lock`). Tests use a fake autotag and recorded
   MusicBrainz answers, never the network.
+- `iprune-clock` is the only code that runs as root. It takes one disk
+  name, refuses anything but an Apple iPod (sysfs), and sends one fixed
+  command. Tests never run `sg_raw` or `pkexec`; `clock::set` does nothing
+  for a folder.
 - `.m3u8` writes go to a temp file in the same folder, `fsync`, then rename.
   Unresolved entries are kept verbatim.
 - Paths are stored exactly as on disk and looked up by their NFC form

@@ -540,6 +540,18 @@ fn a_sync_with_no_playlist_change_says_so_and_takes_no_backup() {
     assert!(!sb.backups_dir().exists());
 }
 
+// Prevents a sync of a folder with nothing to apply reporting a clock it did
+// not set, or a warning for one that does not exist.
+#[test]
+fn a_sync_with_nothing_to_apply_on_a_folder_prints_no_clock_line() {
+    let sb = adopted();
+    let o = sb.ok(&["sync", "--yes"]);
+    assert_code(&o, 0);
+    assert!(out(&o).contains("Nothing to apply."), "{}", out(&o));
+    let all = format!("{}{}", out(&o), err(&o)).to_lowercase();
+    assert!(!all.contains("clock"), "{all}");
+}
+
 #[test]
 fn sync_copies_a_new_file_to_the_fake_ipod_and_reports_the_counts() {
     let sb = adopted();

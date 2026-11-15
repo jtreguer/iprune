@@ -172,6 +172,7 @@ mod tests {
             stopped: None,
             skipped: Vec::new(),
             warnings: Vec::new(),
+            clock: None,
         }
     }
 

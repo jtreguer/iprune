@@ -1965,6 +1965,10 @@ impl Ui {
         if !planned.fits {
             note.push_str(" The tracks to copy do not fit on the iPod: Apply is not possible.");
         }
+        if let Some(line) = sync_job::clock_line(&planned.clock) {
+            note.push('\n');
+            note.push_str(&line);
+        }
         let note = gtk::Label::new(Some(&note));
         note.set_wrap(true);
         note.set_xalign(0.0);
@@ -2124,6 +2128,9 @@ impl Ui {
                         text.push_str(&format!(
                             "\nBackup {stamp}: `iprune restore {stamp}` puts the previous database back."
                         ));
+                    }
+                    if let Some(time) = &done.clock {
+                        text.push_str(&format!("\nThe iPod clock was set to {time}."));
                     }
                     for (path, why) in &done.skipped {
                         text.push_str(&format!("\nNot copied, {why}: {}", path.display()));

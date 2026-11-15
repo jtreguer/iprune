@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Lets the active local session run iprune's clock helper through pkexec
+     without a password; any other session is refused. The helper only sets
+     the clock of an Apple iPod. packaging/install.sh installs this file in
+     /usr/share/polkit-1/actions. -->
+<policyconfig>
+  <vendor>iprune</vendor>
+  <action id="dev.iprune.clock">
+    <description>Set the iPod clock to the computer's time</description>
+    <message>iprune wants to set the iPod clock to the computer's time</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/lib/iprune/iprune-clock</annotate>
+  </action>
+</policyconfig>

@@ -248,6 +248,10 @@ pub struct Outcome {
     pub skipped: Vec<(PathBuf, String)>,
     /// Steps after the verified write that failed: the sync itself stands.
     pub warnings: Vec<String>,
+    /// The time the iPod's clock was set to (`clock::set`). `None` for a
+    /// folder, a sync that stopped early, or a failure, which is among the
+    /// warnings.
+    pub clock: Option<String>,
 }
 
 /// Refuses removing many managed playlists or tracks at once, which more
@@ -1083,6 +1087,15 @@ pub fn sync(
             0
         }
     };
+    // Last, and only for a sync that went to the end: a stop leaves the
+    // rest for the next one.
+    let clock = match stopped {
+        Some(_) => None,
+        None => crate::clock::set(mountpoint).unwrap_or_else(|e| {
+            warnings.push(format!("the iPod clock was not set: {e}"));
+            None
+        }),
+    };
     Ok(Outcome {
         applied,
         copied: expect.added.len(),
@@ -1104,6 +1117,7 @@ pub fn sync(
         stopped,
         skipped,
         warnings,
+        clock,
     })
 }
 

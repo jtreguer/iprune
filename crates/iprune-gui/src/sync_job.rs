@@ -10,7 +10,7 @@ use iprune_core::config::{Config, Paths};
 use iprune_core::exec::{self, FullWork, Progress};
 use iprune_core::notify::{self, Note};
 use iprune_core::store::Store;
-use iprune_core::{device, scan, sync};
+use iprune_core::{clock, device, scan, sync};
 
 /// A plan ready to be shown.
 #[derive(Debug, Clone)]
@@ -33,6 +33,10 @@ pub struct Planned {
     pub fits: bool,
     /// What Apply applies, as shown.
     pub work: FullWork,
+    /// With nothing to apply the sync ends with the plan, which sets the
+    /// iPod clock (`clock::set`): the time set, `Ok(None)` for a folder or
+    /// when there is work to apply, or why it was not set.
+    pub clock: Result<Option<String>, String>,
 }
 
 /// What an applied sync did.
@@ -54,6 +58,8 @@ pub struct Applied {
     /// Files not copied (gone or changed since the scan), with why.
     pub skipped: Vec<(PathBuf, String)>,
     pub warnings: Vec<String>,
+    /// The time the iPod clock was set to; a failure is among `warnings`.
+    pub clock: Option<String>,
     /// The desktop notification for it; `None` when nothing was applied.
     pub note: Option<Note>,
 }
@@ -86,7 +92,17 @@ pub fn to_apply(work: &FullWork) -> String {
     )
 }
 
-/// Scans the library, reads the iPod and plans. Writes only the index.
+/// The line on the iPod clock a plan with nothing to apply set, if any.
+pub fn clock_line(clock: &Result<Option<String>, String>) -> Option<String> {
+    match clock {
+        Ok(Some(time)) => Some(format!("The iPod clock was set to {time}.")),
+        Ok(None) => None,
+        Err(e) => Some(format!("Warning: the iPod clock was not set: {e}")),
+    }
+}
+
+/// Scans the library, reads the iPod and plans. Writes only the index, and
+/// with nothing to apply sets the iPod clock.
 pub fn plan(config: &Config, paths: &Paths) -> Result<Planned> {
     let mut store = open(paths)?;
     let r = scan::scan(&mut store, config, &|_| {}).context("scanning the library")?;
@@ -106,7 +122,12 @@ pub fn plan(config: &Config, paths: &Paths) -> Result<Planned> {
     let mass_removal = exec::check_guards(&prepared, &work, opts)
         .err()
         .map(|e| e.to_string());
+    let clock = match work.is_empty() {
+        true => clock::set(&mountpoint),
+        false => Ok(None),
+    };
     Ok(Planned {
+        clock,
         fits: prepared.plan.space.fits || work.tracks.copies.is_empty(),
         to_apply: to_apply(&work),
         ipod_name: prepared.ipod.name.clone().unwrap_or_else(|| "iPod".into()),
@@ -176,6 +197,7 @@ pub fn apply(
         stopped: done.stopped,
         skipped: done.skipped,
         warnings: done.warnings,
+        clock: done.clock,
     })
 }
 

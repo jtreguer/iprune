@@ -578,6 +578,26 @@ fn stats_csv_failing_is_a_warning_and_the_sync_still_stands() {
     );
 }
 
+// Prevents a sync of a folder (a copy, a fake iPod) trying to set a clock
+// that is not there, and warning of a failure every time.
+#[test]
+fn a_sync_of_a_folder_sets_no_clock_and_does_not_warn_about_one() {
+    let w = world_with_old();
+    w.write_list("Road", &[D3]);
+    w.reload();
+    let out = w.sync().unwrap();
+    assert_eq!(out.clock, None);
+    assert!(
+        !out.warnings
+            .iter()
+            .any(|m| m.to_lowercase().contains("clock")),
+        "{:?}",
+        out.warnings
+    );
+    // The sync itself ran.
+    assert_eq!(w.ipod_playlist("Road").unwrap().1, vec![D3]);
+}
+
 // ---- regression: syncing twice
 
 // Prevents: a second sync repeating work (doubled playlists, new ids) or

@@ -554,6 +554,12 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
     let work = exec::full_work(&prepared);
     if work.is_empty() {
         writeln!(out, "\nNothing to apply.")?;
+        // The sync ends here, and still sets the clock.
+        match iprune_core::clock::set(&mp) {
+            Ok(Some(time)) => writeln!(out, "iPod clock set to {time}")?,
+            Ok(None) => {}
+            Err(e) => writeln!(out, "warning: the iPod clock was not set: {e}")?,
+        }
         return Ok(Outcome::Done);
     }
     let t = &work.tracks;
@@ -644,6 +650,9 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
         done.pulled.plays(),
         done.backup.stamp
     )?;
+    if let Some(time) = &done.clock {
+        writeln!(out, "iPod clock set to {time}")?;
+    }
     for (path, why) in &done.skipped {
         writeln!(out, "not copied, {why}: {}", path.display())?;
     }

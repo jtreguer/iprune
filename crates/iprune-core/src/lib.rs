@@ -3,6 +3,7 @@
 pub mod adopt;
 pub mod adoption;
 pub mod backup;
+pub mod clock;
 pub mod config;
 pub mod device;
 pub mod doctor;

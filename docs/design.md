@@ -175,7 +175,9 @@ From the command line, for scripts:
 
    Any section can be expanded to the full list.
 3. On confirmation: back up the database, copy files, update the database,
-   write it, then read it back and compare it to the plan.
+   write it, then read it back and compare it to the plan. Last, set the
+   iPod's clock to the computer's, as iTunes did when the iPod was
+   connected. A sync with nothing to apply sets the clock too.
 4. `iprune eject` unmounts and powers off the iPod.
 
 ### 7.4 Editing tags
@@ -489,6 +491,8 @@ playlists whose contents differ.
   launcher.
 - An optional Hyprland binding in `~/.config/hypr/bindings.conf`.
 - A desktop notification when a sync finishes or fails.
+- A small helper, installed root-owned with a polkit policy, that sets the
+  iPod clock at each sync without asking for a password (decision 7).
 - No udev rule that syncs automatically. Plugging in the iPod may show a
   notification with the pending plan size, nothing more.
 
@@ -548,3 +552,14 @@ Answers to the questions left open in the first draft (2026-10-13):
    autotag moves from `~/Music` into this repository as `tools/autotag`,
    so a change to its JSON output and to iprune lands in one commit, and a
    symbolic link at `~/Music/autotag` keeps the old routine working.
+7. The iPod clock was found not to follow the computer's on 2026-11-15:
+   iTunes used to set it on every connection, and nothing did since.
+   iprune now sets it at each sync, including one with nothing to apply,
+   but not for a plan only shown or declined. The command is the one
+   libgpod's `ipod-time-sync` sends, and Linux lets only root send it, so a
+   separate helper does, run through `pkexec`, with a polkit policy that
+   lets the desktop session run it without a password (technical
+   document, section 11.6). A udev rule that set the clock on every
+   plug-in was the alternative, closer to iTunes, but it would act without
+   a sync. A clock that cannot be set is a warning, never a reason to
+   stop a sync.

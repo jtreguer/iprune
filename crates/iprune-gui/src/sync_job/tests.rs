@@ -188,6 +188,38 @@ const SEVEN: [&str; 7] = ["P1", "P2", "P3", "P4", "P5", "P6", "P7"];
 
 // ---- plan
 
+// Prevents a plan of a folder trying to set a clock, and a plan with work
+// setting it before the work is applied.
+#[test]
+fn plan_of_a_folder_has_no_clock_with_or_without_work() {
+    let w = World::new(&[]);
+    let p = w.plan();
+    assert!(p.work.is_empty());
+    assert_eq!(p.clock, Ok(None));
+    assert_eq!(clock_line(&p.clock), None);
+    w.write_list("Road", &[D2]);
+    w.reload();
+    let p = w.plan();
+    assert!(!p.work.is_empty());
+    assert_eq!(p.clock, Ok(None));
+}
+
+// Prevents a failure to set the clock being silent, or a folder (no clock,
+// no failure) producing a line.
+#[test]
+fn clock_line_says_the_time_set_or_why_not_and_nothing_for_a_folder() {
+    let set = clock_line(&Ok(Some("2026-11-15 23:41:07".into()))).unwrap();
+    assert!(
+        set.contains("2026-11-15 23:41:07") && set.contains("set"),
+        "{set}"
+    );
+    assert!(!set.to_lowercase().contains("warning"), "{set}");
+    let failed = clock_line(&Err("pkexec refused".into())).unwrap();
+    assert!(failed.contains("pkexec refused"), "{failed}");
+    assert!(failed.to_lowercase().contains("not set"), "{failed}");
+    assert_eq!(clock_line(&Ok(None)), None);
+}
+
 #[test]
 fn plan_of_an_unchanged_library_has_nothing_to_apply() {
     let w = World::new(&[]);

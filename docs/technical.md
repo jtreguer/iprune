@@ -48,11 +48,14 @@ iprune/
         verify.rs           snapshot and compare
         stats.rs            play count pull and export
         notify.rs           desktop notifications at the end of a sync
+        clock.rs            sets the iPod clock through iprune-clock
+    iprune-clock/           binary `iprune-clock`: sets the iPod clock as
+                            root, run through pkexec (section 11.6)
     iprune/                 binary `iprune`: the CLI
       src/main.rs
     iprune-gui/             binary `iprune-gui`: the GTK4 window
       src/{main,view_model,...}.rs
-  packaging/                iprune.desktop, install.sh
+  packaging/                iprune.desktop, install.sh, the clock helper's polkit policy
   tools/
     autotag                 Python script run with uv: MusicBrainz lookup, tag
                             writes and filing of new songs (section 7.2)
@@ -1094,6 +1097,8 @@ Order of operations:
     `-N`). Only folders named like a stamp (`YYYYMMDD-HHMMSS`, with an
     optional `-N`) count as backups; anything else in the folder is
     ignored.
+14. Set the iPod clock (section 11.6), unless the sync stopped early. A
+    failure is a warning too.
 
 Mappings are recorded right after each verified write. If a crash comes
 in between, the next `prepare` takes them back: an unmapped library
@@ -1242,6 +1247,50 @@ the way through. Ratings pulled from the
 replaced database are overwritten by the restored database's own on the
 next sync. Files added after the backup become orphans
 until `doctor --fix` moves them aside.
+
+### 11.6 iPod clock
+
+iTunes set the iPod's clock each time the iPod was connected. iprune sets
+it at each sync: at the end of one that wrote (step 13 of section 11.2),
+and when the plan has nothing to apply, since the sync ends there (`iprune
+sync` after "Nothing to apply.", the window's plan step). A plan only
+shown (`--plan-only`) or declined, a sync that stopped early or failed,
+`doctor` and `restore` leave the clock alone. A clock that cannot be set is
+a warning; the sync stands.
+
+The command is libgpod's (`tools/ipod-scsi.c`, `sync_time`, from watching
+iTunes; Arch does not build that tool): SCSI WRITE BUFFER(10), mode 1
+(vendor specific), buffer 0, offset 0x0C0000, 12 bytes of data: the year and
+the day of the year counted from 0, both big-endian `u16`, then the offset
+from UTC in quarter hours as a signed byte, daylight saving time included
+(UTC+2 is 8, UTC-3:30 is -14), hour, minute, second, 1 when daylight saving
+time is in effect, and three zero bytes. The local time is the system
+time zone's (`/etc/localtime`); `TZ` is not passed through `pkexec`.
+
+The kernel lets only a process with `CAP_SYS_RAWIO` send WRITE BUFFER
+(`scsi_cmd_allowed`), and `/dev/sdX` is `root:disk`, so the command is sent
+by a separate binary, `iprune-clock` (crate `crates/iprune-clock`, no
+unsafe code). `packaging/install.sh` builds it and copies it root-owned to
+`/usr/local/lib/iprune/iprune-clock`, the folder made or reset root's
+first (whoever can write in it could swap the helper), and installs
+`packaging/dev.iprune.clock.policy` in `/usr/share/polkit-1/actions`: the
+active local session may run it without a password (`allow_active`), any
+other session may not. `clock::set` finds the block device mounted at the
+iPod's mountpoint (a folder has none: nothing is done, which covers the
+tests) and runs `pkexec --disable-internal-agent
+/usr/local/lib/iprune/iprune-clock /dev/sdX2`, so no password prompt ever
+waits in the terminal, and gives up after 30 s (`clock::TIMEOUT`), killing
+pkexec if it is still the user's: allowed or refused, pkexec answers at
+once, so only a stuck polkit daemon gets there, and the end of a sync,
+with the iPod lock held or the dialog unable to close, must not wait on it. The helper takes the partition's disk from sysfs,
+refuses anything but a USB device of vendor 05ac whose SCSI model starts
+with "iPod", builds the 12 bytes from its own clock with `jiff`, sends them
+with `/usr/bin/sg_raw` (sg3_utils, a dependency of Arch's libgpod) on its
+standard input, and prints the time set (`2026-11-15 23:41:07 +01:00`),
+which the CLI and the window show. A missing helper, a refusal by polkit
+(`pkexec` exits 126 or 127) or a failed `sg_raw` gives the warning, with
+what they said. Tests check the 12 bytes for several zones and dates, and
+the disk check on fake sysfs trees; they never run `sg_raw` or `pkexec`.
 
 ## 12. Doctor
 
@@ -1543,7 +1592,9 @@ shown (a change in free space or in the planned copies does not count),
 and runs the M4 playlist sync. It compares against the index, without
 reading the playlists folder again: a file edited after the plan but not
 yet read is left for the next sync, and the window reads such edits
-within half a second anyway. While it writes, neither the dialog nor the window can close, the
+within half a second anyway. A plan with nothing to apply sets the iPod
+clock while it is made (section 11.6) and says so under the summary;
+the result of an Apply says so after the backup. While it writes, neither the dialog nor the window can close, the
 application is held, and suspend, shutdown and the lid are inhibited (see
 section 11.2); a signal acts as Stop, and the window quits once the sync
 is done. The result shows
@@ -1613,9 +1664,14 @@ the running one's window to the front.
   `target/debug`) have no autotag beside them and take the one on `PATH`,
   which is that installed copy when cargo's `bin` folder is there; set
   `import.autotag` to the repository's `tools/autotag` to try a change to
-  it without installing. `install.sh --uninstall` removes the binaries,
-  autotag and the entry; the link at `~/Music/autotag` stays. A PKGBUILD
-  may come later.
+  it without installing. Last, through `sudo`, it installs the clock
+  helper root-owned in `/usr/local/lib/iprune` and its polkit policy in
+  `/usr/share/polkit-1/actions` (section 11.6); the helper is built as the
+  user first, into a temporary folder. When `sudo` fails, it says that
+  syncs will warn that the clock was not set, and the rest stays
+  installed. `install.sh --uninstall` removes the binaries, autotag, the
+  entry, the helper and the policy; the link at `~/Music/autotag` stays.
+  A PKGBUILD may come later.
 - Notifications through `notify-send` (module `notify`), once a plan is
   confirmed (`--yes`, the prompt, or Apply in the window): "iPod synced"
   with what changed, "iPod sync stopped early" with why, or "iPod sync
@@ -1704,4 +1760,6 @@ can be checked against the backup with the existing C tools.
 | autotag and iprune disagree on the protocol | the protocol version in autotag's first line; protocol files tested on both sides; both in one repository |
 | mutagen damages a file or drops frames during an import | it writes only a copy, before it enters the library, and the inbox file is deleted only after the rename; autotag's tests check the audio stream and the other frames per format; iprune reads the twelve fields back after filing |
 | `uv` missing, or unable to fetch mutagen on first use | autotag does not start: its stderr is shown, the items stay Looking up, and nothing is written |
+| The clock command, taken from libgpod's tool, does something else on one of the three models, or reads the UTC offset or the daylight saving flag differently | it only ever goes to a USB device of Apple's whose SCSI model is "iPod"; a failure is a warning; tried on each iPod by hand before relying on it |
+| The root clock helper is misused | it takes one argument, refuses any disk but an iPod, sends one fixed command with the current time, and is root-owned where only root can change it; polkit allows it only to the active local session |
 | FairPlay files (one in the library, "Bailemos") may not play on an iPod that is not authorised for that Apple account | the planner skips unmapped ones and leaves mapped ones in place; M5 decides whether copying them is worth offering |
