@@ -984,6 +984,7 @@ dependencies = [
  "gtk4",
  "iprune-core",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
  "unicode-normalization",

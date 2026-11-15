@@ -5,6 +5,10 @@
 //! until the write is verified, so it never writes back a database another
 //! changed meanwhile. The kernel drops the lock when the process ends, crash
 //! included.
+//!
+//! `import.lock` does the same for autotag: held while an autotag process
+//! runs, so the window and the CLI never look songs up or file them at the
+//! same time, and MusicBrainz sees one client.
 
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
@@ -50,8 +54,26 @@ const BRIEF: std::time::Duration = std::time::Duration::from_millis(250);
 /// Takes the lock, waiting at most [`BRIEF`]; refused with
 /// [`Error::IpodBusy`] while another iprune holds it.
 pub fn ipod(paths: &Paths) -> Result<IpodLock> {
+    let (file, path) = take(paths, "ipod.lock", Error::IpodBusy)?;
+    Ok(IpodLock { _file: file, path })
+}
+
+/// Held while it lives, by the owner of an autotag process.
+#[derive(Debug)]
+pub struct ImportLock {
+    _file: File,
+}
+
+/// Takes `import.lock`, waiting at most [`BRIEF`]; refused with
+/// [`Error::ImportBusy`] while another iprune holds it.
+pub fn import(paths: &Paths) -> Result<ImportLock> {
+    let (file, _) = take(paths, "import.lock", Error::ImportBusy)?;
+    Ok(ImportLock { _file: file })
+}
+
+fn take(paths: &Paths, name: &str, busy: Error) -> Result<(File, PathBuf)> {
     std::fs::create_dir_all(&paths.data_dir).at(&paths.data_dir)?;
-    let path = lock_file(paths);
+    let path = paths.data_dir.join(name);
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -61,10 +83,10 @@ pub fn ipod(paths: &Paths) -> Result<IpodLock> {
     let start = std::time::Instant::now();
     loop {
         match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => return Ok(IpodLock { _file: file, path }),
+            Ok(()) => return Ok((file, path)),
             Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
                 if start.elapsed() >= BRIEF {
-                    return Err(Error::IpodBusy);
+                    return Err(busy);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }

@@ -158,7 +158,7 @@ fn mounted_by_fstab(fstab: &str, dir: &Path) -> bool {
 
 /// What a retag leaves unchanged in a file: its kind, sample rate, bitrate
 /// and exact duration. `None` without a duration.
-type AudioKey = (FileKind, Option<u32>, Option<u32>, u32);
+pub(crate) type AudioKey = (FileKind, Option<u32>, Option<u32>, u32);
 
 /// Whether two tag sets name the same song well enough to pair files by
 /// their audio properties: the same title, or the same artist and album,
@@ -171,7 +171,7 @@ fn same_song(a: &tags::Tags, b: &tags::Tags) -> bool {
     eq(&a.title, &b.title) || (eq(&a.artist, &b.artist) && eq(&a.album, &b.album))
 }
 
-fn audio_key(info: &AudioInfo) -> Option<AudioKey> {
+pub(crate) fn audio_key(info: &AudioInfo) -> Option<AudioKey> {
     let ms = info.duration_ms.filter(|&ms| ms > 0)?;
     Some((info.kind, info.samplerate, info.bitrate, ms))
 }
@@ -189,7 +189,7 @@ pub(crate) fn hash_reader(r: impl std::io::Read) -> std::io::Result<[u8; 32]> {
 
 /// Runs a tag reader, turning a panic into `Unreadable`: one malformed file
 /// must not stop the whole scan.
-fn without_panics<T>(
+pub(crate) fn without_panics<T>(
     read: impl FnOnce() -> Result<T, ReadError> + std::panic::UnwindSafe,
 ) -> Result<T, ReadError> {
     std::panic::catch_unwind(read).unwrap_or_else(|_| {

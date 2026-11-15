@@ -20,7 +20,8 @@ grid, playlist editing, sync, adoption review, eject; desktop entry,
 notifications, `packaging/install.sh`). M8, tag editing (`docs/technical.md`
 section 7.1: `tag_edit`, `iprune tag`, the Get Info form), is done too.
 M9, import (`docs/design.md` section 7.6, `docs/technical.md` section 7.2,
-four steps in section 17), is planned and not started.
+four steps in section 17), is under way: steps 1 (autotag) and 2 (`import`,
+`iprune import`) are done; the Import view and packaging remain.
 Work followed the milestones in `docs/technical.md` section 17:
 
 | # | Deliverable | Writes to iPod |
@@ -81,7 +82,8 @@ crates/iprune-core/  config, store, scan, playlist (.m3u8 format), playlists (op
                      the plan), exec (apply, restore), verify (checks around a
                      write), stats, backup, doctor, notify (notify-send
                      after a sync), tag_edit (Get Info writes: id3, mp4,
-                     chunks)
+                     chunks), import (inbox, state, pure status, filing;
+                     autotag: the client and its protocol)
 crates/iprune/       binary `iprune`: CLI
 crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6); view_model
                      (rows, columns, sort, search, Get Info values) is plain and tested, data
@@ -90,8 +92,8 @@ crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6); v
 crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c
 packaging/           iprune.desktop and install.sh (cargo install and the desktop entry)
 tools/autotag        Python script (uv, mutagen): tags new songs from MusicBrainz and files
-                     them into the library; ~/Music/autotag links to it. Import is to drive
-                     it (design 7.6 and decision 6, not built)
+                     them into the library; ~/Music/autotag links to it. `autotag serve` is
+                     what iprune's import drives (design 7.6 and decision 6)
 ```
 
 ## Commands

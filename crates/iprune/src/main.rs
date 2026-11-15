@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use iprune_core::config::{Config, PathStyle, Paths, Scope as ConfigScope};
 use iprune_core::store::{Store, devices};
-use iprune_core::{adoption, backup, device, exec, playlists, scan, sync};
+use iprune_core::{adoption, backup, device, exec, import, playlists, scan, sync};
 
 /// Exit code when the user answers no to a confirmation.
 const EXIT_DECLINED: u8 = 4;
@@ -147,6 +147,21 @@ enum Command {
         files: Vec<PathBuf>,
         #[command(flatten)]
         fields: TagFields,
+    },
+    /// Look new songs up on MusicBrainz, through autotag, and file them
+    /// into the library. Files and folders given are copied into the inbox
+    /// first. Songs without a certain match, or that may already be in the
+    /// library, stay in the inbox for the window or autotag.
+    Import {
+        /// Files or folders to copy into the inbox first.
+        files: Vec<PathBuf>,
+        /// Add the songs filed to this playlist, which must exist.
+        #[arg(long, value_name = "NAME")]
+        playlist: Option<String>,
+        /// Look songs up and show what would be filed; file nothing. Files
+        /// given are still copied into the inbox, and lookups are kept.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Print every track and playlist in a stable form for diffing.
     Snapshot {
@@ -329,6 +344,16 @@ fn init(
         .map(|p| absolute_dir(p))
         .collect::<Result<_>>()?;
     config.playlists.dir = absolute_dir(playlists_dir)?;
+    // A new config names its inbox; --force keeps whatever was set, the
+    // default included.
+    // A default that overlaps the library is left out: the import then
+    // says so, and every other command keeps working.
+    if !exists
+        && let Some(inbox) = iprune_core::config::Import::default_inbox()
+        && !config.inbox_overlaps(&inbox)
+    {
+        config.import.inbox = inbox;
+    }
     match style {
         Some(Style::Absolute) => config.playlists.path_style = PathStyle::Absolute,
         Some(Style::Relative) => config.playlists.path_style = PathStyle::Relative,
@@ -1197,6 +1222,231 @@ fn run_tag(files: &[PathBuf], f: &TagFields) -> Result<()> {
     Ok(())
 }
 
+/// `path` relative to `dir` when inside it, for short lines.
+fn shown(path: &Path, dir: &Path) -> String {
+    path.strip_prefix(dir).unwrap_or(path).display().to_string()
+}
+
+/// "3 of 4 files left in the inbox", or "1 file left in the inbox" when
+/// none was filed.
+fn left_in_inbox(left: usize, total: usize) -> String {
+    if left == total {
+        format!("{} left in the inbox", plural(left, "file", "files"))
+    } else {
+        format!("{left} of {total} files left in the inbox")
+    }
+}
+
+/// Why an inbox file is not filed, in words.
+fn import_reason(v: &import::View, index: &import::Index) -> String {
+    use import::Status;
+    let path = |t: &i64| index.path(*t).map(|p| p.display().to_string());
+    let mut why = match &v.status {
+        Status::NotSupported(w) => format!("not supported: {w}"),
+        Status::Error(w) => w.clone(),
+        Status::LookingUp => "not looked up yet".into(),
+        Status::NoMatch => {
+            "no match on MusicBrainz; type its tags in the window, or run autotag on it".into()
+        }
+        Status::Choose => "no certain match; choose one in the window, or run autotag on it".into(),
+        Status::AlreadyInLibrary(t) => {
+            format!("already in the library: {}", path(t).unwrap_or_default())
+        }
+        Status::PossibleDuplicate => {
+            let mut like: Vec<String> = v.duplicates.iter().filter_map(path).collect();
+            like.extend(v.same_title.iter().cloned());
+            format!(
+                "may already be in the library ({}); accept it in the window",
+                like.join(", ")
+            )
+        }
+        Status::Ready => "ready".into(),
+    };
+    if let Some(e) = &v.error
+        && !matches!(v.status, Status::Error(_))
+    {
+        why.push_str(&format!(" (last try: {e})"));
+    }
+    why
+}
+
+fn run_import(files: &[PathBuf], playlist: Option<&str>, dry_run: bool) -> Result<Outcome> {
+    use import::Status;
+    let (config, mut store) = load()?;
+    let paths = paths()?;
+    if let Some(name) = playlist {
+        playlists::show(store.conn(), &config, name)?;
+    }
+    if !files.is_empty() {
+        let cwd = std::env::current_dir().context("reading the current folder")?;
+        let given: Vec<PathBuf> = files
+            .iter()
+            .map(|f| iprune_core::paths::absolute(f, &cwd))
+            .collect();
+        let copied = import::add_to_inbox(&config, &given)?;
+        say!(
+            "{} in the inbox from those given",
+            plural(copied.len(), "file", "files")
+        );
+    }
+    let tty = io::stderr().is_terminal();
+    let inbox = import::read_inbox(store.conn(), &config)?;
+    for (p, why) in &inbox.unreadable {
+        eprintln!("unreadable  {}: {why}", p.display());
+    }
+    // A library that is not there would be found only after every lookup.
+    if !dry_run {
+        import::check_roots(&config)?;
+    }
+    let index = import::Index::load(store.conn())?;
+    let pending = import::pending(&inbox, &index, true);
+    let mut autotag = None;
+    if !pending.is_empty() {
+        let mut a = import::Autotag::start(&config, &paths)?;
+        if !a.hello.acoustid {
+            eprintln!("autotag has no AcoustID key: songs are matched by name only");
+        }
+        let mut progress = |n: usize, total: usize, path: &Path| {
+            if tty {
+                eprint!(
+                    "\rlooking up {}/{total}: {}\x1b[K",
+                    n + 1,
+                    shown(path, &inbox.dir)
+                );
+            }
+        };
+        let looked = import::look_up(store.conn(), &pending, &mut a, &mut progress, &CANCEL);
+        if tty {
+            eprintln!();
+        }
+        looked?;
+        autotag = Some(a);
+    }
+    let inbox = import::read_inbox(store.conn(), &config)?;
+    let index = import::Index::load(store.conn())?;
+    let views: Vec<(&import::Entry, import::View)> = inbox
+        .entries
+        .iter()
+        .map(|e| (e, import::view(e, &index)))
+        .collect();
+    if views.is_empty() {
+        say!("the inbox, {}, is empty", inbox.dir.display());
+        return Ok(Outcome::Done);
+    }
+    let left = views
+        .iter()
+        .filter(|(_, v)| v.status != Status::Ready)
+        .count();
+    let print_left = || {
+        for (e, v) in views.iter().filter(|(_, v)| v.status != Status::Ready) {
+            say!(
+                "left       {}: {}",
+                shown(&e.path, &inbox.dir),
+                import_reason(v, &index)
+            );
+        }
+    };
+    if dry_run || left == views.len() {
+        for (e, v) in views.iter().filter(|(_, v)| v.status == Status::Ready) {
+            say!(
+                "would file {} → {}",
+                shown(&e.path, &inbox.dir),
+                v.destination
+                    .as_deref()
+                    .unwrap_or("(where autotag puts it)")
+            );
+        }
+        print_left();
+        if left > 0 {
+            bail!("{}", left_in_inbox(left, views.len()));
+        }
+        return Ok(Outcome::Done);
+    }
+    let mut autotag = match autotag {
+        Some(a) => a,
+        None => import::Autotag::start(&config, &paths)?,
+    };
+    let held = applying("Importing songs into the library");
+    let mut progress = |n: usize, total: usize, path: &Path| {
+        if tty {
+            eprint!(
+                "\rfiling {}/{total}: {}\x1b[K",
+                n + 1,
+                shown(path, &inbox.dir)
+            );
+        }
+    };
+    let report = import::file(
+        &mut store,
+        &config,
+        &mut autotag,
+        playlist,
+        &mut progress,
+        &CANCEL,
+    );
+    if tty {
+        eprintln!();
+    }
+    drop(autotag);
+    drop(held);
+    let report = report?;
+    let root = config.import_root().unwrap_or(Path::new("/"));
+    for f in &report.filed {
+        say!(
+            "filed      {} → {}",
+            shown(&f.from, &inbox.dir),
+            shown(&f.to, root)
+        );
+    }
+    for (p, fields) in &report.mismatches {
+        say!(
+            "check      {}: reads back otherwise than written ({}); see Get Info",
+            shown(p, root),
+            fields.join(", ")
+        );
+    }
+    for (p, why) in &report.failed {
+        say!("not filed  {}: {why}", shown(p, &inbox.dir));
+    }
+    print_left();
+    if let Some(e) = &report.error {
+        say!("autotag stopped part way: {e}");
+    }
+    if report.stopped {
+        say!("stopped: the songs not filed wait in the inbox");
+    }
+    match &report.scan {
+        Some(Ok(r)) => io::stdout()
+            .lock()
+            .write_all(scan::describe(r).as_bytes())?,
+        Some(Err(e)) => {
+            say!("the scan after filing failed ({e}); run `iprune scan`");
+        }
+        None => {}
+    }
+    for p in &report.not_indexed {
+        say!("not indexed {}", p.display());
+    }
+    let indexed = report.filed.iter().filter(|f| f.track.is_some()).count();
+    match (&report.playlist, playlist) {
+        (Some(Ok(name)), _) => {
+            say!("added {} to {name}", plural(indexed, "song", "songs"));
+        }
+        (Some(Err(e)), Some(name)) => {
+            say!("the songs were not added to {name}: {e}");
+        }
+        _ => {}
+    }
+    let not_filed = views.len() - report.filed.len();
+    if not_filed > 0 || report.error.is_some() || !report.not_indexed.is_empty() {
+        bail!("{}", left_in_inbox(not_filed, views.len()));
+    }
+    if matches!(report.playlist, Some(Err(_))) || matches!(report.scan, Some(Err(_))) {
+        bail!("the songs were filed, but not all of what follows was done");
+    }
+    Ok(Outcome::Done)
+}
+
 fn snapshot(path: &Path) -> Result<()> {
     let db = if path.is_dir() {
         gpod::Database::open(path)
@@ -1305,6 +1555,11 @@ fn main() -> ExitCode {
         }
         Command::Playlist(cmd) => playlist(cmd),
         Command::Tag { files, fields } => run_tag(files, fields).map(|()| Outcome::Done),
+        Command::Import {
+            files,
+            playlist,
+            dry_run,
+        } => run_import(files, playlist.as_deref(), *dry_run),
         Command::Snapshot { path } => snapshot(path).map(|()| Outcome::Done),
     };
     match result {

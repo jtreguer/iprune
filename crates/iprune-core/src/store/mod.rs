@@ -21,6 +21,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0006_synced_rating.sql"),
     include_str!("migrations/0007_tags_version.sql"),
     include_str!("migrations/0008_device_scope.sql"),
+    include_str!("migrations/0009_import.sql"),
 ];
 
 /// First line of a migration that rebuilds tables: it runs with foreign

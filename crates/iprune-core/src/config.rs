@@ -35,6 +35,39 @@ pub struct Config {
     pub playlists: Playlists,
     pub sync: Sync,
     pub device: Device,
+    pub import: Import,
+}
+
+/// New songs: where they wait, where they are filed, and the program that
+/// looks them up and files them (technical document, section 7.2).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Import {
+    /// Empty means `Inbox` in the XDG music folder (`~/Music/Inbox`).
+    #[serde(skip_serializing_if = "unset")]
+    pub inbox: PathBuf,
+    /// The library root songs are filed into; empty means the first root.
+    #[serde(skip_serializing_if = "unset")]
+    pub root: PathBuf,
+    /// Empty means `autotag` next to the running binary, else on `PATH`.
+    #[serde(skip_serializing_if = "unset")]
+    pub autotag: PathBuf,
+}
+
+fn unset(p: &Path) -> bool {
+    p.as_os_str().is_empty()
+}
+
+impl Import {
+    /// `Inbox` in the XDG music folder, else in `~/Music`; `None` without a
+    /// home folder.
+    pub fn default_inbox() -> Option<PathBuf> {
+        let dirs = directories::UserDirs::new()?;
+        let music = dirs
+            .audio_dir()
+            .map_or_else(|| dirs.home_dir().join("Music"), Path::to_path_buf);
+        Some(music.join("Inbox"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -192,7 +225,56 @@ impl Config {
                 return fail("device.mountpoint must not be inside a library root, nor hold one");
             }
         }
+        for (name, p) in [
+            ("import.inbox", &self.import.inbox),
+            ("import.root", &self.import.root),
+            ("import.autotag", &self.import.autotag),
+        ] {
+            if !p.as_os_str().is_empty() && !p.is_absolute() {
+                return fail(&format!("{name} must be an absolute path"));
+            }
+        }
+        // Songs filed outside the roots would never be indexed.
+        let root = &self.import.root;
+        if !root.as_os_str().is_empty() && !self.library.roots.iter().any(|r| root.starts_with(r)) {
+            return fail("import.root must be a library root or a folder inside one");
+        }
+        // Only an inbox set here: the default one is checked when an import
+        // uses it, so a library in ~/Music does not stop every command.
+        if !self.import.inbox.as_os_str().is_empty() && self.inbox_overlaps(&self.import.inbox) {
+            return fail("import.inbox must not be inside a library root, nor hold one");
+        }
         Ok(())
+    }
+
+    /// Whether `inbox` is inside a library root or holds one: unreviewed
+    /// files must never be library tracks, nor the library the inbox.
+    pub fn inbox_overlaps(&self, inbox: &Path) -> bool {
+        let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+        let inbox = real(inbox);
+        self.library
+            .roots
+            .iter()
+            .map(|r| real(r))
+            .any(|r| r.starts_with(&inbox) || inbox.starts_with(&r))
+    }
+
+    /// The inbox: `import.inbox`, else the default one.
+    pub fn inbox(&self) -> Option<PathBuf> {
+        if self.import.inbox.as_os_str().is_empty() {
+            Import::default_inbox()
+        } else {
+            Some(self.import.inbox.clone())
+        }
+    }
+
+    /// The library root new songs are filed into.
+    pub fn import_root(&self) -> Option<&Path> {
+        if self.import.root.as_os_str().is_empty() {
+            self.library.roots.first().map(PathBuf::as_path)
+        } else {
+            Some(&self.import.root)
+        }
     }
 
     /// Whether `ext` (lowercase, no dot) is excluded from the library.

@@ -13,6 +13,8 @@ use iprune_core::config::{Config, PathStyle};
 use iprune_core::scan::{self, ScanReport};
 use iprune_core::store::{self, Store, TrackRow};
 
+pub mod import_env;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Mp3,

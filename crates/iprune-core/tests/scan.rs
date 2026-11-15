@@ -914,6 +914,7 @@ fn downgrade_to_version_6(env: &mut Env) {
     let conn = env.store.conn();
     conn.execute_batch(
         "ALTER TABLE tracks DROP COLUMN tags_version;
+         DROP TABLE import_items;
          DROP TABLE device_scope_playlists;
          ALTER TABLE devices DROP COLUMN scope;",
     )

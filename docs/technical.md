@@ -192,7 +192,11 @@ autotag = ""                     # empty means autotag next to the iprune
 ```
 
 `init` writes `[import]` with the inbox in the XDG music folder
-(`~/Music/Inbox`). A config without `[import]` gets these defaults.
+(`~/Music/Inbox`); `init --force` leaves `[import]` as it is. A config
+without `[import]` gets these defaults. An inbox set in the config that is
+inside a library root, or holds one, is a config error; the default inbox
+is checked only when an import uses it, so a library in `~/Music` keeps
+working until import is used.
 
 ## 5. State and files
 
@@ -482,12 +486,18 @@ library. iprune has no network code.
 **The inbox.** `[import] inbox` (section 4) is created when missing. Its
 audio files, subfolders included, are the import's items. Hidden files are
 skipped, which also leaves out autotag's temporary files (`.autotag-*`). A
-file whose extension is not `mp3`, `m4a`, `wav`, `aif` or `aiff` is listed
-as not supported; a supported one that `tags::read` cannot read is listed
-with the error. Files dropped on the window or given to `iprune import` are
-copied in through a hidden temporary file and a rename; a dropped folder
-keeps its name, and a name already taken gets " (2)", " (3)" before the
-extension. The originals are not touched. The inbox is read when the
+file whose extension is not `mp3`, `m4a`, `wav`, `aif` or `aiff`, or whose
+name is not UTF-8 (the protocol is JSON), is listed as not supported, with
+no row; a supported one that `tags::read` cannot read is listed with the
+error, and a FairPlay one as not supported. A folder given that holds the
+inbox brings its audio files but not the inbox's. Symbolic links are not
+followed, and a folder that cannot be read keeps the rows of the files
+under it. Files dropped on the window or given to `iprune import` are
+copied in through a hidden temporary file, never replacing one
+(`persist_noclobber`); a dropped folder keeps its name and brings its audio
+files, and a name already taken gets " (2)", " (3)" before the extension.
+Files already in the inbox stay where they are. The originals are not
+touched. The inbox is read when the
 Import view opens, after each import, and on changes (`gio::FileMonitor`)
 while the window is open.
 
@@ -512,12 +522,14 @@ CREATE TABLE import_items (
 
 A row is made for each file found in the inbox and dropped when the file
 leaves it: filed, deleted, or moved away by hand. A file whose size or
-modification time changed loses its lookup, choice and typed tags, and is
-looked up again. No other table refers to this one.
+modification time changed loses its lookup, search, choice, typed tags,
+accepted duplicate and error, and is looked up again; Search again and Look
+up again start a file over the same way, keeping only the new search. No
+other table refers to this one.
 
-**Status.** `import::status` is pure: from a row, the inbox file's audio
-properties and the index's present and missing tracks, it gives the status
-the window and the CLI show, the tags the file would get and its
+**Status.** `import::view` is pure: from an inbox entry (its row and what
+`tags::read` gave) and an `import::Index` of the present tracks, it gives
+the status the window and the CLI show, the tags the file would get and its
 destination. In order:
 
 1. Not supported, Error (unreadable file, or a lookup that failed), and
@@ -525,7 +537,8 @@ destination. In order:
 2. Already in library: the file's hash equals a present track's. It is
    never filed; Delete removes it from the inbox. A hash equal to a
    missing track's is no duplicate: once filed, the scan's move detection
-   gives that track its file back, with its statistics and playlists.
+   gives that track its file back, with its statistics and playlists. Such
+   a file is never looked up either.
 3. The tags the file would get: the typed tags, else the chosen candidate's,
    else the first candidate's. No candidate and no typed tags is No match.
 4. Possible duplicate, unless the user accepted it: a present track with the
@@ -548,7 +561,8 @@ value), which its answer repeats; iprune numbers its requests and checks
 each answer's id. One process is one MusicBrainz client, so autotag's pacing
 (one request a second) holds across a batch, and `uv` starts once. The
 process runs while there is work and holds `import.lock`, so the window and
-the CLI never run two. The program is `[import] autotag`, else `autotag`
+the CLI never run two. It runs in its own process group: Ctrl+C in a
+terminal reaches iprune only, which lets the song being filed finish. The program is `[import] autotag`, else `autotag`
 in the folder of the running `iprune` or `iprune-gui` binary (where
 `install.sh` puts it), else `autotag` on `PATH`.
 
@@ -590,8 +604,10 @@ sides are tested against.
 An answer `{"error": "<message>"}` fails that request only. A process that
 exits or writes a line that is not JSON fails the remaining requests of the
 batch with its stderr; those files are tried again at the next start. Stop
-during lookups closes autotag's stdin and kills it after 2 seconds, which
-can only interrupt a lookup; during filing, Stop waits for the file being
+in the window during lookups closes autotag's stdin and kills its process
+group after 2 seconds (`uv run` keeps python as its child), which can only
+interrupt a lookup; in the CLI, Ctrl+C during lookups ends iprune at once,
+and autotag ends after the lookup it is on; during filing, Stop waits for the file being
 filed, and iprune never closes stdin or kills autotag while an `apply` is
 unanswered. Network errors are lookup errors: kept in `error` and retried by
 Look up again.
@@ -609,9 +625,10 @@ fields iprune reads back in step 3 of the filing are unaffected.
 
 **Filing.** Import files the Ready items in inbox order:
 
-1. It is refused when the root to file into (`[import] root`, else the
-   first of `[library] roots`) is absent or empty, which a scan would also
-   count as unreadable. In the window it takes the busy flag, so it is
+1. It is refused when a library root is absent, since the scan after it
+   would fail, or when the root to file into (`[import] root`, else the
+   first of `[library] roots`) is empty, which a scan would also count as
+   unreadable; and when the playlist named does not exist. In the window it takes the busy flag, so it is
    refused while Scan, Sync, Adopt, Eject or a tag write runs, as Get Info
    is.
 2. For each item, the file must still have its row's size and modification
@@ -627,11 +644,14 @@ fields iprune reads back in step 3 of the filing are unaffected.
    item keeps its lookup; the reason is kept in `error`. Folders created
    for a file that failed are removed again. Stop takes effect between
    files.
-3. Each filed file is read with `tags::read`. The twelve fields must read
-   as sent, and the kind and duration as the inbox file's. A difference is
+3. Each filed file is read with `tags::read`. The fields sent must read
+   back as sent, and the kind and duration as the inbox file's (the
+   duration within 50 ms, for MP3s without a header). A difference is
    reported with the fields; the file stays filed, to be put right with
    Get Info.
-4. `scan::scan`, as Scan does; only the new files are hashed. Each
+4. `scan::scan`, as Scan does; only the new files are hashed. It also runs
+   when autotag stopped part way, since it may have filed a song before
+   answering. Each
    destination must now be an indexed track (looked up by `path_key`); one
    that is not is reported.
 5. When a playlist was chosen, `playlists::add` appends the new tracks to
@@ -1293,10 +1313,15 @@ looked up yet (a line per file as it goes), files the Ready ones and scans
 (section 7.2), then prints a line per item: filed, with its destination, or
 left, with its status and reason. It makes no choice where one is needed;
 those files wait for the window or for `autotag`. `--playlist` adds the
-filed songs to that playlist, which must exist. `--dry-run` looks up and
-prints what would be filed, and files nothing. The exit code is 1 when any
-item is left in the inbox, and the command is refused while the window is
-looking songs up (`import.lock`).
+filed songs to that playlist, which must exist; that is checked before
+anything is looked up. Lookups that failed before are tried again.
+The library roots are checked before any lookup. `--dry-run` looks up and
+prints what would be filed, and files nothing; files given are still
+copied into the inbox, and lookups are kept. A song autotag refused stays
+Ready and is tried again on the next run; one that may be a duplicate
+waits for the window.
+The exit code is 1 when any item is left in the inbox, and the command is
+refused while the window is looking songs up (`import.lock`).
 
 `init --force` changes an existing config: the library folders and the
 playlists folder given replace the old ones, `--path-style` when given, and

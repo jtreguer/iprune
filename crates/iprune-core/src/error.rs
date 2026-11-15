@@ -108,6 +108,12 @@ pub enum Error {
     IpodBusy,
     #[error("eject: {0}")]
     Eject(String),
+    #[error("another iprune is looking songs up or importing them; try again once it is done")]
+    ImportBusy,
+    #[error("autotag: {0}")]
+    Autotag(String),
+    #[error("{} changed since it was read; nothing was filed, try again", .0.display())]
+    InboxChanged(PathBuf),
     #[error("no backup {0:?}; `iprune backups` lists them")]
     NoSuchBackup(String),
     #[error(

@@ -144,7 +144,7 @@ fn a_version_4_index_keeps_every_row_and_id_and_gets_an_id_that_is_never_reused(
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 
     // The next id starts above the highest one used, also after that
     // highest row is deleted.
@@ -325,7 +325,7 @@ fn a_version_7_index_gains_device_scopes_and_its_ipods_follow_the_config() {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 
     // Both iPods are still there, with no selection of their own.
     let devices = dump(conn, "devices");
@@ -361,4 +361,126 @@ fn a_version_7_index_gains_device_scopes_and_its_ipods_follow_the_config() {
         .is_err(),
         "an unknown iPod"
     );
+}
+
+/// A version 8 index (every migration before the import one) with a track,
+/// built from the real migrations.
+fn version_8(path: &Path) {
+    let conn = Connection::open(path).unwrap();
+    for sql in [
+        include_str!("../src/store/migrations/0001_init.sql"),
+        include_str!("../src/store/migrations/0002_tag_state.sql"),
+        include_str!("../src/store/migrations/0003_playlist_tombstones.sql"),
+        include_str!("../src/store/migrations/0004_pending_pulls.sql"),
+        include_str!("../src/store/migrations/0005_stable_ids.sql"),
+        include_str!("../src/store/migrations/0006_synced_rating.sql"),
+        include_str!("../src/store/migrations/0007_tags_version.sql"),
+        include_str!("../src/store/migrations/0008_device_scope.sql"),
+    ] {
+        conn.execute_batch(sql).unwrap();
+    }
+    track_without_id(&conn, "/music/kept.mp3");
+    conn.pragma_update(None, "user_version", 8).unwrap();
+}
+
+#[test]
+fn a_version_8_index_gains_the_import_table_and_keeps_what_it_had() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("iprune.sqlite");
+    version_8(&path);
+    let before = dump(&Connection::open(&path).unwrap(), "tracks");
+    assert_eq!(before.len(), 1, "set up");
+    let tables_before: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'import_items'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables_before, 0, "set up: no import table yet");
+
+    let store = Store::open(&path).unwrap();
+    let conn = store.conn();
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 9);
+    assert_eq!(dump(conn, "tracks"), before, "nothing else was touched");
+
+    // The columns the import code reads and writes.
+    let mut stmt = conn
+        .prepare("SELECT name, \"notnull\" FROM pragma_table_info('import_items') ORDER BY cid")
+        .unwrap();
+    let cols: Vec<(String, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let names: Vec<&str> = cols.iter().map(|c| c.0.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "id",
+            "path",
+            "size",
+            "mtime_ns",
+            "hash",
+            "lookup",
+            "search",
+            "choice",
+            "tags",
+            "confirmed",
+            "error",
+            "added_at"
+        ]
+    );
+    let required: Vec<&str> = cols
+        .iter()
+        .filter(|c| c.1 == 1)
+        .map(|c| c.0.as_str())
+        .collect();
+    assert_eq!(
+        required,
+        ["path", "size", "mtime_ns", "hash", "confirmed", "added_at"]
+    );
+
+    // A row with only what is required: not confirmed, nothing looked up.
+    conn.execute(
+        "INSERT INTO import_items (path, size, mtime_ns, hash, added_at) \
+         VALUES ('/inbox/a.mp3', 1, 2, x'0102', 3)",
+        [],
+    )
+    .unwrap();
+    let (confirmed, lookup, error): (i64, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT confirmed, lookup, error FROM import_items",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((confirmed, lookup, error), (0, None, None));
+    // One row per path.
+    assert!(
+        conn.execute(
+            "INSERT INTO import_items (path, size, mtime_ns, hash, added_at) \
+             VALUES ('/inbox/a.mp3', 1, 2, x'0102', 3)",
+            [],
+        )
+        .is_err()
+    );
+    // An id freed is not given again.
+    conn.execute("DELETE FROM import_items", []).unwrap();
+    conn.execute(
+        "INSERT INTO import_items (path, size, mtime_ns, hash, added_at) \
+         VALUES ('/inbox/b.mp3', 1, 2, x'0102', 3)",
+        [],
+    )
+    .unwrap();
+    let id: i64 = conn
+        .query_row("SELECT id FROM import_items", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(id, 2);
+    // No other table refers to it: tracks are deleted freely.
+    conn.execute("DELETE FROM tracks", []).unwrap();
 }
