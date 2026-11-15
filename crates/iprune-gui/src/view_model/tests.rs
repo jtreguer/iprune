@@ -1235,6 +1235,7 @@ fn layouts_round_trip_through_toml() {
             columns: vec![cs("name", 310, true), cs("album_artist", 77, false)],
         },
         playlist: Layout::default_for(true),
+        sorts: Default::default(),
     };
     let text = toml::to_string(&layouts).unwrap();
     let back: Layouts = toml::from_str(&text).unwrap();
@@ -1487,6 +1488,7 @@ fn parse_reads_back_what_serializing_wrote() {
             sidebar: None,
             library: Layout::default_for(false),
             playlist: Layout::default_for(true),
+            sorts: Default::default(),
         },
         Layouts {
             background: None,
@@ -1495,6 +1497,7 @@ fn parse_reads_back_what_serializing_wrote() {
                 columns: vec![cs("album_artist", 24, false), cs("name", 4000, true)],
             },
             playlist: Layout::default(),
+            sorts: Default::default(),
         },
     ] {
         let text = toml::to_string(&layouts).unwrap();
@@ -1515,6 +1518,7 @@ fn background_round_trips_through_toml_with_columns() {
             columns: vec![cs("name", 310, true)],
         },
         playlist: Layout::default_for(true),
+        sorts: Default::default(),
     };
     let text = toml::to_string(&layouts).expect("saves");
     assert!(text.contains("background = \"#2b1d4e\""), "{text}");
@@ -1533,6 +1537,7 @@ fn no_background_is_not_written_and_reads_back_as_none() {
             columns: vec![cs("name", 310, true)],
         },
         playlist: Layout::default_for(false),
+        sorts: Default::default(),
     };
     let text = toml::to_string(&layouts).unwrap();
     assert!(!text.contains("background"), "{text}");
@@ -1659,6 +1664,7 @@ fn sidebar_round_trips_through_toml_with_columns_and_is_not_written_when_none() 
             columns: vec![cs("name", 310, true)],
         },
         playlist: Layout::default_for(true),
+        sorts: Default::default(),
     };
     let text = toml::to_string(&layouts).unwrap();
     let back = Layouts::parse(&text);
@@ -2295,4 +2301,139 @@ fn facts_name_the_kind_and_the_known_properties() {
     assert!(text.starts_with("WAV"), "{text}");
     assert!(!text.contains("kbit") && !text.contains("kHz"), "{text}");
     assert!(text.contains("1.0 MB"), "{text}");
+}
+
+// ---- per-playlist sorts
+
+fn sorted(entries: &[(&str, Column, bool)]) -> Layouts {
+    let mut l = Layouts::default();
+    for (name, col, desc) in entries {
+        assert!(l.note_playlist_sort(name, *col, *desc));
+    }
+    l
+}
+
+#[test]
+fn sorts_round_trip_through_toml_with_awkward_playlist_names() {
+    let layouts = sorted(&[
+        ("-dash", Column::Artist, true),
+        ("two words", Column::Name, false),
+        ("quote \"q\" and 'a'", Column::Year, true),
+        ("dot.name", Column::Plays, false),
+    ]);
+    let text = toml::to_string(&layouts).unwrap();
+    assert!(text.contains("[sorts"), "{text}");
+    let back = Layouts::parse(&text);
+    assert_eq!(back, layouts, "{text}");
+    assert_eq!(back.playlist_sort("-dash"), (Column::Artist, true));
+    assert_eq!(
+        back.playlist_sort("quote \"q\" and 'a'"),
+        (Column::Year, true)
+    );
+}
+
+#[test]
+fn no_sorts_table_is_written_when_empty() {
+    let text = toml::to_string(&Layouts::default()).unwrap();
+    assert!(!text.contains("sorts"), "{text}");
+    assert!(Layouts::parse(&text).sorts.is_empty());
+    assert!(Layouts::parse("[library]\n").sorts.is_empty());
+}
+
+#[test]
+fn parse_drops_malformed_and_unknown_column_sorts_and_keeps_the_rest() {
+    let l = Layouts::parse(
+        "[sorts.good]\ncolumn = \"artist\"\ndescending = true\n\
+         [sorts.nocol]\ndescending = true\n\
+         [sorts.numcol]\ncolumn = 4\n\
+         [sorts.unknown]\ncolumn = \"nope\"\n\
+         [sorts.baddir]\ncolumn = \"artist\"\ndescending = \"yes\"\n\
+         [sorts.nodir]\ncolumn = \"year\"\n",
+    );
+    let names: Vec<&str> = l.sorts.keys().map(String::as_str).collect();
+    assert_eq!(names, ["good", "nodir"], "{:?}", l.sorts);
+    assert_eq!(l.playlist_sort("good"), (Column::Artist, true));
+    assert_eq!(l.playlist_sort("nodir"), (Column::Year, false));
+    assert_eq!(l.playlist_sort("unknown"), (Column::Position, false));
+    // `sorts` itself not a table
+    assert!(Layouts::parse("sorts = 3\n").sorts.is_empty());
+}
+
+#[test]
+fn playlist_sort_defaults_to_position_ascending() {
+    let l = sorted(&[("a", Column::Genre, true)]);
+    assert_eq!(l.playlist_sort("a"), (Column::Genre, true));
+    assert_eq!(l.playlist_sort("other"), (Column::Position, false));
+}
+
+#[test]
+fn note_playlist_sort_reports_whether_anything_changed() {
+    let mut l = Layouts::default();
+    // the default is not stored, so noting it changes nothing
+    assert!(!l.note_playlist_sort("p", Column::Position, false));
+    assert!(l.sorts.is_empty());
+    assert!(l.note_playlist_sort("p", Column::Artist, false));
+    assert!(!l.note_playlist_sort("p", Column::Artist, false));
+    assert!(l.note_playlist_sort("p", Column::Artist, true));
+    assert_eq!(l.playlist_sort("p"), (Column::Artist, true));
+    // # descending is a real choice and is stored
+    assert!(l.note_playlist_sort("p", Column::Position, true));
+    assert_eq!(l.playlist_sort("p"), (Column::Position, true));
+    assert_eq!(l.sorts["p"].column, "position");
+    // back to the default removes the entry
+    assert!(l.note_playlist_sort("p", Column::Position, false));
+    assert!(l.sorts.is_empty());
+    assert!(!l.note_playlist_sort("p", Column::Position, false));
+}
+
+#[test]
+fn note_playlist_sort_touches_only_the_named_playlist() {
+    let mut l = sorted(&[("a", Column::Name, false), ("b", Column::Year, true)]);
+    assert!(l.note_playlist_sort("a", Column::Position, false));
+    assert_eq!(l.sorts.keys().collect::<Vec<_>>(), ["b"]);
+    assert_eq!(l.playlist_sort("b"), (Column::Year, true));
+}
+
+#[test]
+fn rename_playlist_sort_moves_the_entry_and_drops_a_stale_target() {
+    let mut l = sorted(&[("old", Column::Name, true), ("new", Column::Year, false)]);
+    l.rename_playlist_sort("old", "new");
+    assert_eq!(l.sorts.keys().collect::<Vec<_>>(), ["new"]);
+    assert_eq!(l.playlist_sort("new"), (Column::Name, true));
+
+    // the renamed one had no sort: the stale one under the new name goes
+    let mut l = sorted(&[
+        ("stale", Column::Year, false),
+        ("keep", Column::Genre, true),
+    ]);
+    l.rename_playlist_sort("unknown", "stale");
+    assert_eq!(l.sorts.keys().collect::<Vec<_>>(), ["keep"]);
+
+    // same name: nothing happens
+    let mut l = sorted(&[("same", Column::Name, true)]);
+    let before = l.clone();
+    l.rename_playlist_sort("same", "same");
+    assert_eq!(l, before);
+}
+
+#[test]
+fn forget_playlist_sort_removes_only_that_entry() {
+    let mut l = sorted(&[("a", Column::Name, true), ("b", Column::Year, false)]);
+    l.forget_playlist_sort("a");
+    l.forget_playlist_sort("never-there");
+    assert_eq!(l.sorts.keys().collect::<Vec<_>>(), ["b"]);
+    assert_eq!(l.playlist_sort("a"), (Column::Position, false));
+}
+
+#[test]
+fn order_from_sorted_gives_the_positions_unless_already_in_file_order() {
+    let some = |v: &[usize]| v.iter().map(|&p| Some(p)).collect::<Vec<_>>();
+    assert_eq!(order_from_sorted(some(&[1, 2, 3])), None);
+    assert_eq!(order_from_sorted(some(&[1])), None);
+    assert_eq!(order_from_sorted(some(&[3, 2, 1])), Some(vec![3, 2, 1]));
+    assert_eq!(order_from_sorted(some(&[2, 1, 3])), Some(vec![2, 1, 3]));
+    assert_eq!(order_from_sorted(some(&[1, 3, 2])), Some(vec![1, 3, 2]));
+    assert_eq!(order_from_sorted(vec![Some(2), None, Some(1)]), None);
+    assert_eq!(order_from_sorted(vec![None, None]), None);
+    assert_eq!(order_from_sorted(Vec::<Option<usize>>::new()), None);
 }

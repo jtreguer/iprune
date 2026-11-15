@@ -2,6 +2,7 @@
 //! formatting. Plain functions, tested without a display.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use iprune_core::adopt::normalize;
@@ -537,6 +538,14 @@ pub struct Layout {
     pub columns: Vec<ColumnState>,
 }
 
+/// How a playlist was last sorted: a column key and its direction.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SortState {
+    pub column: String,
+    #[serde(default)]
+    pub descending: bool,
+}
+
 /// The saved layouts, `~/.local/state/iprune/ui.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Layouts {
@@ -551,6 +560,10 @@ pub struct Layouts {
     pub library: Layout,
     #[serde(default)]
     pub playlist: Layout,
+    /// Each playlist's sort, by playlist name. `#` ascending, the default,
+    /// is never stored.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sorts: BTreeMap<String, SortState>,
 }
 
 impl Layout {
@@ -686,8 +699,81 @@ impl Layouts {
                 .and_then(|w| i32::try_from(w).ok()),
             library: view("library"),
             playlist: view("playlist"),
+            sorts: table
+                .get("sorts")
+                .and_then(|v| v.as_table())
+                .map(|sorts| {
+                    sorts
+                        .iter()
+                        .filter_map(|(name, v)| {
+                            let s = v.clone().try_into::<SortState>().ok()?;
+                            Column::from_key(&s.column)?;
+                            Some((name.clone(), s))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
+
+    /// The sort playlist `name` opens with: the one saved, or `#`
+    /// ascending when none is (or its column is unknown). The bool is true
+    /// for descending.
+    pub fn playlist_sort(&self, name: &str) -> (Column, bool) {
+        self.sorts
+            .get(name)
+            .and_then(|s| Column::from_key(&s.column).map(|c| (c, s.descending)))
+            .unwrap_or((Column::Position, false))
+    }
+
+    /// Records the sort chosen for playlist `name`. `#` ascending, the
+    /// default, is recorded by forgetting the entry. True when the saved
+    /// sorts changed.
+    pub fn note_playlist_sort(&mut self, name: &str, column: Column, descending: bool) -> bool {
+        if column == Column::Position && !descending {
+            return self.sorts.remove(name).is_some();
+        }
+        let new = SortState {
+            column: column.key().to_owned(),
+            descending,
+        };
+        if self.sorts.get(name) == Some(&new) {
+            return false;
+        }
+        self.sorts.insert(name.to_owned(), new);
+        true
+    }
+
+    /// A renamed playlist keeps its sort; a sort left under the new name
+    /// (by a playlist deleted outside the window) goes.
+    pub fn rename_playlist_sort(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        let kept = self.sorts.remove(old);
+        self.sorts.remove(new);
+        if let Some(s) = kept {
+            self.sorts.insert(new.to_owned(), s);
+        }
+    }
+
+    /// A deleted or new playlist has no sort of its own.
+    pub fn forget_playlist_sort(&mut self, name: &str) {
+        self.sorts.remove(name);
+    }
+}
+
+/// The order to give a playlist so that its file follows its rows as
+/// sorted: `positions` are the rows' 1-based playlist positions, in sorted
+/// order, and the result is that list, for `playlists::set_order`. None
+/// when a row has no position (not a playlist) or the rows are already in
+/// file order.
+pub fn order_from_sorted(positions: impl IntoIterator<Item = Option<usize>>) -> Option<Vec<usize>> {
+    let order: Vec<usize> = positions.into_iter().collect::<Option<_>>()?;
+    if order.iter().copied().eq(1..=order.len()) {
+        return None;
+    }
+    Some(order)
 }
 
 /// What Ctrl+Up or Ctrl+Down does with the selected positions.

@@ -282,8 +282,10 @@ theme Omarchy sets.
   artist, Composer, Genre, Year, Disc, Track, Plays, Skips, Rating, Last
   played, Date added, Kind, Size, and in a playlist the position `#`. Columns
   can be shown, hidden, resized and reordered; clicking a header sorts by it,
-  clicking again reverses. The layout is remembered per view. The grid stays
-  fast with the whole library of about 9,700 tracks.
+  clicking again reverses. The layout is remembered per view, and each
+  playlist reopens sorted as it was last left (by `#` until another column
+  is chosen). The grid stays fast with the whole library of about 9,700
+  tracks.
 - **Search.** A field above the grid filters the current view on title,
   artist, album, album artist and composer, as you type.
 - **Editing playlists.** Drag rows from any view onto a playlist in the
@@ -297,7 +299,9 @@ theme Omarchy sets.
   created, renamed and deleted from the sidebar, and a filter field above
   it narrows the playlists shown as you type. Each
   change is written to the `.m3u8` file at once. Sorting a playlist by
-  another column changes only the view, never the file.
+  another column changes only the view, never the file, until Save Order
+  to Playlist (in the context menu, after a confirmation) rewrites the file
+  in the order shown; the next sync then gives the iPod that order.
 - **Editing tags.** Get Info opens a form modelled on the Info tab of
   iTunes 10:
 

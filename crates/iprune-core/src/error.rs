@@ -184,6 +184,8 @@ pub enum Error {
     RestoreUnfinished(String),
     #[error("position {position} is out of range (playlist has {len} entries)")]
     BadPosition { position: usize, len: usize },
+    #[error("the new order does not name each of the playlist's {len} entries exactly once")]
+    BadOrder { len: usize },
 }
 
 impl Error {

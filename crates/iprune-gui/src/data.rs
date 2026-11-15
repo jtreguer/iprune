@@ -209,6 +209,16 @@ impl Data {
         )?)
     }
 
+    /// Rewrites the playlist in a new order, see `playlists::set_order`.
+    pub fn set_order(&self, name: &str, order: &[usize]) -> Result<()> {
+        Ok(playlists::set_order(
+            self.store.conn(),
+            &self.config,
+            name,
+            order,
+        )?)
+    }
+
     /// Moves the entries at 1-based `positions` before `before`.
     pub fn move_entries(&self, name: &str, positions: &[usize], before: usize) -> Result<()> {
         Ok(playlists::move_entries(

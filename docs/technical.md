@@ -1353,7 +1353,12 @@ libadwaita's widgets.
   column sorters (`gtk::CustomSorter` calling `Column::compare`). List widgets are recycled,
   so widgets exist only for the visible rows; the ~9,700 track objects are
   plain data that sorting and filtering go through. Column visibility, width
-  and order are saved per view in `~/.local/state/iprune/ui.toml`.
+  and order are saved per view in `~/.local/state/iprune/ui.toml`, and in
+  its `[sorts]` table each playlist's sort, by playlist name (column key
+  and direction). `#` ascending is the default and is not stored; a saved
+  column that is unknown or hidden falls back to it. Renaming or deleting a
+  playlist in the window moves or drops its entry; the sorts `show` applies
+  are not recorded as choices.
 - **Badge.** An "IPRUNE" label (`app-mark`, a fixed orange with a border,
   clear on dark and most mid backgrounds, weaker on very light ones)
   follows the Sync button in the header, so the window is not taken for
@@ -1505,7 +1510,11 @@ with iTunes-style ties (artist, album, disc, track, name), a column menu,
 search, a status line with totals, and the iPod's state; (2) editing:
 dragging rows onto a playlist in the sidebar appends them, dragging inside a
 playlist sorted by `#` (ascending) reorders it (`playlists::move_entries`,
-one write for several rows), Delete removes the selected entries, Ctrl+Up
+one write for several rows), Save Order to Playlist (enabled when a
+playlist is sorted otherwise) sorts every entry, those a search hides
+included, with the grid's own sorter and writes that order after a
+confirmation (`playlists::set_order`, a whole rearrangement checked to name
+each position once, one write), Delete removes the selected entries, Ctrl+Up
 and Ctrl+Down move them, a context menu offers Remove from Playlist and Show
 in Folder, and playlists are created (Ctrl+N or the + button), renamed (F2
 or the sidebar's context menu) and deleted (context menu, with

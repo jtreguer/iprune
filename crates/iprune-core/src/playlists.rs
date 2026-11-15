@@ -473,12 +473,46 @@ pub fn move_entries(
 ) -> Result<()> {
     edit(conn, cfg, name, |items| {
         let order = reorder(items.len(), positions, before)?;
-        let old = std::mem::take(items);
-        let mut old: Vec<Option<Item>> = old.into_iter().map(Some).collect();
-        *items = order
-            .iter()
-            .map(|&p| old[p - 1].take().expect("each position once"))
-            .collect();
+        rearrange(items, &order);
         Ok(())
     })
+}
+
+/// Puts the entries in a new order, as a whole: the entry at 1-based
+/// position `order[i]` goes to place `i + 1`. `order` must name each
+/// position of the file exactly once; otherwise nothing is written. One
+/// write of the file.
+pub fn set_order(conn: &Connection, cfg: &Config, name: &str, order: &[usize]) -> Result<()> {
+    edit(conn, cfg, name, |items| {
+        check_order(order, items.len())?;
+        rearrange(items, order);
+        Ok(())
+    })
+}
+
+/// `order` is a rearrangement of 1..=`len`: a position out of range is
+/// reported as such, a wrong count or a repeat as a bad order.
+fn check_order(order: &[usize], len: usize) -> Result<()> {
+    let mut seen = vec![false; len];
+    for &p in order {
+        let i = check_position(p, len)?;
+        if std::mem::replace(&mut seen[i], true) {
+            return Err(Error::BadOrder { len });
+        }
+    }
+    if order.len() != len {
+        return Err(Error::BadOrder { len });
+    }
+    Ok(())
+}
+
+/// Reorders `items` by `order`, a checked rearrangement of their 1-based
+/// positions.
+fn rearrange(items: &mut Vec<Item>, order: &[usize]) {
+    let old = std::mem::take(items);
+    let mut old: Vec<Option<Item>> = old.into_iter().map(Some).collect();
+    *items = order
+        .iter()
+        .map(|&p| old[p - 1].take().expect("each position once"))
+        .collect();
 }

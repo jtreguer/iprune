@@ -116,6 +116,12 @@ struct Ui {
     layouts: RefCell<Layouts>,
     /// Whether the columns now follow the playlist layout.
     playlist_layout: Cell<bool>,
+    /// Set while `show` applies a sort, which is then not a choice to
+    /// remember.
+    restoring_sort: Cell<bool>,
+    /// Save Order to Playlist, enabled for a playlist not sorted by `#`
+    /// ascending.
+    save_order_action: RefCell<Option<gio::SimpleAction>>,
     reload_pending: Cell<bool>,
     monitor: RefCell<Option<gio::FileMonitor>>,
     /// The modification time of the playlist file on screen when it was
@@ -547,13 +553,128 @@ impl Ui {
         });
     }
 
+    /// The grid's sort: its first column and whether it is descending.
+    fn current_sort(&self) -> Option<(Column, bool)> {
+        let sorter = self.view.sorter().and_downcast::<gtk::ColumnViewSorter>()?;
+        let primary = sorter.primary_sort_column()?;
+        let (col, _) = self.columns.iter().find(|(_, c)| *c == primary)?;
+        Some((
+            *col,
+            sorter.primary_sort_order() == gtk::SortType::Descending,
+        ))
+    }
+
     fn sorted_by_position(&self) -> bool {
-        let Some(sorter) = self.view.sorter().and_downcast::<gtk::ColumnViewSorter>() else {
-            return false;
+        self.current_sort() == Some((Column::Position, false))
+    }
+
+    /// Sorts the grid by `col` alone.
+    fn sort_by(&self, col: Column, descending: bool) {
+        let Some((_, c)) = self.columns.iter().find(|(k, _)| *k == col) else {
+            return;
         };
-        let position = self.columns.iter().find(|(c, _)| *c == Column::Position);
-        sorter.primary_sort_column().as_ref() == position.map(|(_, c)| c)
-            && sorter.primary_sort_order() == gtk::SortType::Ascending
+        let order = match descending {
+            true => gtk::SortType::Descending,
+            false => gtk::SortType::Ascending,
+        };
+        // Cleared first, or the previous column stays as a second key with
+        // its own arrow.
+        self.view.sort_by_column(None, gtk::SortType::Ascending);
+        self.view.sort_by_column(Some(c), order);
+    }
+
+    /// A header was clicked: a playlist remembers its sort.
+    fn sort_changed(&self) {
+        if self.restoring_sort.get() {
+            return;
+        }
+        self.update_save_order();
+        let (Some(name), Some((col, descending))) = (self.playlist_name(), self.current_sort())
+        else {
+            return;
+        };
+        let changed = self
+            .layouts
+            .borrow_mut()
+            .note_playlist_sort(&name, col, descending);
+        if changed {
+            self.save_layouts();
+        }
+    }
+
+    /// Save Order to Playlist: for a playlist sorted otherwise than by `#`
+    /// ascending.
+    fn update_save_order(&self) {
+        if let Some(a) = &*self.save_order_action.borrow() {
+            a.set_enabled(self.playlist_name().is_some() && !self.sorted_by_position());
+        }
+    }
+
+    /// Asks, then rewrites the playlist on screen in the order shown.
+    fn save_order(self: &Rc<Self>) {
+        let Some(name) = self.playlist_name() else {
+            return;
+        };
+        let Some((col, descending)) = self.current_sort() else {
+            return;
+        };
+        if self.sorted_by_position() {
+            return;
+        }
+        let direction = if descending {
+            "descending"
+        } else {
+            "ascending"
+        };
+        let dialog = gtk::AlertDialog::builder()
+            .message(format!("Save the order shown to {name:?}?"))
+            .detail(format!(
+                "The playlist file is rewritten in the order of the grid, sorted by {} \
+                 ({direction}), and the next sync gives the iPod this order. There is no undo.",
+                col.title()
+            ))
+            .buttons(["Cancel", "Save Order"])
+            .cancel_button(0)
+            .default_button(0)
+            .modal(true)
+            .build();
+        let ui = Rc::downgrade(self);
+        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |answer| {
+            if let (Some(ui), Ok(1)) = (ui.upgrade(), answer) {
+                ui.write_shown_order(&name);
+            }
+        });
+    }
+
+    /// Writes the order the grid's sort gives to every entry, those a search
+    /// hides included.
+    fn write_shown_order(&self, name: &str) {
+        // Another playlist may be on screen by the time the dialog closed.
+        if self.playlist_name().as_deref() != Some(name) || !self.ensure_fresh(name) {
+            return;
+        }
+        let Some(sorter) = self.view.sorter() else {
+            return;
+        };
+        let mut objects: Vec<glib::Object> = (0..self.store.n_items())
+            .filter_map(|i| self.store.item(i))
+            .collect();
+        // Stable, from file order, as the grid's own sort.
+        objects.sort_by(|a, b| sorter.compare(a, b).into());
+        let Some(order) = view_model::order_from_sorted(objects.iter().map(|o| row_of(o).position))
+        else {
+            self.status
+                .set_text(&format!("{name} is already in this order"));
+            return;
+        };
+        match self.data.set_order(name, &order) {
+            Ok(()) => {
+                self.refresh();
+                self.status
+                    .set_text(&format!("Saved the order shown to {name}"));
+            }
+            Err(e) => self.edit_failed("The playlist was not changed", &e),
+        }
     }
 
     /// True when the playlist file is still the one on screen. Otherwise
@@ -959,8 +1080,9 @@ impl Ui {
         let _ = std::fs::write(path, text);
     }
 
-    /// Switches the grid to `source`: its layout, its default sort (`#` for
-    /// a playlist, artist for the library), then its rows.
+    /// Switches the grid to `source`: its layout, its sort (for a playlist
+    /// the one it was last given, `#` by default; artist for the library),
+    /// then its rows.
     fn show(&self, source: &Source) {
         let before = self.current.replace(source.clone());
         if *source == Source::Import {
@@ -975,6 +1097,7 @@ impl Ui {
                 ui.import_fill_playlists();
                 ui.import_reload();
             }
+            self.update_save_order();
             self.update_status();
             return;
         }
@@ -996,19 +1119,31 @@ impl Ui {
             Source::Playlist(name) => name,
         });
         let in_playlist = matches!(source, Source::Playlist(_));
-        let sort_by = match source {
-            Source::Library | Source::Import => Column::Artist,
-            Source::Playlist(_) => Column::Position,
-        };
+        // Neither the columns put back by the layout switch nor the sort
+        // applied here are a choice to remember: the sorter reports both.
+        self.restoring_sort.set(true);
         // Sort order first, then the rows, so they are sorted once.
         self.store.remove_all();
         self.switch_layout(in_playlist);
-        if let Some((_, c)) = self.columns.iter().find(|(c, _)| *c == sort_by) {
-            // Cleared first, or the previous column stays as a second key
-            // with its own arrow.
-            self.view.sort_by_column(None, gtk::SortType::Ascending);
-            self.view.sort_by_column(Some(c), gtk::SortType::Ascending);
-        }
+        let (col, descending) = match source {
+            Source::Library | Source::Import => (Column::Artist, false),
+            Source::Playlist(name) => {
+                let saved = self.layouts.borrow().playlist_sort(name);
+                // A column since hidden would sort the rows invisibly.
+                let shown = self
+                    .columns
+                    .iter()
+                    .any(|(c, v)| *c == saved.0 && v.is_visible());
+                if shown {
+                    saved
+                } else {
+                    (Column::Position, false)
+                }
+            }
+        };
+        self.sort_by(col, descending);
+        self.restoring_sort.set(false);
+        self.update_save_order();
         self.load_rows();
     }
 
@@ -2004,6 +2139,10 @@ impl Ui {
                 let Some(ui) = ui.upgrade() else { return };
                 match ui.data.create(&name) {
                     Ok(()) => {
+                        // A sort left under this name by a playlist deleted
+                        // outside the window is not this one's.
+                        ui.layouts.borrow_mut().forget_playlist_sort(&name);
+                        ui.save_layouts();
                         *ui.current.borrow_mut() = Source::Playlist(name);
                         ui.fill_sidebar();
                     }
@@ -2028,6 +2167,8 @@ impl Ui {
                 }
                 match ui.data.rename(&old, &new) {
                     Ok(()) => {
+                        ui.layouts.borrow_mut().rename_playlist_sort(&old, &new);
+                        ui.save_layouts();
                         if *ui.current.borrow() == Source::Playlist(old.clone()) {
                             *ui.current.borrow_mut() = Source::Playlist(new);
                         }
@@ -2060,7 +2201,11 @@ impl Ui {
             match ui.data.delete(&name) {
                 // The sidebar falls back to the library when the playlist
                 // shown is gone.
-                Ok(()) => ui.fill_sidebar(),
+                Ok(()) => {
+                    ui.layouts.borrow_mut().forget_playlist_sort(&name);
+                    ui.save_layouts();
+                    ui.fill_sidebar();
+                }
                 Err(e) => ui.show_error("The playlist was not deleted", &e),
             }
         });
@@ -2402,6 +2547,10 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     grid_menu.append(Some("Show in Playlist…"), Some("win.show-in-playlist"));
     grid_menu.append(Some("Remove from Playlist"), Some("win.remove"));
     grid_menu.append(Some("Show in Folder"), Some("win.show-in-folder"));
+    // Acts on the playlist as a whole, so apart from the row items.
+    let order_items = gio::Menu::new();
+    order_items.append(Some("Save Order to Playlist…"), Some("win.save-order"));
+    grid_menu.append_section(None, &order_items);
     let row_menu = gtk::PopoverMenu::from_model(Some(&grid_menu));
     row_menu.set_parent(&view);
     row_menu.set_has_arrow(false);
@@ -2578,6 +2727,8 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         context_playlist: RefCell::new(None),
         layouts: RefCell::new(layouts),
         playlist_layout: Cell::new(false),
+        restoring_sort: Cell::new(false),
+        save_order_action: RefCell::new(None),
         reload_pending: Cell::new(false),
         monitor: RefCell::new(None),
         shown_mtime: Cell::new(None),
@@ -2644,6 +2795,18 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         }
     });
     *ui.playlist_actions.borrow_mut() = vec![remove.clone(), up.clone(), down.clone()];
+    let save_order = action(window, "save-order", &ui, |ui| ui.save_order());
+    save_order.set_enabled(false);
+    *ui.save_order_action.borrow_mut() = Some(save_order);
+    // A header clicked in a playlist: the sort is remembered for it.
+    if let Some(sorter) = ui.view.sorter() {
+        let weak = Rc::downgrade(&ui);
+        sorter.connect_changed(move |_, _| {
+            if let Some(ui) = weak.upgrade() {
+                ui.sort_changed();
+            }
+        });
+    }
     let scan = action(window, "scan", &ui, |ui| ui.scan_library());
     *ui.scan_action.borrow_mut() = Some(scan);
     let sync = action(window, "sync", &ui, |ui| ui.open_sync());

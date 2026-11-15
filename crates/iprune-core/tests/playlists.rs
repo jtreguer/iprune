@@ -1285,3 +1285,201 @@ fn a_displaced_extinf_keeps_its_place_among_the_lines() {
     let text = "#EXTM3U\n#EXTINF:5,D\n# c\n#EXTINF:6,T\n/a.mp3\n#EXTINF:7,E\n# d\n";
     assert_eq!(playlist::render(&playlist::parse(text)), text);
 }
+
+// ---- set_order: a whole rearrangement
+
+fn ordered_titles(order: &[usize]) -> Vec<String> {
+    let (env, t) = env3();
+    five(&env, &t);
+    playlists::set_order(env.store.conn(), &env.cfg, "mix", order).unwrap();
+    titles(&env, "mix")
+}
+
+#[test]
+fn set_order_reverses_and_permutes_in_file_and_index() {
+    let (env, t) = env3();
+    five(&env, &t); // 1 2 3 1 2
+    playlists::set_order(env.store.conn(), &env.cfg, "mix", &[5, 4, 3, 2, 1]).unwrap();
+    assert_eq!(
+        env.locations("mix"),
+        [&t[1], &t[0], &t[2], &t[1], &t[0]].map(|p| s(p))
+    );
+    let idx = env.indexed_items("mix");
+    assert_eq!(idx.iter().map(|i| i.0).collect::<Vec<_>>(), [0, 1, 2, 3, 4]);
+    let want: Vec<i64> = [&t[1], &t[0], &t[2], &t[1], &t[0]]
+        .iter()
+        .map(|p| env.track(p).id)
+        .collect();
+    assert_eq!(idx.iter().map(|i| i.1.unwrap()).collect::<Vec<_>>(), want);
+
+    // order[i] is the old position of the entry that goes to place i + 1
+    assert_eq!(
+        ordered_titles(&[3, 5, 1, 2, 4]),
+        ["Title3", "Title2", "Title1", "Title2", "Title1"]
+    );
+}
+
+#[test]
+fn set_order_identity_keeps_the_entries_in_place() {
+    let (env, t) = env3();
+    five(&env, &t);
+    let idx = env.indexed_items("mix");
+    playlists::set_order(env.store.conn(), &env.cfg, "mix", &[1, 2, 3, 4, 5]).unwrap();
+    assert_eq!(
+        titles(&env, "mix"),
+        ["Title1", "Title2", "Title3", "Title1", "Title2"]
+    );
+    assert_eq!(env.indexed_items("mix"), idx);
+}
+
+#[test]
+fn set_order_with_a_bad_order_returns_the_error_and_changes_nothing() {
+    let (env, t) = env3();
+    five(&env, &t);
+    let conn = env.store.conn();
+    let text = env.read_playlist("mix");
+    let idx = env.indexed_items("mix");
+    let bad_order: &[&[usize]] = &[
+        &[],
+        &[1, 2, 3, 4],
+        &[1, 1, 2, 3, 4],
+        &[1, 2, 3, 4, 5, 1],
+        &[2, 2, 2, 2, 2],
+    ];
+    for order in bad_order {
+        let err = playlists::set_order(conn, &env.cfg, "mix", order).unwrap_err();
+        assert!(
+            matches!(err, Error::BadOrder { len: 5 }),
+            "{order:?}: {err:?}"
+        );
+    }
+    let out_of_range: &[(&[usize], usize)] = &[
+        (&[0, 1, 2, 3, 4], 0),
+        (&[1, 2, 3, 4, 6], 6),
+        (&[1, 2, 3, 4, 5, 6], 6),
+    ];
+    for (order, position) in out_of_range {
+        let err = playlists::set_order(conn, &env.cfg, "mix", order).unwrap_err();
+        assert!(
+            matches!(err, Error::BadPosition { position: p, len: 5 } if p == *position),
+            "{order:?}: {err:?}"
+        );
+    }
+    let err = playlists::set_order(conn, &env.cfg, "nope", &[1]).unwrap_err();
+    assert!(
+        matches!(err, Error::NoSuchPlaylist(ref n) if n == "nope"),
+        "{err:?}"
+    );
+    assert_eq!(env.read_playlist("mix"), text);
+    assert_eq!(env.indexed_items("mix"), idx);
+    assert_eq!(fs::read_dir(&env.lists).unwrap().count(), 1);
+}
+
+#[test]
+fn set_order_on_a_playlist_of_one_and_of_none() {
+    let (env, t) = env3();
+    let conn = env.store.conn();
+    playlists::create(conn, &env.cfg, "empty").unwrap();
+    let empty = env.read_playlist("empty");
+    playlists::set_order(conn, &env.cfg, "empty", &[]).unwrap();
+    assert_eq!(env.read_playlist("empty"), empty);
+    let err = playlists::set_order(conn, &env.cfg, "empty", &[1]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::BadPosition {
+                position: 1,
+                len: 0
+            }
+        ),
+        "{err:?}"
+    );
+
+    playlists::create(conn, &env.cfg, "one").unwrap();
+    playlists::add(conn, &env.cfg, "one", &[t[1].clone()], None).unwrap();
+    let one = env.read_playlist("one");
+    playlists::set_order(conn, &env.cfg, "one", &[1]).unwrap();
+    assert_eq!(titles(&env, "one"), ["Title2"]);
+    for (order, bad_position) in [
+        (&[1usize, 1][..], false),
+        (&[2][..], true),
+        (&[][..], false),
+    ] {
+        let err = playlists::set_order(conn, &env.cfg, "one", order).unwrap_err();
+        match bad_position {
+            true => assert!(
+                matches!(
+                    err,
+                    Error::BadPosition {
+                        position: 2,
+                        len: 1
+                    }
+                ),
+                "{err:?}"
+            ),
+            false => assert!(matches!(err, Error::BadOrder { len: 1 }), "{err:?}"),
+        }
+    }
+    assert_eq!(env.read_playlist("one"), one);
+}
+
+#[test]
+fn set_order_carries_unresolved_entries_verbatim_with_their_extinf() {
+    let (env, t) = env3();
+    let original = format!(
+        "#EXTM3U\n#EXTINF:241,Ghost - Gone Song\n/old/place/ghost.mp3\n{}\n#EXTINF:7,Odd\nhttp://example.com/stream one\n  spaced entry.mp3\n",
+        t[0].display()
+    );
+    load(&env, "mix", &original);
+
+    // [ghost a http spaced] -> [spaced http ghost a]
+    playlists::set_order(env.store.conn(), &env.cfg, "mix", &[4, 3, 1, 2]).unwrap();
+
+    let text = env.read_playlist("mix");
+    assert!(
+        text.contains("#EXTINF:241,Ghost - Gone Song\n/old/place/ghost.mp3\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("#EXTINF:7,Odd\nhttp://example.com/stream one\n"),
+        "{text}"
+    );
+    assert_eq!(
+        env.locations("mix"),
+        vec![
+            "  spaced entry.mp3".to_owned(),
+            "http://example.com/stream one".to_owned(),
+            "/old/place/ghost.mp3".to_owned(),
+            s(&t[0]),
+        ]
+    );
+    let idx = env.indexed_items("mix");
+    assert_eq!(
+        idx.iter().map(|i| i.1.is_some()).collect::<Vec<_>>(),
+        [false, false, false, true]
+    );
+}
+
+#[test]
+fn set_order_leaves_the_other_lines_where_they_are() {
+    let (env, t) = env3();
+    load(
+        &env,
+        "so",
+        &format!(
+            "#PLAYLIST:x\n{a}\n# mid\n{b}\n# tail\n",
+            a = t[0].display(),
+            b = t[1].display()
+        ),
+    );
+    playlists::set_order(env.store.conn(), &env.cfg, "so", &[2, 1]).unwrap();
+    let want = [
+        "#EXTM3U".to_owned(),
+        "#PLAYLIST:x".to_owned(),
+        s(&t[1]),
+        "# mid".to_owned(),
+        s(&t[0]),
+        "# tail".to_owned(),
+    ];
+    assert_eq!(without_extinf(&env.read_playlist("so")), want);
+}
