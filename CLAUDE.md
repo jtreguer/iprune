@@ -20,8 +20,8 @@ grid, playlist editing, sync, adoption review, eject; desktop entry,
 notifications, `packaging/install.sh`). M8, tag editing (`docs/technical.md`
 section 7.1: `tag_edit`, `iprune tag`, the Get Info form), is done too.
 M9, import (`docs/design.md` section 7.6, `docs/technical.md` section 7.2,
-four steps in section 17), is under way: steps 1 (autotag), 2 (`import`,
-`iprune import`) and 3 (the Import view) are done; packaging remains.
+four steps in section 17), is done: autotag, `import` and `iprune import`,
+the Import view, and `install.sh` installing autotag next to the binaries.
 Work followed the milestones in `docs/technical.md` section 17:
 
 | # | Deliverable | Writes to iPod |
@@ -91,7 +91,7 @@ crates/iprune-gui/   binary `iprune-gui`: GTK4 window, iTunes-style grid (M6); v
                      workers (no GTK, tested), main, adopt_dialog, info_dialog and
                      import_view are GTK; view_model::import has the Import view's rows
 crates/gpod/tests/c/ snapshot.c (copy of the C repair tool) and make_fixture.c
-packaging/           iprune.desktop and install.sh (cargo install and the desktop entry)
+packaging/           iprune.desktop and install.sh (cargo install, autotag, the desktop entry)
 tools/autotag        Python script (uv, mutagen): tags new songs from MusicBrainz and files
                      them into the library; ~/Music/autotag links to it. `autotag serve` is
                      what iprune's import drives (design 7.6 and decision 6)
@@ -110,7 +110,7 @@ PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with 'mutagen>=1.47' pytest too
                                             # autotag: no network, ffmpeg and ffprobe needed
 # cargo sets IPRUNE_NO_DETECT (.cargo/config.toml): nothing it runs finds the
 # real iPod by itself, `cargo run` included; set device.mountpoint for that
-packaging/install.sh                        # install both binaries and the desktop entry
+packaging/install.sh                        # install both binaries, autotag and the desktop entry
 ```
 
 Requires `libgpod` installed (`pacman -S libgpod`) and `pkg-config libgpod-1.0`

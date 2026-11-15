@@ -1584,7 +1584,17 @@ the running one's window to the front.
   `packaging/iprune.desktop`, with `Exec` set to the installed
   `iprune-gui` in full, since the launcher may not have cargo's folder on
   its PATH. `StartupWMClass` is the application id, `dev.iprune.Iprune`.
-  `install.sh --uninstall` removes the binaries and the entry. A PKGBUILD
+  It also copies `tools/autotag` into the same `bin` folder, where the
+  import looks for it first (section 7.2), through a temporary file and a
+  rename so a running autotag keeps its file, and says so when `uv`,
+  which autotag runs with, is not on the PATH. The copy is a snapshot:
+  a change to `tools/autotag` needs `install.sh` again, as a change to
+  the binaries does. Binaries run from the build folder (`cargo run`,
+  `target/debug`) have no autotag beside them and take the one on `PATH`,
+  which is that installed copy when cargo's `bin` folder is there; set
+  `import.autotag` to the repository's `tools/autotag` to try a change to
+  it without installing. `install.sh --uninstall` removes the binaries,
+  autotag and the entry; the link at `~/Music/autotag` stays. A PKGBUILD
   may come later.
 - Notifications through `notify-send` (module `notify`), once a plan is
   confirmed (`--yes`, the prompt, or Apply in the window): "iPod synced"

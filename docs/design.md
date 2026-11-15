@@ -513,8 +513,9 @@ Answers to the questions left open in the first draft (2026-10-13):
    had never done before, so iprune's own tag writer changes only the
    edited frames, and each new file is read back and checked before it
    replaces the original (technical document, section 7.1).
-6. Importing was proposed on 2026-11-14 and is not built yet (sections 7.6
-   and 8). iprune runs `autotag` (`tools/autotag`, a Python script using
+6. Importing was proposed on 2026-11-14 and built in four steps, the last
+   on 2026-11-15 (sections 7.6 and 8; technical document, section 17).
+   iprune runs `autotag` (`tools/autotag`, a Python script using
    mutagen) instead of looking songs up itself. The MusicBrainz ranking and
    the folder layout then live in one place, autotag keeps working on its
    own, and iprune has no network code. autotag gains a `serve` mode that
