@@ -1102,18 +1102,6 @@ impl Ui {
             return;
         }
         self.stack.set_visible_child_name("tracks");
-        // Leaving an empty inbox: its row goes, once the sidebar is done
-        // with this selection.
-        if before == Source::Import
-            && let Some(ui) = self.import.ui()
-        {
-            let ui = Rc::downgrade(&ui);
-            glib::idle_add_local_once(move || {
-                if let Some(ui) = ui.upgrade() {
-                    ui.import_count_changed(import_job::count(ui.data.config()));
-                }
-            });
-        }
         self.title.set_text(match source {
             Source::Library | Source::Import => "Music",
             Source::Playlist(name) => name,
@@ -2083,16 +2071,13 @@ impl Ui {
         sources.push(None);
         self.sidebar.append(&sidebar_item("Music"));
         sources.push(Some(Source::Library));
-        // Under Music while the inbox holds files, or while it is shown.
+        // Always under Music, so Add Files… is one click away; it says how
+        // many files wait.
         let files = import_job::count(self.data.config());
-        let shown = *self.current.borrow() == Source::Import;
-        let row = view_model::import::import_row_wanted(files, shown).then(|| {
-            let row = sidebar_item(&view_model::import::sidebar_label(files));
-            self.sidebar.append(&row);
-            sources.push(Some(Source::Import));
-            row
-        });
-        *self.import.sidebar_row.borrow_mut() = row;
+        let row = sidebar_item(&view_model::import::sidebar_label(files));
+        self.sidebar.append(&row);
+        sources.push(Some(Source::Import));
+        *self.import.sidebar_row.borrow_mut() = Some(row);
         self.import_fill_playlists();
         self.sidebar.append(&sidebar_header("Playlists"));
         sources.push(None);
@@ -3138,8 +3123,11 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
         });
     }
     // Songs dropped anywhere on the window go to the inbox; a file put
-    // there by another program shows at once.
+    // there by another program shows at once. The inbox is made now, so it
+    // is watched from the start; one inside the library is not made, and
+    // the Import view says why.
     window.add_controller(ui.import_drop_target());
+    let _ = iprune_core::import::inbox_dir(ui.data.config());
     ui.import_watch();
     // The window owns the state from here.
     keep_alive(window, ui.clone());

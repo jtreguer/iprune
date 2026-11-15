@@ -985,24 +985,18 @@ impl Ui {
         });
     }
 
-    /// Shows the Import view, adding its sidebar row if needed.
+    /// Shows the Import view, through its sidebar row.
     pub(crate) fn import_show(self: &Rc<Self>) {
         let index = self
             .sources
             .borrow()
             .iter()
             .position(|s| matches!(s, Some(Source::Import)));
-        match index.and_then(|i| self.sidebar.row_at_index(i as i32)) {
-            Some(row) => {
-                if self.sidebar.selected_row().as_ref() == Some(&row) {
-                    self.show(&Source::Import);
-                } else {
-                    self.sidebar.select_row(Some(&row));
-                }
-            }
-            None => {
-                *self.current.borrow_mut() = Source::Import;
-                self.fill_sidebar();
+        if let Some(row) = index.and_then(|i| self.sidebar.row_at_index(i as i32)) {
+            if self.sidebar.selected_row().as_ref() == Some(&row) {
+                self.show(&Source::Import);
+            } else {
+                self.sidebar.select_row(Some(&row));
             }
         }
     }
@@ -1175,15 +1169,8 @@ impl Ui {
         }
     }
 
-    /// The sidebar's Import row follows the number of files in the inbox:
-    /// added or removed as it fills or empties, but kept while shown.
+    /// The sidebar's Import row says how many files are in the inbox.
     pub(crate) fn import_count_changed(self: &Rc<Self>, n: usize) {
-        let has = self.import.sidebar_row.borrow().is_some();
-        let shown = *self.current.borrow() == Source::Import;
-        if model::import_row_wanted(n, shown) != has {
-            self.fill_sidebar();
-            return;
-        }
         if let Some(label) = self
             .import
             .sidebar_row

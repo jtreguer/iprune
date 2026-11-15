@@ -964,7 +964,9 @@ fn the_summary_counts_files_and_ready_ones() {
 
 #[test]
 fn the_sidebar_label_shows_the_file_count() {
-    assert_eq!(sidebar_label(0), "Import (0)");
+    // An empty inbox shows no count; the row is always there.
+    assert_eq!(sidebar_label(0), "Import");
+    assert_eq!(sidebar_label(1), "Import (1)");
     assert_eq!(sidebar_label(6), "Import (6)");
 }
 
@@ -1021,23 +1023,6 @@ fn lookups_start_by_themselves_only_when_all_four_conditions_hold() {
     assert!(!auto_look_up(true, false, true, false));
     assert!(!auto_look_up(true, true, false, false));
     assert!(!auto_look_up(true, true, true, true));
-}
-
-#[test]
-fn the_sidebar_has_an_import_row_while_files_wait_or_the_view_is_open() {
-    for (files, shown, wanted) in [
-        (0, false, false),
-        (1, false, true),
-        (6, false, true),
-        (0, true, true),
-        (3, true, true),
-    ] {
-        assert_eq!(
-            import_row_wanted(files, shown),
-            wanted,
-            "{files} files, shown {shown}"
-        );
-    }
 }
 
 // A reload that kept the pane's radios must not re-tick them from the

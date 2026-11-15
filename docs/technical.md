@@ -1450,8 +1450,10 @@ libadwaita's widgets.
 - **Playlists folder.** A `gio::FileMonitor` reloads files changed by other
   programs.
 - **Import view** (M9, section 7.2). `Source::Import`: the sidebar's
-  Import row, under Music, shows the number of files in the inbox and is
-  there while it holds any, or while the view is shown. The main area is a
+  Import row is always under Music, "Import (n)" while files wait in the
+  inbox, so Add Files… is always one click away. The window makes the
+  inbox when it starts (unless it would lie inside the library, which the
+  view then reports), so it is watched from the start. The main area is a
   `gtk::Stack` of the track grid and the view (`import_view`, GTK only).
   `view_model::import` works out the rows (status, the tags the file would
   get against those it has, destination, candidates, duplicates, the
@@ -1500,7 +1502,7 @@ libadwaita's widgets.
     off. Filing takes the busy flag and, as a sync does, keeps the window
     from closing; a signal stops it between files. The report is a dialog
     like the scan's. A `gio::FileMonitor` on the inbox's top level,
-    started as soon as the inbox exists, reloads the view, or the
+    started with the window, reloads the view, or the
     sidebar's count when another view is shown; files another program
     puts in a subfolder show at the next reload. The rows selected stay
     selected across reloads, and what is typed in Search Again is kept.

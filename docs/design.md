@@ -340,8 +340,9 @@ theme Omarchy sets.
   with a progress bar; Eject unmounts and powers off the iPod.
 - **Adoption review.** On first connection, the proposals appear as a grid,
   one row per iPod track with its candidates, to accept or reject one by one.
-- **Importing.** Import appears under Music in the sidebar while the inbox
-  holds files, with their count (section 7.6). It is a view of the window,
+- **Importing.** Import is always under Music in the sidebar, with the
+  number of files in the inbox when there are any (section 7.6), so Add
+  Files… is one click away. It is a view of the window,
   not a modal dialog, since lookups take minutes and some files wait for a
   decision that can come later.
 

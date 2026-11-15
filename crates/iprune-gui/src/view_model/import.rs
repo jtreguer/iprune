@@ -464,15 +464,12 @@ pub fn keep_radios(same_file: bool, shown: &[String], candidates: &[CandidateLin
         && shown.iter().zip(candidates).all(|(s, c)| *s == c.label)
 }
 
-/// Whether the sidebar has an Import row: while the inbox holds files, or
-/// while the view is shown.
-pub fn import_row_wanted(files: usize, shown: bool) -> bool {
-    files > 0 || shown
-}
-
-/// The sidebar's row: "Import (6)".
+/// The sidebar's row: "Import", then "Import (6)" while files wait.
 pub fn sidebar_label(files: usize) -> String {
-    format!("Import ({files})")
+    match files {
+        0 => "Import".to_owned(),
+        n => format!("Import ({n})"),
+    }
 }
 
 /// The line under the grid while autotag works.
