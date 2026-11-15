@@ -421,21 +421,24 @@ fn add_of_an_unindexed_file_or_to_an_unknown_playlist_fails_and_writes_nothing()
 }
 
 #[test]
-fn move_entries_reorders_the_file_and_the_rows() {
+fn set_order_reorders_the_file_and_the_rows() {
     let sb = sandbox(5);
     sb.data.create("mix").unwrap();
     sb.data
         .add("mix", &sb.pick(&[0, 1, 2, 3, 4]), None)
         .unwrap();
-    sb.data.move_entries("mix", &[2, 4], 1).unwrap();
+    // entries 2 and 4 moved to the top
+    sb.data.set_order("mix", &[2, 4, 1, 3, 5]).unwrap();
     assert_eq!(sb.shown("mix"), sb.pick(&[1, 3, 0, 2, 4]));
-    sb.data.move_entries("mix", &[1], 6).unwrap();
+    // the first moved to the end
+    sb.data.set_order("mix", &[2, 3, 4, 5, 1]).unwrap();
     assert_eq!(sb.shown("mix"), sb.pick(&[3, 0, 2, 4, 1]));
 
-    // a bad position changes nothing
+    // a bad order changes nothing
     let before = sb.text("mix");
-    assert!(sb.data.move_entries("mix", &[9], 1).is_err());
-    assert!(sb.data.move_entries("mix", &[1], 7).is_err());
+    assert!(sb.data.set_order("mix", &[9, 1, 2, 3, 4]).is_err());
+    assert!(sb.data.set_order("mix", &[1, 2, 3, 4]).is_err());
+    assert!(sb.data.set_order("mix", &[1, 1, 2, 3, 4]).is_err());
     assert_eq!(sb.text("mix"), before);
 }
 
@@ -514,7 +517,7 @@ fn playlist_mtime_follows_every_kind_of_edit_and_is_none_for_unknown_playlists()
     let after_add = sb.data.playlist_mtime("mix").unwrap();
     assert_ne!(after_add, past);
     set_past(1_000_000);
-    sb.data.move_entries("mix", &[3], 1).unwrap();
+    sb.data.set_order("mix", &[3, 1, 2]).unwrap();
     let after_move = sb.data.playlist_mtime("mix").unwrap();
     assert_ne!(after_move, past);
     set_past(1_000_000);

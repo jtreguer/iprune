@@ -2437,3 +2437,236 @@ fn order_from_sorted_gives_the_positions_unless_already_in_file_order() {
     assert_eq!(order_from_sorted(vec![None, None]), None);
     assert_eq!(order_from_sorted(Vec::<Option<usize>>::new()), None);
 }
+
+// ------------------------------------------- shown_places, move_as_shown
+
+type ShownCase = (&'static [usize], &'static [usize], Option<Vec<usize>>);
+type NudgeCase = (&'static [usize], bool, Option<Vec<usize>>);
+
+#[test]
+fn shown_places_table() {
+    let cases: &[ShownCase] = &[
+        // identity
+        (&[1, 2, 3, 4], &[2, 4], Some(vec![2, 4])),
+        // reversed: position 1 is shown last
+        (&[4, 3, 2, 1], &[1, 4, 2], Some(vec![4, 1, 3])),
+        // arbitrary permutation, answer in the order asked
+        (&[3, 1, 4, 2, 5], &[5, 3, 2], Some(vec![5, 1, 4])),
+        // repeats are kept, not collapsed
+        (&[3, 1, 2], &[2, 2, 3], Some(vec![3, 3, 1])),
+        // one not shown, anywhere in the list
+        (&[3, 1, 2], &[1, 4], None),
+        (&[3, 1, 2], &[0], None),
+        (&[3, 1, 2], &[4, 1], None),
+        // empty
+        (&[3, 1, 2], &[], Some(vec![])),
+        (&[], &[], Some(vec![])),
+        (&[], &[1], None),
+    ];
+    for (shown, positions, want) in cases {
+        assert_eq!(
+            &shown_places(shown, positions),
+            want,
+            "{shown:?} {positions:?}"
+        );
+    }
+}
+
+fn is_permutation(order: &[usize], len: usize) -> bool {
+    let mut s = order.to_vec();
+    s.sort_unstable();
+    s.iter().copied().eq(1..=len)
+}
+
+#[test]
+fn move_as_shown_on_the_identity_is_reorder_in_file_order() {
+    let len = 6;
+    let shown: Vec<usize> = (1..=len).collect();
+    let moves: &[(&[usize], usize)] = &[
+        (&[3], 1),
+        (&[1], 7),
+        (&[1], 2),
+        (&[1], 3),
+        (&[6], 6),
+        (&[6], 1),
+        (&[2, 3], 6),
+        (&[5, 2, 4], 1),          // given out of order
+        (&[1, 3, 5], 7),          // scattered, to the end
+        (&[2, 5], 4),             // scattered, to the middle
+        (&[2, 4], 4),             // the target is itself moved
+        (&[2, 4], 2),             // ditto, the first moved
+        (&[3, 3, 4], 1),          // repeats
+        (&[1, 2, 3, 4, 5, 6], 3), // everything
+        (&[2], 2),                // in place
+        (&[2], 3),                // in place, after itself
+        (&[1, 2], 3),             // block already there
+    ];
+    for &(moved, before) in moves {
+        let reordered = iprune_core::playlists::reorder(len, moved, before).unwrap();
+        let want = if reordered.iter().copied().eq(1..=len) {
+            None
+        } else {
+            Some(reordered)
+        };
+        assert_eq!(
+            move_as_shown(&shown, moved, before),
+            want,
+            "{moved:?} before {before}"
+        );
+    }
+}
+
+#[test]
+fn move_as_shown_with_a_sorted_grid_moves_what_is_on_screen() {
+    // The grid shows playlist positions 3,1,4,2,5 top to bottom.
+    let shown = [3, 1, 4, 2, 5];
+    let cases: &[(&[usize], usize, Vec<usize>)] = &[
+        // the row at place 3 (position 4) up one place
+        (&[4], 2, vec![3, 4, 1, 2, 5]),
+        // the row at place 2 (position 1) down one place: before place 4
+        (&[1], 4, vec![3, 4, 1, 2, 5]),
+        // the row at place 4 (position 2) to the top
+        (&[2], 1, vec![2, 3, 1, 4, 5]),
+        // the row at place 1 (position 3) to the end
+        (&[3], 6, vec![1, 4, 2, 5, 3]),
+        // the last row to the top, the first row to the second place
+        (&[5], 1, vec![5, 3, 1, 4, 2]),
+        (&[3], 3, vec![1, 3, 4, 2, 5]),
+        // several rows gathered in on-screen order (not playlist order,
+        // not selection order): positions 2 (place 4), 3 (place 1), 5 (place 5)
+        (&[2, 3, 5], 3, vec![1, 3, 2, 5, 4]),
+        (&[5, 2, 3], 3, vec![1, 3, 2, 5, 4]),
+        (&[5, 2], 1, vec![2, 5, 3, 1, 4]),
+        // the target is one of the moved rows
+        (&[1, 4], 3, vec![3, 1, 4, 2, 5]), // identity on screen is None, see below
+    ];
+    for (moved, before, want) in cases {
+        let got = move_as_shown(&shown, moved, *before);
+        if *want == shown {
+            assert_eq!(got, None, "{moved:?} before {before}");
+            continue;
+        }
+        assert_eq!(got.as_ref(), Some(want), "{moved:?} before {before}");
+        assert!(is_permutation(got.as_ref().unwrap(), 5));
+    }
+}
+
+#[test]
+fn move_as_shown_on_the_spot_is_none_even_when_the_grid_is_not_in_file_order() {
+    let shown = [3, 1, 4, 2, 5];
+    // dropped on itself or right after itself
+    for (moved, before) in [
+        (&[3][..], 1),
+        (&[3], 2),
+        (&[1], 2),
+        (&[1], 3),
+        (&[5], 5),
+        (&[5], 6),
+        (&[3, 1], 3),
+        (&[1, 3], 1),
+        (&[4, 2], 5),
+        (&[3, 1, 4, 2, 5], 4),
+    ] {
+        assert_eq!(
+            move_as_shown(&shown, moved, before),
+            None,
+            "{moved:?} before {before}"
+        );
+    }
+}
+
+#[test]
+fn move_as_shown_refuses_what_is_out_of_range() {
+    let shown = [3, 1, 4, 2, 5];
+    assert_eq!(move_as_shown(&shown, &[1], 0), None);
+    assert_eq!(move_as_shown(&shown, &[1], 7), None);
+    assert_eq!(move_as_shown(&shown, &[6], 1), None);
+    assert_eq!(move_as_shown(&shown, &[0], 1), None);
+    assert_eq!(move_as_shown(&shown, &[1, 9], 1), None);
+    assert_eq!(move_as_shown(&[], &[1], 1), None);
+    // a position the grid does not show, even if it is in range of the playlist
+    assert_eq!(move_as_shown(&[2, 1], &[3], 1), None);
+    // nothing to move
+    assert_eq!(move_as_shown(&shown, &[], 1), None);
+}
+
+#[test]
+fn move_as_shown_always_gives_a_permutation_of_the_playlist() {
+    let len = 5;
+    for shown in [
+        vec![1, 2, 3, 4, 5],
+        vec![5, 4, 3, 2, 1],
+        vec![3, 1, 4, 2, 5],
+        vec![2, 5, 1, 3, 4],
+    ] {
+        for mask in 1u32..(1 << len) {
+            let moved: Vec<usize> = (1..=len).filter(|p| mask >> (p - 1) & 1 == 1).collect();
+            for before in 1..=len + 1 {
+                let Some(order) = move_as_shown(&shown, &moved, before) else {
+                    continue;
+                };
+                assert!(is_permutation(&order, len), "{shown:?} {moved:?} {before}");
+                assert_ne!(
+                    order, shown,
+                    "{shown:?} {moved:?} {before}: a no-op was reported"
+                );
+                // the moved entries stay together, in the order shown
+                let on_screen: Vec<usize> = shown
+                    .iter()
+                    .copied()
+                    .filter(|p| moved.contains(p))
+                    .collect();
+                let at = order.iter().position(|p| *p == on_screen[0]).unwrap();
+                assert_eq!(&order[at..at + on_screen.len()], &on_screen[..]);
+                // the others keep the order shown
+                let rest = |v: &[usize]| -> Vec<usize> {
+                    v.iter().copied().filter(|p| !moved.contains(p)).collect()
+                };
+                assert_eq!(rest(&order), rest(&shown));
+            }
+        }
+    }
+}
+
+#[test]
+fn ctrl_up_and_down_move_the_selected_block_one_place_on_screen() {
+    let shown = [3, 1, 4, 2, 5];
+    let len = shown.len();
+    // the Ctrl+Up / Ctrl+Down composition of the window
+    let nudge = |sel: &[usize], up: bool| -> Option<Vec<usize>> {
+        let places = shown_places(&shown, sel)?;
+        match nudge_before(&places, len, up) {
+            Nudge::Before(b) => move_as_shown(&shown, sel, b),
+            _ => None,
+        }
+    };
+    // (selection as playlist positions, up, order after)
+    let cases: &[NudgeCase] = &[
+        (&[4], true, Some(vec![3, 4, 1, 2, 5])),
+        (&[4], false, Some(vec![3, 1, 2, 4, 5])),
+        // block at places 2-3 (positions 1 and 4), selection given in any order
+        (&[1, 4], true, Some(vec![1, 4, 3, 2, 5])),
+        (&[4, 1], false, Some(vec![3, 2, 1, 4, 5])),
+        // block at places 4-5 down: already at the bottom
+        (&[2, 5], false, None),
+        // first place up, last place down
+        (&[3], true, None),
+        (&[5], false, None),
+        // places 1 and 3 (positions 3 and 4) are not adjacent on screen
+        // even though positions 3 and 4 are adjacent in the file
+        (&[3, 4], true, None),
+        // places 2 and 3 are adjacent on screen but positions 1 and 4 are not
+        // in the file: the screen decides
+        (&[1, 4], true, Some(vec![1, 4, 3, 2, 5])),
+        // empty and unknown
+        (&[], true, None),
+        (&[9], true, None),
+    ];
+    for (sel, up, want) in cases {
+        assert_eq!(&nudge(sel, *up), want, "{sel:?} up {up}");
+    }
+    // the gap case is reported as such, not as nothing to do
+    let places = shown_places(&shown, &[3, 4]).unwrap();
+    assert_eq!(places, [1, 3]);
+    assert_eq!(nudge_before(&places, len, true), Nudge::NotAdjacent);
+}

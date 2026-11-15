@@ -291,7 +291,7 @@ fn make_column(col: Column, slot: UiSlot) -> gtk::ColumnViewColumn {
                     return false;
                 };
                 let height = f64::from(target.widget().map_or(1, |w| w.height()));
-                ui.drop_on_row(view_model::drop_before(position, y, height))
+                ui.drop_on_row(position, y, height)
             });
         }
         label.add_controller(target);
@@ -653,16 +653,10 @@ impl Ui {
         if self.playlist_name().as_deref() != Some(name) || !self.ensure_fresh(name) {
             return;
         }
-        let Some(sorter) = self.view.sorter() else {
+        let Some(shown) = self.shown_order() else {
             return;
         };
-        let mut objects: Vec<glib::Object> = (0..self.store.n_items())
-            .filter_map(|i| self.store.item(i))
-            .collect();
-        // Stable, from file order, as the grid's own sort.
-        objects.sort_by(|a, b| sorter.compare(a, b).into());
-        let Some(order) = view_model::order_from_sorted(objects.iter().map(|o| row_of(o).position))
-        else {
+        let Some(order) = view_model::order_from_sorted(shown.into_iter().map(Some)) else {
             self.status
                 .set_text(&format!("{name} is already in this order"));
             return;
@@ -675,6 +669,18 @@ impl Ui {
             }
             Err(e) => self.edit_failed("The playlist was not changed", &e),
         }
+    }
+
+    /// Every playlist position, those a search hides included, in the order
+    /// the grid's sort gives them. None outside a playlist.
+    fn shown_order(&self) -> Option<Vec<usize>> {
+        let sorter = self.view.sorter()?;
+        let mut objects: Vec<glib::Object> = (0..self.store.n_items())
+            .filter_map(|i| self.store.item(i))
+            .collect();
+        // Stable, from file order, as the grid's own sort.
+        objects.sort_by(|a, b| sorter.compare(a, b).into());
+        objects.iter().map(|o| row_of(o).position).collect()
     }
 
     /// True when the playlist file is still the one on screen. Otherwise
@@ -696,9 +702,10 @@ impl Ui {
         self.show_error(what, e);
     }
 
-    /// A drop on a row of the playlist shown: reorders it when the rows
-    /// come from it and it is sorted by `#`.
-    fn drop_on_row(&self, before: usize) -> bool {
+    /// A drop on the row at playlist `position` of the playlist shown, `y`
+    /// down a row `height` high: moves the dragged rows when they come from
+    /// it, before that row or after it, as the grid shows them.
+    fn drop_on_row(self: &Rc<Self>, position: usize, y: f64, height: f64) -> bool {
         let Some(name) = self.playlist_name() else {
             return false;
         };
@@ -710,46 +717,124 @@ impl Ui {
                 .set_text("Drop tracks on a playlist in the sidebar to add them");
             return false;
         }
-        if !self.sorted_by_position() {
-            self.status
-                .set_text("Sort by # (ascending) to reorder the playlist");
+        if !self.ensure_fresh(&name) {
             return false;
         }
-        self.move_entries(&name, &drag.positions, before);
+        let Some(shown) = self.shown_order() else {
+            return false;
+        };
+        let Some(place) = view_model::shown_places(&shown, &[position]) else {
+            return false;
+        };
+        let before = view_model::drop_before(place[0], y, height);
+        self.move_shown(&name, &shown, &drag.positions, before);
         true
     }
 
-    fn move_entries(&self, name: &str, positions: &[usize], before: usize) {
-        if !self.ensure_fresh(name) {
+    /// Moves the entries at playlist `positions` before the row shown at
+    /// 1-based place `before`, `shown` being the grid's order. Sorted by
+    /// `#` ascending, that is a plain move. Sorted otherwise, the order
+    /// shown, with the move, becomes the playlist's order: asked first,
+    /// since the whole order is rewritten, then shown by `#`.
+    fn move_shown(
+        self: &Rc<Self>,
+        name: &str,
+        shown: &[usize],
+        positions: &[usize],
+        before: usize,
+    ) {
+        let Some(order) = view_model::move_as_shown(shown, positions, before) else {
             return;
-        }
-        let len = self.store.n_items().try_into().unwrap_or(usize::MAX);
-        let order = match iprune_core::playlists::reorder(len, positions, before) {
-            Ok(o) => o,
-            Err(_) => return,
         };
-        if order.iter().copied().eq(1..=len) {
+        let moved = positions.to_vec();
+        // The file the move was made on: a reload while the dialog is open
+        // refreshes the view, and the order would land on other entries.
+        let seen = self.shown_mtime.get();
+        // No sort at all shows the file order too.
+        let (col, descending) = match self.current_sort() {
+            None | Some((Column::Position, false)) => {
+                self.write_move(name, &order, &moved, seen);
+                return;
+            }
+            Some(sort) => sort,
+        };
+        let direction = if descending {
+            "descending"
+        } else {
+            "ascending"
+        };
+        let dialog = gtk::AlertDialog::builder()
+            .message(format!("Reorder {name:?} by hand?"))
+            .detail(format!(
+                "The playlist takes the order shown, sorted by {} ({direction}), with this \
+                 move, and is then shown by #. The file is rewritten and the next sync gives \
+                 the iPod this order. There is no undo.",
+                col.title()
+            ))
+            .buttons(["Cancel", "Reorder"])
+            .cancel_button(0)
+            .default_button(0)
+            .modal(true)
+            .build();
+        let ui = Rc::downgrade(self);
+        let name = name.to_owned();
+        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |answer| {
+            if let (Some(ui), Ok(1)) = (ui.upgrade(), answer) {
+                ui.write_move(&name, &order, &moved, seen);
+            }
+        });
+    }
+
+    /// Writes the order a move gave and shows it: by `#`, with the moved
+    /// entries selected. `seen` is the modification time of the file the
+    /// move was made on.
+    fn write_move(&self, name: &str, order: &[usize], moved: &[usize], seen: Option<i64>) {
+        // Another playlist may be on screen by the time a dialog closed, or
+        // the file changed: the positions would land on other entries.
+        if self.playlist_name().as_deref() != Some(name) || !self.ensure_fresh(name) {
             return;
         }
-        match self.data.move_entries(name, positions, before) {
+        if self.shown_mtime.get() != seen {
+            self.status.set_text(
+                "The playlist changed on disk while you were asked and is shown again; \
+                 nothing was changed",
+            );
+            return;
+        }
+        let sorted_otherwise = !self.sorted_by_position();
+        match self.data.set_order(name, order) {
             Ok(()) => {
+                if sorted_otherwise {
+                    // Remembered like a header click: the playlist now has
+                    // an order of its own.
+                    self.sort_by(Column::Position, false);
+                }
                 self.refresh();
-                self.select_positions(&view_model::new_positions(&order, positions));
+                self.select_positions(&view_model::new_positions(order, moved));
             }
             Err(e) => self.edit_failed("The playlist was not changed", &e),
         }
     }
 
-    /// Moves the selected entries one place up (`-1`) or down (`+1`). Only
-    /// adjacent entries: a scattered selection would be gathered instead.
-    fn nudge(&self, step: i32) {
+    /// Moves the selected entries one place up (`-1`) or down (`+1`) on
+    /// screen. Only adjacent rows: a scattered selection would be gathered
+    /// instead.
+    fn nudge(self: &Rc<Self>, step: i32) {
         let Some(name) = self.playlist_name() else {
             return;
         };
+        if !self.ensure_fresh(&name) {
+            return;
+        }
         let positions = self.selected_positions();
-        let len = self.store.n_items() as usize;
-        match view_model::nudge_before(&positions, len, step < 0) {
-            view_model::Nudge::Before(before) => self.move_entries(&name, &positions, before),
+        let Some(shown) = self.shown_order() else {
+            return;
+        };
+        let Some(places) = view_model::shown_places(&shown, &positions) else {
+            return;
+        };
+        match view_model::nudge_before(&places, shown.len(), step < 0) {
+            view_model::Nudge::Before(before) => self.move_shown(&name, &shown, &positions, before),
             view_model::Nudge::NotAdjacent => self
                 .status
                 .set_text("Select adjacent entries to move them with Ctrl+Up and Ctrl+Down"),

@@ -290,7 +290,10 @@ theme Omarchy sets.
   artist, album, album artist and composer, as you type.
 - **Editing playlists.** Drag rows from any view onto a playlist in the
   sidebar to append them, or into a playlist's grid to insert them where they
-  are dropped. Dragging inside a playlist sorted by `#` reorders it. Delete
+  are dropped. Dragging inside a playlist reorders it as it is shown: in a
+  playlist sorted by another column (Artist, say), the first move asks,
+  then the order shown, with the move, becomes the playlist's order and the
+  grid is sorted by `#`, where further moves need no asking. Delete
   removes the selected rows from the playlist (never a file from the library).
   A context menu offers Get Info (see Editing tags below), Add to playlist
   (a list of the playlists with a filter field), Show in playlist (the same list, of the other playlists
@@ -301,7 +304,8 @@ theme Omarchy sets.
   change is written to the `.m3u8` file at once. Sorting a playlist by
   another column changes only the view, never the file, until Save Order
   to Playlist (in the context menu, after a confirmation) rewrites the file
-  in the order shown; the next sync then gives the iPod that order.
+  in the order shown, or a move by hand does as above; the next sync then
+  gives the iPod that order.
 - **Editing tags.** Get Info opens a form modelled on the Info tab of
   iTunes 10:
 

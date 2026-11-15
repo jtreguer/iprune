@@ -219,17 +219,6 @@ impl Data {
         )?)
     }
 
-    /// Moves the entries at 1-based `positions` before `before`.
-    pub fn move_entries(&self, name: &str, positions: &[usize], before: usize) -> Result<()> {
-        Ok(playlists::move_entries(
-            self.store.conn(),
-            &self.config,
-            name,
-            positions,
-            before,
-        )?)
-    }
-
     pub fn create(&self, name: &str) -> Result<()> {
         Ok(playlists::create(self.store.conn(), &self.config, name)?)
     }

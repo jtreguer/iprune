@@ -621,6 +621,33 @@ pub fn new_positions(order: &[usize], moved: &[usize]) -> Vec<usize> {
     out
 }
 
+/// The 1-based places at which the grid shows the entries at playlist
+/// `positions`, given `shown`, every playlist position in the order the
+/// grid shows them. None when one is not shown.
+pub fn shown_places(shown: &[usize], positions: &[usize]) -> Option<Vec<usize>> {
+    positions
+        .iter()
+        .map(|p| shown.iter().position(|s| s == p).map(|i| i + 1))
+        .collect()
+}
+
+/// A move made on the grid as it is shown: the entries at playlist
+/// `moved` go, in the order shown, before the row shown at 1-based place
+/// `before` (`shown.len() + 1` for the end), as
+/// [`iprune_core::playlists::reorder`] does in file order. Returns the
+/// playlist's new order for `playlists::set_order`: the order shown, with
+/// the move. None when nothing moves in that order (rows a search hides
+/// included: a move past only hidden rows changes nothing visible, yet
+/// counts), or a place or position is out of range.
+pub fn move_as_shown(shown: &[usize], moved: &[usize], before: usize) -> Option<Vec<usize>> {
+    let places = shown_places(shown, moved)?;
+    let order = iprune_core::playlists::reorder(shown.len(), &places, before).ok()?;
+    if order.iter().copied().eq(1..=shown.len()) {
+        return None;
+    }
+    Some(order.iter().map(|&i| shown[i - 1]).collect())
+}
+
 /// Where a drop on the row at 1-based `position` inserts: before it in its
 /// upper half, after it in its lower half.
 pub fn drop_before(position: usize, y: f64, height: f64) -> usize {

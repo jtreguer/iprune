@@ -1511,13 +1511,18 @@ playlist (in file order, unresolved entries dimmed), every column sortable
 with iTunes-style ties (artist, album, disc, track, name), a column menu,
 search, a status line with totals, and the iPod's state; (2) editing:
 dragging rows onto a playlist in the sidebar appends them, dragging inside a
-playlist sorted by `#` (ascending) reorders it (`playlists::move_entries`,
-one write for several rows), Save Order to Playlist (enabled when a
+playlist (or Ctrl+Up and Ctrl+Down) moves the rows as the grid shows them:
+the order shown (every entry, those a search hides included, sorted by
+the grid's sorter) with the move, `view_model::move_as_shown` applying
+`playlists::reorder` to places on screen, is written in one go
+(`playlists::set_order`); sorted by `#` ascending that is a plain move,
+sorted otherwise it rewrites the whole order, so it asks first and then
+sorts the grid by `#`, Save Order to Playlist (enabled when a
 playlist is sorted otherwise) sorts every entry, those a search hides
 included, with the grid's own sorter and writes that order after a
 confirmation (`playlists::set_order`, a whole rearrangement checked to name
-each position once, one write), Delete removes the selected entries, Ctrl+Up
-and Ctrl+Down move them, a context menu offers Remove from Playlist and Show
+each position once, one write), Delete removes the selected entries, a
+context menu offers Remove from Playlist and Show
 in Folder, and playlists are created (Ctrl+N or the + button), renamed (F2
 or the sidebar's context menu) and deleted (context menu, with
 confirmation). A `gio::FileMonitor` on the playlists folder reloads changes
